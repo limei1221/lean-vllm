@@ -13,12 +13,15 @@ description = "a lightweight vLLM implementation for prototyping inference techn
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
-    "triton>=3.0.0",
     "transformers>=4.51.0",
-    "flash-attn",
     "xxhash",
 ]
 
+[project.optional-dependencies]
+cuda = [
+    "triton>=3.0.0",
+    "flash-attn",
+]
 [project.urls]
 Homepage="https://github.com/limei1221/inferweave"
 Upstream="https://github.com/GeeeekExplorer/nano-vllm"
