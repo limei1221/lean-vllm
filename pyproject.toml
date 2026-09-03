@@ -22,9 +22,17 @@ cuda = [
     "triton>=3.0.0",
     "flash-attn",
 ]
+
+# a group, not an extra: uv installs it on a bare `uv sync`
+[dependency-groups]
+dev = ["pytest"]
+
 [project.urls]
 Homepage="https://github.com/limei1221/inferweave"
 Upstream="https://github.com/GeeeekExplorer/nano-vllm"
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]    # its setup.py imports torch
 
 [tool.setuptools.packages.find]
 where = ["."]

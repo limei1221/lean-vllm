@@ -1,66 +1,84 @@
-<p align="center">
-<img width="300" src="assets/logo.png">
-</p>
+# InferWeave
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+A lightweight vLLM implementation used as a testbed for production inference
+engineering: scheduling, attention kernels, model architectures, speculative
+decoding, and distributed serving.
 
-# Nano-vLLM
+The goal is not feature parity with vLLM, but comparable numbers on the parts
+that are implemented. Each project ships a design document, a correctness check
+against a reference implementation, and a benchmark against vLLM on the same
+hardware.
 
-A lightweight vLLM implementation built from scratch.
+## Roadmap
 
-## Key Features
+| | Project | Status |
+|---|---|---|
+| 0 | Attention backend abstraction | interface + Torch/FlashAttention backends done |
+| 1 | Online serving + advanced scheduler | next |
+| 2 | DeepSeek-style model support: MLA + MoE + YaRN | |
+| 3 | Speculative decoding | |
+| 4 | Disaggregated prefill / decode | |
 
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+## Install
 
-## Installation
+Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+uv sync                  # deps, dev tools and the package, into .venv
+uv sync --extra cuda     # add FlashAttention and Triton (NVIDIA only)
 ```
 
-## Model Download
+FlashAttention and Triton are optional. Without them the engine falls back to the
+`torch` attention backend, which runs on CPU and Apple Silicon — enough to develop
+and test against, though the CUDA-specific parts of the model runner still need
+porting before the full engine runs off-GPU.
 
-To download the model weights manually, use the following command:
+## Quick start
+
 ```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
+uv run hf download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B
+uv run python example.py
 ```
 
-## Quick Start
-
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
-from nanovllm import LLM, SamplingParams
+from inferweave import LLM, SamplingParams
+
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
+outputs = llm.generate(["Hello, InferWeave."], sampling_params)
 outputs[0]["text"]
 ```
 
-## Benchmark
+## Benchmarks
 
-See `bench.py` for benchmark.
+vLLM is the baseline. Every project reports before/after numbers against it on
+the same GPU, same model, same request trace — throughput, TTFT, TPOT, and
+p50/p95/p99 latency, with the metrics that matter to that project called out.
 
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
+```bash
+uv run python bench.py
+```
 
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
+No numbers are published yet: the CUDA-specific parts of the model runner still
+need porting, so nothing has been measured on a GPU since the fork.
 
+## Attention backends
 
-## Star History
+Model code declares attention semantics; a backend owns execution. Selection is
+automatic, or forced with `INFERWEAVE_ATTENTION_BACKEND=torch|flash_attn`.
 
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+```bash
+uv run pytest tests/
+```
+
+The tests check every available backend against a dense reference that uses
+neither SDPA nor paging, so the same suite runs on a laptop and on a GPU box.
+Details in [docs/attention-backends.md](docs/attention-backends.md).
+
+## Credit
+
+InferWeave is a fork of [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)
+by Xingkai Yu, branched at
+[`bb823b3`](https://github.com/GeeeekExplorer/nano-vllm/commit/bb823b3e06983d71485a8e1f23715ebd87d98ef8).
+The scheduler, block manager, paged KV cache, and Qwen3 implementation are its
+work. MIT licensed, as is this fork.
