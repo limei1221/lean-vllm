@@ -47,7 +47,7 @@ def device(case):
     return case[1]
 
 
-def dense_attention(q, k, v, scale=SCALE):
+def dense_attention(q, k, v, scale=SCALE, compute_dtype=torch.float32):
     """Causal attention one head at a time. q is [lq, H, D], k/v [lk, Hkv, D] full sequence."""
     lq, num_heads, _ = q.shape
     lk, num_kv_heads, _ = k.shape
@@ -56,10 +56,10 @@ def dense_attention(q, k, v, scale=SCALE):
 
     out = torch.empty_like(q)
     for h in range(num_heads):
-        scores = (q[:, h, :].float() @ k[:, h, :].float().T) * scale
+        scores = (q[:, h, :].to(compute_dtype) @ k[:, h, :].to(compute_dtype).T) * scale
         for j in range(lq):
             scores[j, lk - lq + j + 1:] = float("-inf")
-        out[:, h, :] = (scores.softmax(dim=-1) @ v[:, h, :].float()).to(q.dtype)
+        out[:, h, :] = (scores.softmax(dim=-1) @ v[:, h, :].to(compute_dtype)).to(q.dtype)
     return out
 
 
@@ -263,3 +263,62 @@ def test_gqa_fallback_matches_broadcast(backend, device, monkeypatch):
 
     monkeypatch.setattr(torch_backend, "_SDPA_ENABLE_GQA", False)
     torch.testing.assert_close(backend.decode(q, k_cache, v_cache, context), expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
+def test_low_precision_no_worse_than_naive(backend, device, dtype, request):
+    """Backend error against an fp32 oracle must not exceed naive arithmetic in the same dtype.
+
+    A fixed atol is meaningless at bf16, where the mantissa is 8 bits. What is
+    testable is that the backend loses no more accuracy than doing the same
+    maths in the same precision, so the fp32 oracle is compared against both.
+    """
+    num_cached, num_new = 10, 6
+    total = num_cached + num_new
+    block_table = [0, 1, 2, 3]
+    k_cache, v_cache = make_cache(4, device, dtype=dtype)
+
+    k_full = randn(total, NUM_KV_HEADS, HEAD_DIM, device=device).to(dtype)
+    v_full = randn(total, NUM_KV_HEADS, HEAD_DIM, device=device).to(dtype)
+    q = randn(num_new, NUM_HEADS, HEAD_DIM, device=device).to(dtype)
+
+    write_prefix(k_cache, v_cache, k_full, v_full, block_table, num_cached)
+    backend.store_kvcache(
+        k_full[num_cached:], v_full[num_cached:], k_cache, v_cache,
+        torch.tensor(slots_for(block_table, num_cached, total), dtype=torch.int32, device=device),
+    )
+    out = backend.prefill(q, k_full[num_cached:], v_full[num_cached:], k_cache, v_cache, Context(
+        is_prefill=True,
+        cu_seqlens_q=torch.tensor([0, num_new], dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.tensor([0, total], dtype=torch.int32, device=device),
+        max_seqlen_q=num_new, max_seqlen_k=total,
+        block_tables=torch.tensor([block_table], dtype=torch.int32, device=device),
+    ))
+
+    # identical inputs, so the only difference is the precision of the arithmetic
+    ref = dense_attention(q.float(), k_full.float(), v_full.float())
+    naive = dense_attention(q, k_full, v_full, compute_dtype=dtype).float()
+
+    backend_err = (out.float() - ref).abs().max().item()
+    naive_err = (naive - ref).abs().max().item()
+    print(f"\n{dtype} backend_err={backend_err:.3e} naive_err={naive_err:.3e} "
+          f"ratio={backend_err / max(naive_err, 1e-12):.2f}")
+    assert backend_err <= 2 * naive_err + 1e-6, (
+        f"backend error {backend_err:.3e} exceeds twice naive {dtype} error {naive_err:.3e}")
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
+def test_low_precision_cache_roundtrip_is_exact(backend, device, dtype):
+    """store_kvcache must not perturb values; only attention arithmetic may lose precision."""
+    block_table = [0, 1]
+    k_cache, v_cache = make_cache(2, device, dtype=dtype)
+    n = 2 * BLOCK_SIZE
+    key = randn(n, NUM_KV_HEADS, HEAD_DIM, device=device).to(dtype)
+    value = randn(n, NUM_KV_HEADS, HEAD_DIM, device=device).to(dtype)
+
+    slots = slots_for(block_table, 0, n)
+    backend.store_kvcache(key, value, k_cache, v_cache,
+                          torch.tensor(slots, dtype=torch.int32, device=device))
+
+    torch.testing.assert_close(k_cache.view(-1, NUM_KV_HEADS, HEAD_DIM)[slots], key, atol=0, rtol=0)
+    torch.testing.assert_close(v_cache.view(-1, NUM_KV_HEADS, HEAD_DIM)[slots], value, atol=0, rtol=0)
