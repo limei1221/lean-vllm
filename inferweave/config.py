@@ -10,6 +10,7 @@ class Config:
     max_num_seqs: int = 512
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
+    kvcache_memory_gb: float = 2.0    # cpu/mps only; cuda uses gpu_memory_utilization
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None

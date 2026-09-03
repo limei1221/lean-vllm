@@ -28,10 +28,14 @@ uv sync                  # deps, dev tools and the package, into .venv
 uv sync --extra cuda     # add FlashAttention and Triton (NVIDIA only)
 ```
 
-FlashAttention and Triton are optional. Without them the engine falls back to the
-`torch` attention backend, which runs on CPU and Apple Silicon — enough to develop
-and test against, though the CUDA-specific parts of the model runner still need
-porting before the full engine runs off-GPU.
+FlashAttention and Triton are optional. Without them the engine runs on CPU and
+Apple Silicon via the `torch` attention backend, at laptop speed — enough to
+develop and test the scheduler and cache against a small model.
+
+The device is picked automatically (cuda, then mps, then cpu) and can be forced
+with `INFERWEAVE_DEVICE`. Off CUDA there is no `mem_get_info` to size the KV
+cache from, so it comes from `kvcache_memory_gb` (default 2.0) instead of
+`gpu_memory_utilization`.
 
 ## Quick start
 
@@ -59,8 +63,7 @@ p50/p95/p99 latency, with the metrics that matter to that project called out.
 uv run python bench.py
 ```
 
-No numbers are published yet: the CUDA-specific parts of the model runner still
-need porting, so nothing has been measured on a GPU since the fork.
+No numbers are published yet: nothing has been measured on a GPU since the fork.
 
 ## Attention backends
 

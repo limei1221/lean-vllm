@@ -1,7 +1,8 @@
 # Attention Backend Abstraction
 
-Status: interface + `TorchAttention` + `FlashAttentionBackend` landed.
-Not yet done: device abstraction, CUDA-graph wiring, FlashInfer / FlashMLA.
+Status: interface + `TorchAttention` + `FlashAttentionBackend` landed, and
+CUDA-graph capture is gated on `supports_cuda_graph()`.
+Not yet done: FlashInfer / FlashMLA.
 
 ## Problem
 
@@ -133,11 +134,10 @@ are published.
 
 ## Next
 
-1. Device abstraction — `model_runner.py` still hardcodes `.cuda()`,
-   `pin_memory=True`, `mem_get_info`, NCCL init and CUDA-graph capture. Until
-   that lands, the backend runs off-GPU but the engine does not.
-2. Have `allocate_kv_cache` call `get_kv_cache_shape`, and gate CUDA-graph
-   capture on `supports_cuda_graph()` rather than `enforce_eager` alone.
-3. Verify `TorchAttention` against `FlashAttentionBackend` on rented hardware
+1. Have `allocate_kv_cache` call `get_kv_cache_shape`; the hook exists but the
+   model runner still hardcodes the FlashAttention layout.
+2. Verify `TorchAttention` against `FlashAttentionBackend` on rented hardware
    before building further work on the oracle.
+3. Batch the per-sequence loop in `TorchAttention` before publishing any
+   Torch-vs-Flash crossover numbers.
 4. FlashInfer / FlashMLA backends, then per-layer dispatch.
