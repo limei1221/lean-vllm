@@ -1,3 +1,4 @@
+import logging
 import pickle
 import torch
 import torch.distributed as dist
@@ -13,6 +14,8 @@ from inferweave.utils.context import set_context, get_context, reset_context
 from inferweave.utils.loader import load_model
 from inferweave.utils import device as dev
 
+logger = logging.getLogger(__name__)
+
 
 class ModelRunner:
 
@@ -21,8 +24,11 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.device = dev.get_device()
+        attention_backend = get_attention_backend()
+        if rank == 0:
+            logger.info("attention backend: %s", attention_backend.get_name())
         self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
-                              or not get_attention_backend().supports_cuda_graph())
+                              or not attention_backend.supports_cuda_graph())
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event

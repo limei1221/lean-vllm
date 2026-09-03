@@ -53,6 +53,9 @@ outputs = llm.generate(["Hello, InferWeave."], sampling_params)
 outputs[0]["text"]
 ```
 
+The attention backend is picked automatically and can be forced with
+`INFERWEAVE_ATTENTION_BACKEND`.
+
 ## Benchmarks
 
 vLLM is the baseline. Every project reports before/after numbers against it on
@@ -63,12 +66,11 @@ p50/p95/p99 latency, with the metrics that matter to that project called out.
 uv run python bench.py
 ```
 
-No numbers are published yet: nothing has been measured on a GPU since the fork.
+No benchmark numbers are published yet. The attention backends have been
+verified for numerical correctness against a dense reference on an A100, but
+throughput has not been measured on a GPU since the fork.
 
-## Attention backends
-
-Model code declares attention semantics; a backend owns execution. Selection is
-automatic, or forced with `INFERWEAVE_ATTENTION_BACKEND=torch|flash_attn`.
+## Tests
 
 ```bash
 uv run pytest tests/
@@ -76,7 +78,8 @@ uv run pytest tests/
 
 The tests check every available backend against a dense reference that uses
 neither SDPA nor paging, so the same suite runs on a laptop and on a GPU box.
-Details in [docs/attention-backends.md](docs/attention-backends.md).
+Attention backend design and selection are covered in
+[docs/attention-backends.md](docs/attention-backends.md).
 
 ## Credit
 

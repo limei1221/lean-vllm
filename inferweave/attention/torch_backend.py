@@ -95,9 +95,9 @@ class TorchAttention(AttentionBackend):
         return q_pos >= k_pos
 
     def _sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-        q = q.transpose(0, 1).unsqueeze(0)
-        k = k.transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
+        q = q.transpose(0, 1).unsqueeze(0) # [1, H, Lq, D]
+        k = k.transpose(0, 1).unsqueeze(0) # [1, H_kv, Lk, D]
+        v = v.transpose(0, 1).unsqueeze(0) # [1, H_kv, Lk, D]
         if mask is not None:
             mask = mask.view(1, 1, *mask.shape)
 
@@ -110,5 +110,5 @@ class TorchAttention(AttentionBackend):
         else:
             kwargs = {"enable_gqa": gqa} if _SDPA_ENABLE_GQA else {}
 
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale, **kwargs)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale, **kwargs) # [1, H, Lq, D]
         return o.squeeze(0).transpose(0, 1)

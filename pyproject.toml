@@ -20,7 +20,11 @@ dependencies = [
 [project.optional-dependencies]
 cuda = [
     "triton>=3.0.0",
-    "flash-attn",
+    # flash-attn wheels are built against a specific torch minor + CUDA major; pin torch to match.
+    # uv resolves all extras into one lock, so this pin holds in every environment, not just this extra.
+    "torch>=2.9,<2.10",
+    # exact version, so the source-build fallback below matches the pinned wheel
+    "flash-attn==2.8.3",
 ]
 
 # a group, not an extra: uv installs it on a bare `uv sync`
@@ -32,7 +36,25 @@ Homepage="https://github.com/limei1221/inferweave"
 Upstream="https://github.com/GeeeekExplorer/nano-vllm"
 
 [tool.uv]
-no-build-isolation-package = ["flash-attn"]    # its setup.py imports torch
+required-version = ">=0.10"    # extra-build-dependencies is stable from 0.10
+
+# flash-attn provides prebuilt wheels on GitHub with encoded torch minor, CUDA major, and ABI. Use these to avoid local CUDA compilation.
+[tool.uv.sources]
+flash-attn = [
+    { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version >= '3.12'" },
+]
+
+# Fallback when no wheel above matches — notably Linux on Python 3.10/3.11 and
+# aarch64 (the aarch64 wheel is unverified, so it resolves from PyPI instead):
+[tool.uv.extra-build-dependencies]
+flash-attn = [
+    { requirement = "torch", match-runtime = true },
+    "psutil",
+    "setuptools",
+    "wheel",
+    "packaging",
+    "einops",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

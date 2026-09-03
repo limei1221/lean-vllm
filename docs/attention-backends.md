@@ -136,8 +136,6 @@ are published.
 
 1. Have `allocate_kv_cache` call `get_kv_cache_shape`; the hook exists but the
    model runner still hardcodes the FlashAttention layout.
-2. Verify `TorchAttention` against `FlashAttentionBackend` on rented hardware
-   before building further work on the oracle.
-3. Batch the per-sequence loop in `TorchAttention` before publishing any
+2. Batch the per-sequence loop in `TorchAttention` before publishing any
    Torch-vs-Flash crossover numbers.
-4. FlashInfer / FlashMLA backends, then per-layer dispatch.
+3. FlashInfer / FlashMLA backends, then per-layer dispatch.
