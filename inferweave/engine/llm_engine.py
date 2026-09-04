@@ -48,7 +48,9 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params, request_id)
         self.scheduler.add(seq)
-        self.detokenizers[seq.request_id] = IncrementalDetokenizer(self.tokenizer, prompt)
+        self.detokenizers[seq.request_id] = IncrementalDetokenizer(
+            self.tokenizer, prompt, seq.skip_special_tokens
+        )
         return seq.request_id
 
     def abort_request(self, request_id: str) -> bool:

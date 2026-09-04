@@ -7,6 +7,7 @@ class SamplingParams:
     max_tokens: int = 64
     ignore_eos: bool = False
     stop_token_ids: list[int] = field(default_factory=list)
+    skip_special_tokens: bool = True
 
     def __post_init__(self):
         assert self.temperature >= 0

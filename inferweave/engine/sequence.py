@@ -33,6 +33,7 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_token_ids = sampling_params.stop_token_ids
+        self.skip_special_tokens = sampling_params.skip_special_tokens
         self.finish_reason: str | None = None
         self.num_preemptions = 0
         self.arrival_time = perf_counter()
