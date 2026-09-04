@@ -1,7 +1,7 @@
 # Online Serving + Advanced Scheduler
 
-Status: M0 and M1 landed. M2-M6 below are plan; this becomes the results
-document as they land.
+Status: M0, M1 and M2 landed, bar two M2 bullets noted below. M3-M6 are plan;
+this becomes the results document as they land.
 
 ## Goal
 
@@ -117,7 +117,7 @@ real Qwen3 tokenizer when a model directory is present. `stop_token_ids` are
 honoured even under `ignore_eos`, which covers the eos token only — vLLM's
 semantics.
 
-### M2 — unified token-budget scheduler
+### M2 — unified token-budget scheduler — *done*
 
 `SchedulerOutput` carrying `[(seq, num_scheduled_tokens)]` and the preemption
 list replaces `(seqs, is_prefill)`. One pass per step: schedule running
@@ -135,8 +135,21 @@ prefill), then admit from the waiting queue into the budget that is left.
   fairness.
 - admission control: `max_waiting_requests`, so the server can return 429.
 - prefix-cache-aware admission: `block_manager.can_allocate` already returns the
-  cached-block count; prefer high-hit prompts when the queue is deep.
+  cached-block count; prefer high-hit prompts when the queue is deep. **Not yet
+  done** — it reorders the waiting queue, so it belongs with the policy object
+  rather than in the admission loop.
 - replace `running.remove(seq)` in `postprocess`, a linear scan per finish.
+  **Not yet done**, and not worth doing until a profile says the deque scan
+  costs something.
+
+Two semantics worth recording. `long_prefill_token_threshold` caps how many
+tokens one prompt may take from a single step's budget, which is what actually
+stops a long prompt from starving short ones; `max_num_partial_prefills` caps
+how many prompts may be mid-chunk at once. vLLM splits the same concern
+differently, marking prompts over a threshold as "long" and capping those
+separately. A sequence alone in the cache that still cannot grow is dropped
+with `finish_reason="capacity"` rather than preempted forever — the old code
+asserted here instead.
 
 **Bridge to M3.** `SchedulerOutput` can describe a mixed batch before the runner
 can execute one, so the engine splits a mixed output into two runner calls per

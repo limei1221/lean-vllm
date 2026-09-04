@@ -6,6 +6,7 @@ the milestone that is expected to change it.
 
 import pytest
 
+from inferweave.engine.scheduler import QueueFull
 from inferweave.sampling_params import SamplingParams
 
 FOREVER = SamplingParams(max_tokens=64, ignore_eos=True)
@@ -171,16 +172,50 @@ class TestBatching:
         engine.step()
         assert len(engine.model_runner.batches[0][1]) == 2
 
-    def test_arriving_prefill_starves_running_decodes(self, make_engine):
-        """The reason this project exists: prefill returns first, unconditionally."""
+    def test_an_arriving_prefill_mixes_with_running_decodes(self, make_engine):
+        """The reason this project exists: an arrival no longer stalls decoding."""
         engine = make_engine()
         running = engine.add(prompt(8), FOREVER)
         engine.step()
-        engine.add(prompt(8, 100), FOREVER)
+        arriving = engine.add(prompt(8, 100), FOREVER)
         engine.step()
-        is_prefill, batch = engine.model_runner.batches[1]
-        assert is_prefill
-        assert running.request_id not in [request_id for request_id, _ in batch]    # M2 mixes them
+        prefill, decode = engine.model_runner.batches[1], engine.model_runner.batches[2]
+        assert prefill == (True, [(arriving.request_id, 8)])
+        assert decode == (False, [(running.request_id, 1)])
+
+
+class TestBudget:
+
+    def test_running_sequences_are_scheduled_before_arrivals(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=1)
+        running = engine.add(prompt(1), FOREVER)
+        engine.step()
+        arriving = engine.add(prompt(8, 100), FOREVER)
+        engine.step()
+        assert engine.model_runner.batches[1] == (False, [(running.request_id, 1)])
+        assert arriving in engine.scheduler.waiting    # the budget went to decode
+
+    def test_budget_is_shared_across_prefill_and_decode(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=10)
+        decoding = engine.add(prompt(8), FOREVER)
+        prefilling = engine.add(prompt(8, 100), FOREVER)
+        engine.step()
+        assert engine.model_runner.batches[0] == (True, [(decoding.request_id, 8), (prefilling.request_id, 2)])
+        engine.step()
+        assert engine.model_runner.batches[1] == (True, [(prefilling.request_id, 6)])
+        assert engine.model_runner.batches[2] == (False, [(decoding.request_id, 1)])
+
+    def test_no_admission_in_a_step_that_preempted(self, make_engine):
+        """Admitting under memory pressure would only preempt again."""
+        engine = make_engine(num_kvcache_blocks=3, kvcache_block_size=8)
+        first = engine.add(prompt(8), FOREVER)
+        second = engine.add(prompt(8, 100), FOREVER)
+        engine.step()
+        waiting = engine.add(prompt(8, 200), FOREVER)
+        engine.step()
+        assert second.num_preemptions == 1
+        assert engine.model_runner.batches[1] == (False, [(first.request_id, 1)])
+        assert waiting in engine.scheduler.waiting
 
 
 class TestChunkedPrefill:
@@ -190,19 +225,20 @@ class TestChunkedPrefill:
         seq = engine.add(prompt(40), FOREVER)
         engine.step()
         assert engine.model_runner.batches[0] == (True, [(seq.request_id, 16)])
-        assert seq in engine.scheduler.waiting    # not running until prefill completes
+        assert seq in engine.scheduler.running    # admitted, prompt still filling
         engine.step()
         engine.step()
         assert [n for _, n in engine.model_runner.batches[2][1]] == [8]
-        assert seq in engine.scheduler.running
+        assert seq.num_completion_tokens == 1    # only the final chunk samples
+        engine.step()
+        assert engine.model_runner.batches[3] == (False, [(seq.request_id, 1)])
 
-    def test_only_the_first_sequence_may_be_chunked(self, make_engine):
-        """Limitation: leftover budget goes unused rather than partly prefilling. M2 fixes."""
+    def test_leftover_budget_partly_prefills_the_next_sequence(self, make_engine):
         engine = make_engine(max_num_batched_tokens=20)
         engine.add(prompt(8), FOREVER)
         engine.add(prompt(40, 100), FOREVER)
         engine.step()
-        assert [n for _, n in engine.model_runner.batches[0][1]] == [8]    # 12 tokens of budget wasted
+        assert [n for _, n in engine.model_runner.batches[0][1]] == [8, 12]    # budget fully spent
 
 
 class TestPrefixCache:
@@ -238,10 +274,104 @@ class TestPreemption:
         outputs = engine.run_to_completion()
         assert [len(o) for o in outputs.values()] == [12, 12]
 
-    def test_preempting_the_last_sequence_crashes(self, make_engine):
-        """Known bug: an empty decode batch trips `assert scheduled_seqs`. M2 turns this green."""
+    def test_a_sequence_the_cache_cannot_hold_is_dropped(self, make_engine):
+        """Alone in the cache and still short of a block: dropped, not preempted forever."""
         engine = make_engine(num_kvcache_blocks=1, kvcache_block_size=8)
+        seq = engine.add(prompt(8), FOREVER)
+        engine.step()
+        engine.step()
+        assert seq.finish_reason == "capacity"
+        assert engine.is_finished()
+        assert not engine.scheduler.block_manager.used_block_ids
+
+
+class TestPolicy:
+
+    def test_fcfs_admits_in_arrival_order(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=8)
+        first = engine.add(prompt(8), FOREVER)
+        second = engine.add(prompt(8, 100), SamplingParams(max_tokens=64, ignore_eos=True, priority=-5))
+        engine.step()
+        assert engine.model_runner.batches[0] == (True, [(first.request_id, 8)])
+        assert second in engine.scheduler.waiting
+
+    def test_priority_admits_the_urgent_request_first(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=8, scheduling_policy="priority")
+        engine.add(prompt(8), FOREVER)
+        urgent = engine.add(prompt(8, 100), SamplingParams(max_tokens=64, ignore_eos=True, priority=-5))
+        engine.step()
+        assert engine.model_runner.batches[0] == (True, [(urgent.request_id, 8)])
+
+    def test_priority_ties_break_on_arrival(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=8, scheduling_policy="priority")
+        first = engine.add(prompt(8), FOREVER)
+        engine.add(prompt(8, 100), FOREVER)
+        engine.step()
+        assert engine.model_runner.batches[0] == (True, [(first.request_id, 8)])
+
+    def test_fcfs_preempts_the_newest_sequence(self, make_engine):
+        engine = make_engine(num_kvcache_blocks=2, kvcache_block_size=8)
+        engine.add(prompt(8), FOREVER)
+        newest = engine.add(prompt(8, 100), FOREVER)
+        engine.step()
+        engine.step()
+        assert newest.num_preemptions == 1
+
+    def test_priority_preempts_the_least_urgent_sequence(self, make_engine):
+        engine = make_engine(num_kvcache_blocks=2, kvcache_block_size=8, scheduling_policy="priority")
+        expendable = engine.add(prompt(8), SamplingParams(max_tokens=64, ignore_eos=True, priority=5))
+        engine.add(prompt(8, 100), FOREVER)
+        engine.step()
+        engine.step()
+        assert expendable.num_preemptions == 1    # oldest, but least urgent
+
+    def test_an_unknown_policy_is_rejected(self, make_engine):
+        with pytest.raises(ValueError, match="unknown scheduling policy"):
+            make_engine(scheduling_policy="lifo")
+
+
+class TestAdmissionControl:
+
+    def test_a_full_queue_is_refused(self, make_engine):
+        engine = make_engine(max_waiting_requests=2)
+        engine.add(prompt(8), FOREVER)
+        engine.add(prompt(8, 100), FOREVER)
+        with pytest.raises(QueueFull):
+            engine.add(prompt(8, 200), FOREVER)
+
+    def test_the_queue_reopens_once_requests_are_admitted(self, make_engine):
+        engine = make_engine(max_waiting_requests=1)
         engine.add(prompt(8), FOREVER)
         engine.step()
-        with pytest.raises(AssertionError):
-            engine.step()
+        engine.add(prompt(8, 100), FOREVER)    # the first one left the queue
+
+    def test_unlimited_by_default(self, make_engine):
+        engine = make_engine()
+        for s in range(20):
+            engine.add(prompt(8, s * 100), FOREVER)
+        assert len(engine.scheduler.waiting) == 20
+
+
+class TestLongPrompts:
+
+    def test_one_prompt_cannot_take_the_whole_budget(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=64, long_prefill_token_threshold=8)
+        first = engine.add(prompt(40), FOREVER)
+        second = engine.add(prompt(40, 100), FOREVER)
+        engine.step()
+        assert engine.model_runner.batches[0] == (True, [(first.request_id, 8), (second.request_id, 8)])
+
+    def test_concurrent_chunked_prompts_are_capped(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=16, max_num_partial_prefills=1)
+        first = engine.add(prompt(40), FOREVER)
+        second = engine.add(prompt(40, 100), FOREVER)
+        engine.step()
+        assert engine.model_runner.batches[0] == (True, [(first.request_id, 16)])
+        assert second in engine.scheduler.waiting
+
+    def test_a_prompt_that_fits_is_admitted_past_the_cap(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=48, max_num_partial_prefills=1)
+        first = engine.add(prompt(40), FOREVER)
+        short = engine.add(prompt(8, 100), FOREVER)
+        engine.step()
+        assert engine.model_runner.batches[0] == (True, [(first.request_id, 40), (short.request_id, 8)])

@@ -8,6 +8,7 @@ class SamplingParams:
     ignore_eos: bool = False
     stop_token_ids: list[int] = field(default_factory=list)
     skip_special_tokens: bool = True
+    priority: int = 0    # lower is scheduled sooner, under the priority policy
 
     def __post_init__(self):
         assert self.temperature >= 0

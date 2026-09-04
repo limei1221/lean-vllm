@@ -17,6 +17,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    scheduling_policy: str = "fcfs"    # or "priority"
+    max_waiting_requests: int = 0      # 0 is unlimited
+    max_num_partial_prefills: int = 0  # concurrent chunked prompts; 0 is unlimited
+    long_prefill_token_threshold: int = 0    # per-step token cap for one prompt; 0 is none
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

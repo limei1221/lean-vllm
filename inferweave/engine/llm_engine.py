@@ -58,12 +58,17 @@ class LLMEngine:
         self.detokenizers.pop(request_id, None)
         return aborted
 
-    def step(self) -> tuple[list[RequestOutput], int]:
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        stepped = self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        return [self._output(seq) for seq in stepped], num_tokens
+    def step(self) -> tuple[list[RequestOutput], int, int]:
+        output = self.scheduler.schedule()
+        num_prefill_tokens, num_decode_tokens = output.num_prefill_tokens, output.num_decode_tokens
+        stepped = []
+        # Until M3 the runner takes one kind of batch at a time, so a mixed step is two calls.
+        for seqs, is_prefill in ((output.prefills, True), (output.decodes, False)):
+            if not seqs:
+                continue
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            stepped += self.scheduler.postprocess(seqs, token_ids)
+        return [self._output(seq) for seq in stepped], num_prefill_tokens, num_decode_tokens
 
     def _output(self, seq: Sequence) -> RequestOutput:
         token_id = seq.last_token
@@ -97,11 +102,12 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            step_outputs, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+            step_outputs, num_prefill_tokens, num_decode_tokens = self.step()
+            elapsed = perf_counter() - t
+            if num_prefill_tokens:
+                prefill_throughput = num_prefill_tokens / elapsed
+            if num_decode_tokens:
+                decode_throughput = num_decode_tokens / elapsed
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
