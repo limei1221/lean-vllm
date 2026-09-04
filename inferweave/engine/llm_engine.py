@@ -7,9 +7,11 @@ import torch.multiprocessing as mp
 
 from inferweave.config import Config
 from inferweave.sampling_params import SamplingParams
+from inferweave.engine.output import RequestOutput
 from inferweave.engine.sequence import Sequence
 from inferweave.engine.scheduler import Scheduler
 from inferweave.engine.model_runner import ModelRunner
+from inferweave.utils.detokenizer import IncrementalDetokenizer
 
 
 class LLMEngine:
@@ -32,6 +34,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.detokenizers: dict[str, IncrementalDetokenizer] = {}
         atexit.register(self.exit)
 
     def exit(self):
@@ -40,19 +43,40 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams, request_id: str | None = None) -> str:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(prompt, sampling_params, request_id)
         self.scheduler.add(seq)
+        self.detokenizers[seq.request_id] = IncrementalDetokenizer(self.tokenizer, prompt)
+        return seq.request_id
 
-    def step(self):
+    def abort_request(self, request_id: str) -> bool:
+        aborted = self.scheduler.abort(request_id)
+        self.detokenizers.pop(request_id, None)
+        return aborted
+
+    def step(self) -> tuple[list[RequestOutput], int]:
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+        stepped = self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        return [self._output(seq) for seq in stepped], num_tokens
+
+    def _output(self, seq: Sequence) -> RequestOutput:
+        token_id = seq.last_token
+        detokenizer = self.detokenizers[seq.request_id]
+        text = detokenizer.decode(token_id)
+        if seq.is_finished:
+            del self.detokenizers[seq.request_id]
+        return RequestOutput(
+            request_id=seq.request_id,
+            token_ids=[token_id],
+            text=text,
+            finished=seq.is_finished,
+            finish_reason=seq.finish_reason,
+            metrics=seq.metrics() if seq.is_finished else None,
+        )
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -66,13 +90,12 @@ class LLMEngine:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
-        outputs = {}
+        request_ids = [self.add_request(prompt, sp) for prompt, sp in zip(prompts, sampling_params)]
+        collected = {request_id: {"text": "", "token_ids": []} for request_id in request_ids}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            step_outputs, num_tokens = self.step()
             if num_tokens > 0:
                 prefill_throughput = num_tokens / (perf_counter() - t)
             else:
@@ -81,10 +104,10 @@ class LLMEngine:
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
-                pbar.update(1)
+            for output in step_outputs:
+                collected[output.request_id]["text"] += output.text
+                collected[output.request_id]["token_ids"] += output.token_ids
+                if output.finished:
+                    pbar.update(1)
         pbar.close()
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
-        return outputs
+        return [collected[request_id] for request_id in request_ids]

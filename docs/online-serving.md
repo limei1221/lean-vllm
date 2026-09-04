@@ -1,7 +1,7 @@
 # Online Serving + Advanced Scheduler
 
-Status: M0 landed (a scheduler harness that runs without a GPU). M1-M6 below are
-plan; this becomes the results document as they land.
+Status: M0 and M1 landed. M2-M6 below are plan; this becomes the results
+document as they land.
 
 ## Goal
 
@@ -94,7 +94,7 @@ decode unconditionally, only the leading sequence may be chunked (so leftover
 budget is wasted), and preempting the last running sequence trips
 `assert scheduled_seqs`.
 
-### M1 — request plumbing: ids, streaming, cancellation
+### M1 — request plumbing: ids, streaming, cancellation — *done*
 
 - `engine/sequence.py`: `request_id`, arrival / first-scheduled / first-token /
   finish timestamps, `finish_reason`, `num_preemptions`, `stop_token_ids`.
@@ -110,6 +110,12 @@ budget is wasted), and preempting the last running sequence trips
   aborted. Applied between steps, never during one.
 - `Sampler`: `temperature == 0` means argmax; drop the assert in
   `SamplingParams`.
+
+The detokenizer is tested against a byte-level fake tokenizer, which reproduces
+the split-character problem without a download, and additionally against the
+real Qwen3 tokenizer when a model directory is present. `stop_token_ids` are
+honoured even under `ignore_eos`, which covers the eos token only — vLLM's
+semantics.
 
 ### M2 — unified token-budget scheduler
 

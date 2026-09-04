@@ -1,7 +1,9 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from time import perf_counter
 
+from inferweave.engine.output import RequestMetrics
 from inferweave.sampling_params import SamplingParams
 
 
@@ -15,8 +17,9 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(), request_id: str | None = None):
         self.seq_id = next(Sequence.counter)
+        self.request_id = request_id if request_id is not None else f"req-{self.seq_id}"
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
@@ -29,6 +32,24 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.stop_token_ids = sampling_params.stop_token_ids
+        self.finish_reason: str | None = None
+        self.num_preemptions = 0
+        self.arrival_time = perf_counter()
+        self.first_scheduled_time: float | None = None
+        self.first_token_time: float | None = None
+        self.finish_time: float | None = None
+
+    def metrics(self) -> RequestMetrics:
+        return RequestMetrics(
+            arrival_time=self.arrival_time,
+            num_prompt_tokens=self.num_prompt_tokens,
+            num_completion_tokens=self.num_completion_tokens,
+            num_preemptions=self.num_preemptions,
+            first_scheduled_time=self.first_scheduled_time,
+            first_token_time=self.first_token_time,
+            finish_time=self.finish_time,
+        )
 
     def __len__(self):
         return self.num_tokens

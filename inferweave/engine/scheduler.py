@@ -1,4 +1,5 @@
 from collections import deque
+from time import perf_counter
 
 from inferweave.config import Config
 from inferweave.engine.sequence import Sequence, SequenceStatus
@@ -15,12 +16,30 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.seqs: dict[str, Sequence] = {}    # live requests, for abort
 
     def is_finished(self):
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        self.seqs[seq.request_id] = seq
         self.waiting.append(seq)
+
+    def abort(self, request_id: str) -> bool:
+        """Drop a request between steps. Returns False if it already finished."""
+        seq = self.seqs.pop(request_id, None)
+        if seq is None:
+            return False
+        queue = self.waiting if seq.status == SequenceStatus.WAITING else self.running
+        queue.remove(seq)
+        self.block_manager.deallocate(seq)
+        self._finish(seq, "abort")
+        return True
+
+    def _finish(self, seq: Sequence, reason: str):
+        seq.status = SequenceStatus.FINISHED
+        seq.finish_reason = reason
+        seq.finish_time = perf_counter()
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
@@ -45,6 +64,8 @@ class Scheduler:
                 self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
+            if seq.first_scheduled_time is None:
+                seq.first_scheduled_time = perf_counter()
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
@@ -74,11 +95,14 @@ class Scheduler:
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
+        seq.num_preemptions += 1
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool) -> list[Sequence]:
+        """Returns the sequences that produced a token; a partial prefill produces none."""
+        stepped = []
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
@@ -86,7 +110,17 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+            if seq.first_token_time is None:
+                seq.first_token_time = perf_counter()
+            stepped.append(seq)
+            if (token_id == self.eos and not seq.ignore_eos) or token_id in seq.stop_token_ids:
+                reason = "stop"    # ignore_eos covers the eos token only, not client stop tokens
+            elif seq.num_completion_tokens == seq.max_tokens:
+                reason = "length"
+            else:
+                continue
+            self._finish(seq, reason)
+            self.block_manager.deallocate(seq)
+            self.running.remove(seq)
+            del self.seqs[seq.request_id]
+        return stepped
