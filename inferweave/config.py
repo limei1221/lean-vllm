@@ -17,6 +17,7 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    enable_chunked_prefill: bool = True    # off is the pre-M2 shape, kept for the A/B
     scheduling_policy: str = "fcfs"    # or "priority"
     max_waiting_requests: int = 0      # 0 is unlimited
     max_num_partial_prefills: int = 0  # concurrent chunked prompts; 0 is unlimited

@@ -20,6 +20,7 @@ class FakeConfig:
     max_num_seqs: int = 8
     max_num_batched_tokens: int = 1024
     eos: int = EOS
+    enable_chunked_prefill: bool = True
     scheduling_policy: str = "fcfs"
     max_waiting_requests: int = 0
     max_num_partial_prefills: int = 0
@@ -40,9 +41,14 @@ class FakeModelRunner:
     def call(self, method_name, *args):
         return getattr(self, method_name)(*args)
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence]) -> list[int]:
+        is_prefill = any(seq.is_prefill for seq in seqs)
         self.batches.append((is_prefill, [(seq.request_id, seq.num_scheduled_tokens) for seq in seqs]))
-        return [self._token(seq) for seq in seqs]
+        return [self._token(seq) for seq in seqs if self._samples(seq)]
+
+    @staticmethod
+    def _samples(seq: Sequence) -> bool:
+        return seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens
 
     def _token(self, seq: Sequence) -> int:
         limit = self.eos_after.get(seq.request_id)
@@ -69,11 +75,10 @@ class FakeEngine:
 
     def step(self) -> list[RequestOutput]:
         output = self.scheduler.schedule()
-        stepped = []
-        for seqs, is_prefill in ((output.prefills, True), (output.decodes, False)):
-            if seqs:
-                token_ids = self.model_runner.call("run", seqs, is_prefill)
-                stepped += self.scheduler.postprocess(seqs, token_ids)
+        if not output:
+            return []
+        token_ids = self.model_runner.call("run", output.scheduled)
+        stepped = self.scheduler.postprocess(output.scheduled, token_ids)
         return [
             RequestOutput(
                 request_id=seq.request_id,

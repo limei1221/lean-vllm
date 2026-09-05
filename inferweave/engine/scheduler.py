@@ -13,25 +13,12 @@ class SchedulerOutput:
     """What one step should run. A sequence carries its own num_scheduled_tokens."""
     scheduled: list[Sequence] = field(default_factory=list)
     preempted: list[Sequence] = field(default_factory=list)
+    # Counted while scheduling: postprocess() clears num_scheduled_tokens.
+    num_prefill_tokens: int = 0
+    num_decode_tokens: int = 0
 
     def __bool__(self):
         return bool(self.scheduled)
-
-    @property
-    def prefills(self) -> list[Sequence]:
-        return [seq for seq in self.scheduled if seq.is_prefill]
-
-    @property
-    def decodes(self) -> list[Sequence]:
-        return [seq for seq in self.scheduled if not seq.is_prefill]
-
-    @property
-    def num_prefill_tokens(self) -> int:
-        return sum(seq.num_scheduled_tokens for seq in self.prefills)
-
-    @property
-    def num_decode_tokens(self) -> int:
-        return len(self.decodes)
 
 
 class QueueFull(Exception):
@@ -45,6 +32,7 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
+        self.enable_chunked_prefill = config.enable_chunked_prefill
         self.max_waiting_requests = config.max_waiting_requests
         self.max_num_partial_prefills = config.max_num_partial_prefills
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
@@ -75,6 +63,10 @@ class Scheduler:
 
     def schedule(self) -> SchedulerOutput:
         """One token budget per step, running sequences first so decode is never starved."""
+        if not self.enable_chunked_prefill:
+            output = self._schedule_whole_prompts()
+            if output:
+                return output    # prefill-only step, as before M2
         output = SchedulerOutput()
         budget = self.max_num_batched_tokens
         still_running: deque[Sequence] = deque()
@@ -109,6 +101,29 @@ class Scheduler:
 
         return output
 
+    def _schedule_whole_prompts(self) -> SchedulerOutput:
+        """Chunked prefill disabled: whole prompts only, and never mixed with decode."""
+        output = SchedulerOutput()
+        budget = self.max_num_batched_tokens
+        while self.waiting and len(output.scheduled) < self.max_num_seqs:
+            seq = self.waiting.peek()
+            num_cached_blocks = self.block_manager.can_allocate(seq)
+            if num_cached_blocks == -1:
+                break
+            num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+            if num_tokens > self.max_num_batched_tokens:
+                self.waiting.pop()    # will never fit in one step, and splitting is off
+                self._drop(seq, "capacity")
+                continue
+            if num_tokens > budget:
+                break
+            self.waiting.pop()
+            self.block_manager.allocate(seq, num_cached_blocks)
+            seq.status = SequenceStatus.RUNNING
+            budget -= self._schedule(seq, budget, output)
+            self.running.append(seq)
+        return output
+
     def _schedule(self, seq: Sequence, budget: int, output: SchedulerOutput) -> int:
         """Give seq its share of the budget: a prompt chunk, or one decoded token."""
         seq.is_prefill = seq.num_cached_tokens < seq.num_prompt_tokens
@@ -119,6 +134,10 @@ class Scheduler:
         if seq.first_scheduled_time is None:
             seq.first_scheduled_time = perf_counter()
         output.scheduled.append(seq)
+        if seq.is_prefill:
+            output.num_prefill_tokens += num_tokens
+        else:
+            output.num_decode_tokens += 1
         return num_tokens
 
     def _would_chunk(self, seq: Sequence, num_cached_blocks: int, budget: int) -> bool:
@@ -171,12 +190,14 @@ class Scheduler:
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[Sequence]:
         """Returns the sequences that produced a token; a partial prefill produces none."""
         stepped = []
-        for seq, token_id in zip(seqs, token_ids):
+        tokens = iter(token_ids)    # only the rows that sampled produced one
+        for seq in seqs:
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if seq.num_cached_tokens < seq.num_tokens:
                 continue    # prompt not finished, so no logits for this sequence
+            token_id = next(tokens)
             seq.append_token(token_id)
             if seq.first_token_time is None:
                 seq.first_token_time = perf_counter()

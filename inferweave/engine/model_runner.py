@@ -107,7 +107,7 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        self.run(seqs)
         dev.empty_cache(self.device)
 
     def allocate_kv_cache(self):
@@ -133,26 +133,27 @@ class ModelRunner:
         block_tables = dev.make_tensor(block_tables, torch.int32, self.device)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
-        max_seqlen_q = 0
-        max_seqlen_k = 0
-        slot_mapping = []
-        block_tables = None
+    def prepare_batch(self, seqs: list[Sequence]):
+        """One batch for any mix of prompt chunks and decode rows."""
+        input_ids, positions, slot_mapping = [], [], []
+        cu_seqlens_q, cu_seqlens_k = [0], [0]
+        max_seqlen_q = max_seqlen_k = 0
+        context_lens, logits_indices, temperatures = [], [], []
+        is_prefill = any(seq.is_prefill for seq in seqs)
+
         for seq in seqs:
             start = seq.num_cached_tokens
-            seqlen_q = seq.num_scheduled_tokens
-            end = start + seqlen_q
-            seqlen_k = end
-            input_ids.extend(seq[start:end])
+            end = start + seq.num_scheduled_tokens
+            input_ids.extend(seq[start:end] if seq.is_prefill else [seq.last_token])
             positions.extend(range(start, end))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seq.num_scheduled_tokens)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + end)
+            max_seqlen_q = max(seq.num_scheduled_tokens, max_seqlen_q)
+            max_seqlen_k = max(end, max_seqlen_k)
+            context_lens.append(end)
+            if end == seq.num_tokens:    # the prompt is complete, so this row samples
+                logits_indices.append(cu_seqlens_q[-1] - 1)
+                temperatures.append(seq.temperature)
             if not seq.block_table:    # warmup
                 continue
             start_block = start // self.block_size
@@ -166,38 +167,24 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+
+        block_tables = self.prepare_block_tables(seqs) if any(seq.block_table for seq in seqs) else None
+        set_context(
+            is_prefill,
+            cu_seqlens_q=dev.make_tensor(cu_seqlens_q, torch.int32, self.device),
+            cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, self.device),
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            slot_mapping=dev.make_tensor(slot_mapping, torch.int32, self.device),
+            context_lens=dev.make_tensor(context_lens, torch.int32, self.device),
+            block_tables=block_tables,
+            # A pure-decode batch samples on every row, so the gather is skipped.
+            logits_indices=dev.make_tensor(logits_indices, torch.int64, self.device) if is_prefill else None,
+        )
         input_ids = dev.make_tensor(input_ids, torch.int64, self.device)
         positions = dev.make_tensor(positions, torch.int64, self.device)
-        cu_seqlens_q = dev.make_tensor(cu_seqlens_q, torch.int32, self.device)
-        cu_seqlens_k = dev.make_tensor(cu_seqlens_k, torch.int32, self.device)
-        slot_mapping = dev.make_tensor(slot_mapping, torch.int32, self.device)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
-        return input_ids, positions
-
-    def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = dev.make_tensor(input_ids, torch.int64, self.device)
-        positions = dev.make_tensor(positions, torch.int64, self.device)
-        slot_mapping = dev.make_tensor(slot_mapping, torch.int32, self.device)
-        context_lens = dev.make_tensor(context_lens, torch.int32, self.device)
-        block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-        return input_ids, positions
-
-    def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = [seq.temperature for seq in seqs]
-        temperatures = dev.make_tensor(temperatures, torch.float32, self.device)
-        return temperatures
+        temperatures = dev.make_tensor(temperatures, torch.float32, self.device) if self.rank == 0 else None
+        return input_ids, positions, temperatures, is_prefill
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -218,9 +205,8 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+    def run(self, seqs: list[Sequence]) -> list[int]:
+        input_ids, positions, temperatures, is_prefill = self.prepare_batch(seqs)
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()

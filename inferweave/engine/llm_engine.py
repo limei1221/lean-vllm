@@ -60,15 +60,11 @@ class LLMEngine:
 
     def step(self) -> tuple[list[RequestOutput], int, int]:
         output = self.scheduler.schedule()
-        num_prefill_tokens, num_decode_tokens = output.num_prefill_tokens, output.num_decode_tokens
-        stepped = []
-        # Until M3 the runner takes one kind of batch at a time, so a mixed step is two calls.
-        for seqs, is_prefill in ((output.prefills, True), (output.decodes, False)):
-            if not seqs:
-                continue
-            token_ids = self.model_runner.call("run", seqs, is_prefill)
-            stepped += self.scheduler.postprocess(seqs, token_ids)
-        return [self._output(seq) for seq in stepped], num_prefill_tokens, num_decode_tokens
+        if not output:
+            return [], 0, 0
+        token_ids = self.model_runner.call("run", output.scheduled)
+        stepped = self.scheduler.postprocess(output.scheduled, token_ids)
+        return [self._output(seq) for seq in stepped], output.num_prefill_tokens, output.num_decode_tokens
 
     def _output(self, seq: Sequence) -> RequestOutput:
         token_id = seq.last_token

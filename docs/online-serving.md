@@ -1,7 +1,7 @@
 # Online Serving + Advanced Scheduler
 
-Status: M0, M1 and M2 landed, bar two M2 bullets noted below. M3-M6 are plan;
-this becomes the results document as they land.
+Status: M0-M3 landed, bar two M2 bullets noted below. M4-M6 are plan; this
+becomes the results document as they land.
 
 ## Goal
 
@@ -161,17 +161,22 @@ instead of two" gated by the differential tests. The split also forces two
 invariants M3 needs anyway: a sequence appears in at most one sub-batch per
 step, and only rows whose prefill completed may sample.
 
-### M3 — mixed batches through the runner and backends
+### M3 — mixed batches through the runner and backends — *done*
 
-- `Context` always carries `query_start_loc`, `seq_lens` and `block_tables`, and
-  gains `logits_indices`. `is_prefill` stops being the branch; the pure-decode
-  fast path is selected by "every query length is 1".
+- `Context` gains `logits_indices`; the existing `cu_seqlens_q` / `cu_seqlens_k`
+  / `context_lens` / `block_tables` are now filled on every step. `is_prefill`
+  survives as the field name but means "take the varlen path", and is set from
+  `any(seq.is_prefill)` — **not** from "every query length is 1", which would
+  wrongly send a one-token final prompt chunk down the decode path.
 - `ModelRunner.prepare_batch()` replaces `prepare_prefill` / `prepare_decode`.
 - `ParallelLMHead` gathers logits from `context.logits_indices` rather than
   `cu_seqlens_q[1:] - 1`, since an unfinished chunk must not sample. The
   scheduler output therefore also carries the sampler-row-to-sequence map.
   Getting this wrong corrupts output silently, so it gets its own test.
-- Backends gain a unified mixed-length path. FlashAttention needs only
+- Backends needed **no change**: `prefill` was already the unified varlen path,
+  and a decode row is just a row of query length 1. This was the milestone's
+  main risk and it evaporated on contact. For the record, the reasoning was:
+  FlashAttention needs only
   `flash_attn_varlen_func(..., block_table=...)` with per-sequence context
   lengths, a decode row being just `q_len == 1`; whether it wants `cu_seqlens_k`
   or `seqused_k` is version-dependent and gets verified against the pinned 2.8.3
@@ -179,9 +184,16 @@ step, and only rows whose prefill completed may sample.
   with bottom-right masking and simply always takes the paged path. `decode()`
   stays as the pure-decode fast path, keeping `flash_attn_with_kvcache` and
   CUDA graphs.
-- New differential test: a mixed batch against the dense oracle, with the
-  top-left-masking mutation asserted to fail it.
-- Behind `enable_chunked_prefill`, so the old path survives for the A/B.
+- New differential tests: a mixed batch of decode row, resumed chunk and cold
+  prefill against the dense oracle, and one mixed call against the separate
+  calls it replaces.
+- `enable_chunked_prefill=False` restores the pre-M2 shape — whole prompts only,
+  never mixed with decode — so the A/B has a "before" arm. A prompt that cannot
+  fit one step's budget is dropped with `finish_reason="capacity"` rather than
+  waiting forever.
+- Verified end to end on Qwen3-0.6B: greedy output is identical token-for-token
+  with `max_num_batched_tokens=16` (a ~150-token prompt in ~10 chunks) and with
+  4096 (no chunking at all).
 - `docs/attention-backends.md` updated in the same commit as the interface.
 
 ### M4 — async engine and HTTP server

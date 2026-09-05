@@ -79,6 +79,24 @@ the two agree.
 matches the oracle *and* that the top-left result differs, so the test fails if
 it ever stops discriminating.
 
+## Mixed batches
+
+A step may hold prompt chunks and decode rows together. No backend change was
+needed for that: `prefill` already takes packed varlen sequences with
+`num_query_tokens < num_key_tokens` per row, so a decode row is simply a row
+whose query length is 1, and the bottom-right mask is already the right one.
+`test_mixed_batch_of_chunks_and_decodes` checks a batch of all three shapes —
+decode row, resumed chunk, cold prefill — against the dense oracle, and
+`test_mixed_batch_matches_running_the_rows_separately` checks that one mixed
+call equals the separate `prefill` and `decode` calls it replaces.
+
+`decode` survives as the pure-decode fast path, because it reaches
+`flash_attn_with_kvcache` and is the only shape a CUDA graph can capture. The
+runner selects it only when **no** row is a prompt chunk. "Every query length is
+1" would be the wrong test: a prompt whose last chunk happens to be one token
+long also has query length 1, and it must take the varlen path so that
+`logits_indices` decides whether it samples.
+
 ## Backend selection
 
 `get_attention_backend()` resolves in order: explicit argument,

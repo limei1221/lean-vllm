@@ -179,9 +179,8 @@ class TestBatching:
         engine.step()
         arriving = engine.add(prompt(8, 100), FOREVER)
         engine.step()
-        prefill, decode = engine.model_runner.batches[1], engine.model_runner.batches[2]
-        assert prefill == (True, [(arriving.request_id, 8)])
-        assert decode == (False, [(running.request_id, 1)])
+        # one batch, both kinds of row in it
+        assert engine.model_runner.batches[1] == (True, [(running.request_id, 1), (arriving.request_id, 8)])
 
 
 class TestBudget:
@@ -202,8 +201,7 @@ class TestBudget:
         engine.step()
         assert engine.model_runner.batches[0] == (True, [(decoding.request_id, 8), (prefilling.request_id, 2)])
         engine.step()
-        assert engine.model_runner.batches[1] == (True, [(prefilling.request_id, 6)])
-        assert engine.model_runner.batches[2] == (False, [(decoding.request_id, 1)])
+        assert engine.model_runner.batches[1] == (True, [(decoding.request_id, 1), (prefilling.request_id, 6)])
 
     def test_no_admission_in_a_step_that_preempted(self, make_engine):
         """Admitting under memory pressure would only preempt again."""
@@ -250,7 +248,7 @@ class TestPrefixCache:
         second = engine.add(prompt(16), FOREVER)
         engine.step()
         # One full block hits; the trailing block is never a candidate, so 8 of 16 recompute.
-        assert [n for _, n in engine.model_runner.batches[1][1]] == [8]
+        assert dict(engine.model_runner.batches[1][1])[second.request_id] == 8
         assert second.block_table[0] == first.block_table[0]
         assert engine.scheduler.block_manager.blocks[first.block_table[0]].ref_count == 2
 
@@ -375,3 +373,49 @@ class TestLongPrompts:
         short = engine.add(prompt(8, 100), FOREVER)
         engine.step()
         assert engine.model_runner.batches[0] == (True, [(first.request_id, 40), (short.request_id, 8)])
+
+
+class TestBatchCounts:
+    """postprocess() clears num_scheduled_tokens, so the counts must be taken at schedule time."""
+
+    def test_counts_survive_postprocess(self, make_engine):
+        engine = make_engine()
+        engine.add(prompt(8), FOREVER)
+        output = engine.scheduler.schedule()
+        assert (output.num_prefill_tokens, output.num_decode_tokens) == (8, 0)
+        engine.scheduler.postprocess(output.scheduled, [1234])
+        assert (output.num_prefill_tokens, output.num_decode_tokens) == (8, 0)
+
+    def test_a_mixed_step_counts_both_kinds(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=10)
+        engine.add(prompt(8), FOREVER)
+        engine.add(prompt(8, 100), FOREVER)
+        engine.step()
+        output = engine.scheduler.schedule()
+        assert (output.num_prefill_tokens, output.num_decode_tokens) == (6, 1)
+
+
+class TestChunkedPrefillDisabled:
+
+    def test_a_prompt_is_never_split(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=16, enable_chunked_prefill=False)
+        seq = engine.add(prompt(12), FOREVER)
+        other = engine.add(prompt(12, 100), FOREVER)
+        engine.step()
+        assert engine.model_runner.batches[0] == (True, [(seq.request_id, 12)])
+        assert other in engine.scheduler.waiting    # no room for a whole prompt, so it waits
+
+    def test_prefill_does_not_mix_with_decode(self, make_engine):
+        engine = make_engine(enable_chunked_prefill=False)
+        running = engine.add(prompt(8), FOREVER)
+        engine.step()
+        arriving = engine.add(prompt(8, 100), FOREVER)
+        engine.step()
+        assert engine.model_runner.batches[1] == (True, [(arriving.request_id, 8)])
+        assert running.num_completion_tokens == 1    # starved this step, as before M2
+
+    def test_a_prompt_larger_than_the_budget_is_dropped(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=16, enable_chunked_prefill=False)
+        seq = engine.add(prompt(40), FOREVER)
+        engine.step()
+        assert seq.finish_reason == "capacity"

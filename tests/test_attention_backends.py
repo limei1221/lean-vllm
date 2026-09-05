@@ -352,3 +352,78 @@ def test_low_precision_cache_roundtrip_is_exact(backend, device, block_size, dty
 
     torch.testing.assert_close(k_cache.view(-1, NUM_KV_HEADS, HEAD_DIM)[slots], key, atol=0, rtol=0)
     torch.testing.assert_close(v_cache.view(-1, NUM_KV_HEADS, HEAD_DIM)[slots], value, atol=0, rtol=0)
+
+
+def _mixed_batch(device, block_size, dtype, num_cached, num_new, block_tables_list, num_blocks):
+    """Seed a cache and return (q, k_new, v_new, k_cache, v_cache, k_full, v_full)."""
+    k_cache, v_cache = make_cache(num_blocks, device, block_size, dtype)
+    q_list, k_full, v_full, slot_mapping = [], [], [], []
+    for i, (cached, new) in enumerate(zip(num_cached, num_new)):
+        total = cached + new
+        k_full.append(randn(total, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype))
+        v_full.append(randn(total, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype))
+        q_list.append(randn(new, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype))
+        write_prefix(k_cache, v_cache, k_full[i], v_full[i], block_tables_list[i], block_size, cached)
+        slot_mapping += slots_for(block_tables_list[i], block_size, cached, total)
+    k_new = torch.cat([k[c:] for k, c in zip(k_full, num_cached)])
+    v_new = torch.cat([v[c:] for v, c in zip(v_full, num_cached)])
+    return q_list, k_new, v_new, k_cache, v_cache, k_full, v_full, slot_mapping
+
+
+def _mixed_context(device, num_cached, num_new, block_tables_list):
+    totals = [c + n for c, n in zip(num_cached, num_new)]
+    return Context(
+        is_prefill=True,
+        cu_seqlens_q=torch.tensor([0, *torch.tensor(num_new).cumsum(0).tolist()], dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.tensor([0, *torch.tensor(totals).cumsum(0).tolist()], dtype=torch.int32, device=device),
+        max_seqlen_q=max(num_new), max_seqlen_k=max(totals),
+        block_tables=torch.tensor(block_tables_list, dtype=torch.int32, device=device),
+    )
+
+
+def test_mixed_batch_of_chunks_and_decodes(backend, device, block_size, dtype, tol):
+    """One batch holding a decode row, a resumed chunk and a cold prefill."""
+    num_cached = [2 * block_size + 5, block_size + 1, 0]
+    num_new = [1, 7, 4]    # decode, resumed chunk, cold
+    block_tables_list = [[0, 1, 2], [3, 4, -1], [5, -1, -1]]
+
+    q_list, k_new, v_new, k_cache, v_cache, k_full, v_full, slots = _mixed_batch(
+        device, block_size, dtype, num_cached, num_new, block_tables_list, 6
+    )
+    backend.store_kvcache(k_new, v_new, k_cache, v_cache,
+                          torch.tensor(slots, dtype=torch.int32, device=device))
+    context = _mixed_context(device, num_cached, num_new, block_tables_list)
+    out = backend.prefill(torch.cat(q_list), k_new, v_new, k_cache, v_cache, context)
+
+    expected = torch.cat([dense_attention(q, k, v) for q, k, v in zip(q_list, k_full, v_full)])
+    torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+
+
+def test_mixed_batch_matches_running_the_rows_separately(backend, device, block_size, dtype, tol):
+    """One mixed call must equal the prefill call plus the decode call it replaces."""
+    num_cached = [block_size + 1, 3 * block_size]
+    num_new = [6, 1]    # a chunk, then a decode row; order must not matter
+    block_tables_list = [[0, 1, -1, -1], [2, 3, 4, 5]]
+
+    q_list, k_new, v_new, k_cache, v_cache, _, _, slots = _mixed_batch(
+        device, block_size, dtype, num_cached, num_new, block_tables_list, 6
+    )
+    backend.store_kvcache(k_new, v_new, k_cache, v_cache,
+                          torch.tensor(slots, dtype=torch.int32, device=device))
+
+    merged = backend.prefill(torch.cat(q_list), k_new, v_new, k_cache, v_cache,
+                             _mixed_context(device, num_cached, num_new, block_tables_list))
+
+    chunk = backend.prefill(q_list[0], k_new[:num_new[0]], v_new[:num_new[0]], k_cache, v_cache, Context(
+        is_prefill=True,
+        cu_seqlens_q=torch.tensor([0, num_new[0]], dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.tensor([0, num_cached[0] + num_new[0]], dtype=torch.int32, device=device),
+        max_seqlen_q=num_new[0], max_seqlen_k=num_cached[0] + num_new[0],
+        block_tables=torch.tensor([block_tables_list[0]], dtype=torch.int32, device=device),
+    ))
+    decoded = backend.decode(q_list[1], k_cache, v_cache, Context(
+        is_prefill=False,
+        context_lens=torch.tensor([num_cached[1] + num_new[1]], dtype=torch.int32, device=device),
+        block_tables=torch.tensor([block_tables_list[1]], dtype=torch.int32, device=device),
+    ))
+    torch.testing.assert_close(merged, torch.cat([chunk, decoded]), atol=tol, rtol=tol)
