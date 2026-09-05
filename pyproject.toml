@@ -18,6 +18,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+serve = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
 cuda = [
     "triton>=3.0.0",
     # flash-attn wheels are built against a specific torch minor + CUDA major; pin torch to match.
@@ -27,9 +31,12 @@ cuda = [
     "flash-attn==2.8.3",
 ]
 
+[project.scripts]
+inferweave = "inferweave.entrypoints.cli:main"
+
 # a group, not an extra: uv installs it on a bare `uv sync`
 [dependency-groups]
-dev = ["pytest"]
+dev = ["pytest", "httpx"]    # httpx drives the server tests over its ASGI transport
 
 [project.urls]
 Homepage="https://github.com/limei1221/inferweave"

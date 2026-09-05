@@ -19,7 +19,7 @@ class LLMEngine:
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
+        self.config = config = Config(model, **config_kwargs)
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -47,10 +47,9 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params, request_id)
-        self.scheduler.add(seq)
-        self.detokenizers[seq.request_id] = IncrementalDetokenizer(
-            self.tokenizer, prompt, seq.skip_special_tokens
-        )
+        detokenizer = IncrementalDetokenizer(self.tokenizer, prompt, seq.skip_special_tokens)
+        self.scheduler.add(seq)    # last, so a refused request leaves nothing behind
+        self.detokenizers[seq.request_id] = detokenizer
         return seq.request_id
 
     def abort_request(self, request_id: str) -> bool:
@@ -60,11 +59,12 @@ class LLMEngine:
 
     def step(self) -> tuple[list[RequestOutput], int, int]:
         output = self.scheduler.schedule()
-        if not output:
-            return [], 0, 0
-        token_ids = self.model_runner.call("run", output.scheduled)
-        stepped = self.scheduler.postprocess(output.scheduled, token_ids)
-        return [self._output(seq) for seq in stepped], output.num_prefill_tokens, output.num_decode_tokens
+        stepped = []
+        if output:
+            token_ids = self.model_runner.call("run", output.scheduled)
+            stepped = self.scheduler.postprocess(output.scheduled, token_ids)
+        outputs = [self._output(seq) for seq in stepped] + [self._dropped(seq) for seq in output.dropped]
+        return outputs, output.num_prefill_tokens, output.num_decode_tokens
 
     def _output(self, seq: Sequence) -> RequestOutput:
         token_id = seq.last_token
@@ -79,6 +79,17 @@ class LLMEngine:
             finished=seq.is_finished,
             finish_reason=seq.finish_reason,
             metrics=seq.metrics() if seq.is_finished else None,
+        )
+
+    def _dropped(self, seq: Sequence) -> RequestOutput:
+        """Finished by the scheduler without ever sampling, so there is no token."""
+        self.detokenizers.pop(seq.request_id, None)
+        return RequestOutput(
+            request_id=seq.request_id,
+            token_ids=[],
+            finished=True,
+            finish_reason=seq.finish_reason,
+            metrics=seq.metrics(),
         )
 
     def is_finished(self):

@@ -14,7 +14,7 @@ hardware.
 | | Project | Status |
 |---|---|---|
 | 0 | Attention backend abstraction | interface + Torch/FlashAttention backends done |
-| 1 | Online serving + advanced scheduler | next |
+| 1 | Online serving + advanced scheduler | scheduler, async engine and OpenAI server done |
 | 2 | DeepSeek-style model support: MLA + MoE + YaRN | |
 | 3 | Speculative decoding | |
 | 4 | Disaggregated prefill / decode | |
@@ -26,6 +26,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync                  # deps, dev tools and the package, into .venv
 uv sync --extra cuda     # add FlashAttention and Triton (NVIDIA only)
+uv sync --extra serve    # add FastAPI and uvicorn for the HTTP server
 ```
 
 FlashAttention and Triton are optional. Without them the engine runs on CPU and
@@ -55,6 +56,28 @@ outputs[0]["text"]
 
 The attention backend is picked automatically and can be forced with
 `INFERWEAVE_ATTENTION_BACKEND`.
+
+## Serving
+
+```bash
+uv run inferweave serve ~/huggingface/Qwen3-0.6B --port 8000
+```
+
+An OpenAI-compatible server: `/v1/completions`, `/v1/chat/completions` (both
+with SSE streaming), `/v1/models` and `/health`. Requests arrive at any time and
+share one token budget per step, so a prompt being prefilled in chunks and a
+batch of decoding requests run together; a client that hangs up frees its KV
+blocks straight away.
+
+```bash
+curl http://localhost:8000/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model": "qwen", "prompt": "Hello, InferWeave.", "max_tokens": 32, "temperature": 0}'
+```
+
+Sampling parameters the engine does not implement (`top_p`, `seed`, penalties,
+`n > 1`, and the rest) are refused with a 400 rather than ignored. Every engine
+flag is a `Config` field; `inferweave serve --help` lists them. Design and
+milestones are in [docs/online-serving.md](docs/online-serving.md).
 
 ## Benchmarks
 

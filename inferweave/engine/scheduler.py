@@ -13,6 +13,7 @@ class SchedulerOutput:
     """What one step should run. A sequence carries its own num_scheduled_tokens."""
     scheduled: list[Sequence] = field(default_factory=list)
     preempted: list[Sequence] = field(default_factory=list)
+    dropped: list[Sequence] = field(default_factory=list)    # finished without ever sampling
     # Counted while scheduling: postprocess() clears num_scheduled_tokens.
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
@@ -63,11 +64,13 @@ class Scheduler:
 
     def schedule(self) -> SchedulerOutput:
         """One token budget per step, running sequences first so decode is never starved."""
+        dropped = []
         if not self.enable_chunked_prefill:
             output = self._schedule_whole_prompts()
             if output:
                 return output    # prefill-only step, as before M2
-        output = SchedulerOutput()
+            dropped = output.dropped    # nothing to run, but the drops still owe an output
+        output = SchedulerOutput(dropped=dropped)
         budget = self.max_num_batched_tokens
         still_running: deque[Sequence] = deque()
 
@@ -113,7 +116,7 @@ class Scheduler:
             num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             if num_tokens > self.max_num_batched_tokens:
                 self.waiting.pop()    # will never fit in one step, and splitting is off
-                self._drop(seq, "capacity")
+                self._drop(seq, "capacity", output)
                 continue
             if num_tokens > budget:
                 break
@@ -166,7 +169,7 @@ class Scheduler:
             else:
                 # Alone in the cache and still short of a block: it can never fit.
                 self.block_manager.deallocate(seq)
-                self._drop(seq, "capacity")
+                self._drop(seq, "capacity", output)
                 return False
         return True
 
@@ -183,9 +186,11 @@ class Scheduler:
         seq.finish_reason = reason
         seq.finish_time = perf_counter()
 
-    def _drop(self, seq: Sequence, reason: str):
+    def _drop(self, seq: Sequence, reason: str, output: SchedulerOutput | None = None):
         self._finish(seq, reason)
         del self.seqs[seq.request_id]
+        if output is not None:
+            output.dropped.append(seq)    # the caller is still owed a final output
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[Sequence]:
         """Returns the sequences that produced a token; a partial prefill produces none."""

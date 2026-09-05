@@ -1,7 +1,9 @@
 """A scheduler harness with no torch, no model and no GPU, so scheduling is testable on a laptop."""
 
+import asyncio
 import pytest
 from dataclasses import dataclass
+from functools import wraps
 from itertools import count
 
 from inferweave.engine.output import RequestOutput
@@ -19,6 +21,7 @@ class FakeConfig:
     kvcache_block_size: int = 8
     max_num_seqs: int = 8
     max_num_batched_tokens: int = 1024
+    max_model_len: int = 4096
     eos: int = EOS
     enable_chunked_prefill: bool = True
     scheduling_policy: str = "fcfs"
@@ -67,6 +70,7 @@ class FakeEngine:
         self.config = config
         self.scheduler = Scheduler(config)
         self.model_runner = runner
+        self.last_output = None
 
     def add(self, prompt: list[int], sampling_params: SamplingParams | None = None) -> Sequence:
         seq = Sequence(prompt, sampling_params or SamplingParams())
@@ -74,11 +78,11 @@ class FakeEngine:
         return seq
 
     def step(self) -> list[RequestOutput]:
-        output = self.scheduler.schedule()
-        if not output:
-            return []
-        token_ids = self.model_runner.call("run", output.scheduled)
-        stepped = self.scheduler.postprocess(output.scheduled, token_ids)
+        output = self.last_output = self.scheduler.schedule()
+        stepped = []
+        if output:
+            token_ids = self.model_runner.call("run", output.scheduled)
+            stepped = self.scheduler.postprocess(output.scheduled, token_ids)
         return [
             RequestOutput(
                 request_id=seq.request_id,
@@ -88,6 +92,15 @@ class FakeEngine:
                 metrics=seq.metrics() if seq.is_finished else None,
             )
             for seq in stepped
+        ] + [
+            RequestOutput(
+                request_id=seq.request_id,
+                token_ids=[],
+                finished=True,
+                finish_reason=seq.finish_reason,
+                metrics=seq.metrics(),
+            )
+            for seq in output.dropped
         ]
 
     def is_finished(self):
@@ -102,6 +115,32 @@ class FakeEngine:
             for output in self.step():
                 outputs.setdefault(output.request_id, []).extend(output.token_ids)
         raise AssertionError("engine did not finish; a sequence is stuck")
+
+
+class FakeLLMEngine(FakeEngine):
+    """LLMEngine's surface, so AsyncLLMEngine can be driven without a model."""
+
+    tokenizer = None    # the async engine only needs one for str prompts
+
+    def add_request(self, prompt: list[int], sampling_params=None, request_id: str | None = None) -> str:
+        seq = Sequence(prompt, sampling_params or SamplingParams(), request_id)
+        self.scheduler.add(seq)
+        return seq.request_id
+
+    def abort_request(self, request_id: str) -> bool:
+        return self.scheduler.abort(request_id)
+
+    def step(self) -> tuple[list[RequestOutput], int, int]:
+        outputs = super().step()
+        return outputs, self.last_output.num_prefill_tokens, self.last_output.num_decode_tokens
+
+
+def asyncio_test(test):
+    """No async plugin in the dev group, so each test drives its own loop."""
+    @wraps(test)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(test(*args, **kwargs))
+    return wrapper
 
 
 @pytest.fixture(autouse=True)
