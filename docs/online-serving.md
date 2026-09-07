@@ -1,6 +1,6 @@
 # Online Serving + Advanced Scheduler
 
-Status: M0-M5 landed, bar two M2 bullets noted below. M6 is plan.
+Status: M0-M5 have landed, except for two M2 items (see M2). M6 is still a plan.
 
 ## Goal
 
@@ -10,12 +10,15 @@ produced, and one token-budget scheduler decides every step what to run —
 mixing chunked prefill with decode, with admission control, preemption, and a
 pluggable fairness policy.
 
-Done when `inferweave serve` speaks OpenAI-compatible SSE and frees a
-disconnected client's KV blocks mid-generation; when one step can hold prefill
-chunks and decode rows together with the backends still matching the dense
-oracle; and when the same Poisson-arrival benchmark script runs against both
-InferWeave and vLLM and this document publishes the resulting
-goodput-versus-p99 curves.
+Done when three things are true:
+
+1. `inferweave serve` speaks OpenAI-compatible SSE, and a disconnected client's
+   KV blocks are freed mid-generation.
+2. One step can hold prefill chunks and decode rows together, with the backends
+   still matching the dense oracle.
+3. One Poisson-arrival benchmark script runs against both InferWeave and vLLM,
+   and this document publishes the resulting curves: goodput (completed
+   requests per second, not counting rejections) against p99 latency.
 
 Not in scope: multi-node, KV offload, disaggregated prefill (Project 4),
 speculative decoding (Project 3), LoRA, beam search, `n > 1`.
@@ -70,7 +73,7 @@ Where the design forks, what vLLM does and what this project does.
 | Is chunked prefill optional? | V1 removed the flag; always on. | Keep `enable_chunked_prefill` anyway. It is the only honest way to get the "before" number. |
 | Preemption by swap or recompute? | V1 dropped swapping; recompute, back to the head of the queue. | Recompute. Prefix caching means recompute often re-hits the blocks it just dropped — worth measuring rather than assuming. |
 | Where does priority come from? | Client-supplied `priority` field, lower means earlier, arrival breaks ties. | Same. Deriving it server-side from prompt length was rejected: it turns the policy comparison into a comparison of two heuristics. |
-| Backpressure | Unbounded queueing, no rejection. | Queue by default, but `max_waiting_requests` returns 429. Deliberately unlike vLLM — unbounded queueing converts overload into unbounded TTFT, and the benchmark can show it. |
+| Admission control | Unbounded queueing, no rejection. | Queue by default, matching vLLM, so the M6 comparison runs the same discipline on both sides. `max_waiting_requests` (429 at arrival) and `request_timeout` (504 after waiting too long) are opt-in, because unbounded queueing converts overload into unbounded TTFT and the benchmark can show it. |
 | Engine loop: thread or process? | V1 uses a separate process with ZMQ to keep GIL contention off the engine. | A thread first: no serialization, no IPC, far less code. The process boundary is the known next move if Python work shows up in step time. |
 | Metric names | `vllm:time_to_first_token_seconds`, `vllm:num_requests_running`, ... | Mirrored under `inferweave:`, so one dashboard reads both engines. |
 
@@ -115,12 +118,15 @@ Chunked prefill applies to any sequence; victim selection is a policy object
 single step's budget, which is what actually stops a long prompt from starving
 short ones; `max_num_partial_prefills` caps how many prompts may be mid-chunk at
 once. vLLM splits the same concern differently, marking prompts over a threshold
-as "long" and capping those separately. A sequence alone in the cache that still
-cannot grow is dropped with `finish_reason="capacity"` rather than preempted
-forever — the old code asserted here instead.
+as "long" and capping those separately.
 
-Aging the effective priority by queue time is the fix for one client starving
-others, left out until the benchmark shows the starvation it would solve.
+A sequence that is alone in the cache and still cannot grow is dropped with
+`finish_reason="capacity"` rather than preempted forever. The old code asserted
+here instead.
+
+One client can still starve others. The fix is to age a request's effective
+priority by how long it has queued — left out until the benchmark shows the
+starvation it would solve.
 
 Two bullets **not done**: prefix-cache-aware admission (it reorders the waiting
 queue, so it belongs with the policy object rather than the admission loop), and
@@ -179,6 +185,14 @@ until a profile says the deque scan costs something).
 - `/metrics` is **deferred to M5**: nothing aggregates counters until
   `engine/metrics.py` exists, and an endpoint serving zeroes is worse than none.
 
+**Two forms of admission control, both off by default.** `max_waiting_requests`
+refuses a request on arrival with a 429. `request_timeout` drops one that has
+waited that long without ever being scheduled, and the server answers 504. The
+timeout only touches sequences that have never run: a preempted sequence has
+tokens to show for itself, and `max_tokens` already bounds a request that is
+running. Both stay off for the M6 comparison, so neither engine sheds what the
+other queues.
+
 **A request could finish without ever producing an output.** The scheduler can
 drop a request that will never fit (`finish_reason="capacity"`) without it ever
 reaching the sampler, so nothing was pushed to the stream and the client hung
@@ -234,10 +248,11 @@ above.
   and `LLMEngine.step()` records. Keeping the recording out of the scheduler is
   what lets the test harness exercise it with no model.
 
-The summary reports counts, sums and means, and no percentiles: these buckets
-are too coarse to interpolate one from without lying about it, and M6's client
-measures the real ones. Rates are `None` rather than `0.0` before anything has
-happened, since a hit rate of zero and no queries at all are different claims.
+The summary reports counts, sums and means, and no percentiles: the histogram
+buckets are too coarse to interpolate a percentile from without lying about it,
+and M6's client measures the real ones. Rates are `None` rather than `0.0`
+before anything has happened, since a hit rate of zero and no queries at all are
+different claims.
 
 On GPU utilization: the honest metric is `model_busy_fraction`, the share of
 wall clock spent inside a step. `nvidia-smi` is reported beside it as
@@ -282,7 +297,7 @@ Rejections are a reported outcome: goodput sits beside throughput, and any table
 reporting percentiles also reports rejection rate, since percentiles cover
 completed requests only and an engine shedding 90% of its load would otherwise
 show an excellent p99. Non-429 failures are counted separately and abort the run
-above a threshold; they are bugs, not backpressure.
+above a threshold; they are bugs, not admission control.
 
 ## Blast radius
 
@@ -299,12 +314,13 @@ weights leaves ~60GB of KV while being large enough that a step is not dominated
 by scheduler Python: at 0.6B a decode step is 1-3ms and a vLLM comparison would
 largely measure interpreter speed against vLLM's multi-process frontend.
 
-Not Blackwell: the pinned `flash-attn==2.8.3` wheel is a `cu12torch2.9` build
-targeting sm80-sm90, and there the import succeeds and `torch.cuda.is_available()`
-is true, so `is_available()` returns True and the kernels fail below that check.
-The selector's refusal to downgrade silently does not protect against a backend
-that is importable but unsupported. Ampere also keeps `docs/attention-backends.md`
-honest, since its numerics were validated on an A100.
+Not Blackwell. The pinned `flash-attn==2.8.3` wheel is a `cu12torch2.9` build
+targeting sm80-sm90. On Blackwell it still imports, and `torch.cuda.is_available()`
+is still true — so the backend selector's own `is_available()` says yes and picks
+flash-attn. The kernels then fail at launch, below the point where anything
+checked. Refusing to downgrade silently does not protect against a backend that
+imports but cannot run. Ampere also keeps `docs/attention-backends.md` honest,
+since its numerics were validated on an A100.
 
 L40S 48GB is the budget substitute at half the price, though ~864 GB/s against
 the A100's ~2 TB/s makes decode-bound TPOT incomparable to published numbers.
@@ -343,8 +359,9 @@ Two confounds to control for:
   memory — so changing the token budget silently changes the number of KV
   blocks. Pin `num_kvcache_blocks` for every run.
 - vLLM queues without bound, so its rejection rate is zero by construction and
-  overload lands in its p99; InferWeave sheds load and moves the same pressure
-  into its rejection rate. Compare on goodput-versus-p99, never p99 alone.
+  overload lands in its p99. InferWeave does the same by default, but with
+  admission control switched on it moves that pressure into its rejection rate
+  instead. Compare on goodput-versus-p99, never p99 alone.
 
 ## Risks
 
