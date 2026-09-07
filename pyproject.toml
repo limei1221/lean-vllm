@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "inferweave"
+name = "lean-vllm"
 version = "0.2.0"
 authors = [{ name = "Mei Li" }]
 license = "MIT"
@@ -32,14 +32,14 @@ cuda = [
 ]
 
 [project.scripts]
-inferweave = "inferweave.entrypoints.cli:main"
+lean-vllm = "lean_vllm.entrypoints.cli:main"
 
 # a group, not an extra: uv installs it on a bare `uv sync`
 [dependency-groups]
 dev = ["pytest", "httpx2"]    # httpx2 drives the server tests over its ASGI transport
 
 [project.urls]
-Homepage="https://github.com/limei1221/inferweave"
+Homepage="https://github.com/limei1221/lean-vllm"
 Upstream="https://github.com/GeeeekExplorer/nano-vllm"
 
 [tool.pytest.ini_options]
@@ -71,4 +71,4 @@ flash-attn = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["inferweave*"]
+include = ["lean_vllm*"]

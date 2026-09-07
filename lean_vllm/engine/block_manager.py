@@ -2,7 +2,7 @@ from collections import deque
 import xxhash
 import numpy as np
 
-from inferweave.engine.sequence import Sequence
+from lean_vllm.engine.sequence import Sequence
 
 
 class Block:

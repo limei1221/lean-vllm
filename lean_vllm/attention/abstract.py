@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from inferweave.utils.context import Context
+from lean_vllm.utils.context import Context
 
 
 class AttentionBackend(ABC):
@@ -17,7 +17,7 @@ class AttentionBackend(ABC):
     @staticmethod
     @abstractmethod
     def get_name() -> str:
-        """Identifier matching INFERWEAVE_ATTENTION_BACKEND."""
+        """Identifier matching LEAN_VLLM_ATTENTION_BACKEND."""
 
     @staticmethod
     @abstractmethod

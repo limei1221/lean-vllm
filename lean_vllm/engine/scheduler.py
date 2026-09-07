@@ -2,10 +2,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from time import perf_counter
 
-from inferweave.config import Config
-from inferweave.engine.sequence import Sequence, SequenceStatus
-from inferweave.engine.block_manager import BlockManager
-from inferweave.engine.policy import SchedulingPolicy
+from lean_vllm.config import Config
+from lean_vllm.engine.sequence import Sequence, SequenceStatus
+from lean_vllm.engine.block_manager import BlockManager
+from lean_vllm.engine.policy import SchedulingPolicy
 
 
 @dataclass(slots=True)

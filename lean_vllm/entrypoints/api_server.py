@@ -10,19 +10,19 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from inferweave.engine.async_engine import AsyncLLMEngine, EngineDeadError
-from inferweave.engine.output import RequestOutput
-from inferweave.engine.scheduler import QueueFull
-from inferweave.entrypoints import protocol
-from inferweave.entrypoints.protocol import (
+from lean_vllm.engine.async_engine import AsyncLLMEngine, EngineDeadError
+from lean_vllm.engine.output import RequestOutput
+from lean_vllm.engine.scheduler import QueueFull
+from lean_vllm.entrypoints import protocol
+from lean_vllm.entrypoints.protocol import (
     BaseRequest,
     ChatCompletionRequest,
     CompletionRequest,
     ModelCard,
     ModelList,
 )
-from inferweave.entrypoints.stop_checker import StopChecker
-from inferweave.sampling_params import SamplingParams
+from lean_vllm.entrypoints.stop_checker import StopChecker
+from lean_vllm.sampling_params import SamplingParams
 
 DONE = "data: [DONE]\n\n"
 
@@ -39,7 +39,7 @@ def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
         yield
         engine.stop()
 
-    app = FastAPI(title="InferWeave", lifespan=lifespan)
+    app = FastAPI(title="lean-vLLM", lifespan=lifespan)
 
     @app.exception_handler(RequestValidationError)
     async def _bad_request(request: Request, exc: RequestValidationError):

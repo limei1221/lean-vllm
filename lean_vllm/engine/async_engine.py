@@ -13,9 +13,9 @@ from queue import Empty, SimpleQueue
 from typing import AsyncIterator, Callable
 from uuid import uuid4
 
-from inferweave.engine.llm_engine import LLMEngine
-from inferweave.engine.output import RequestOutput
-from inferweave.sampling_params import SamplingParams
+from lean_vllm.engine.llm_engine import LLMEngine
+from lean_vllm.engine.output import RequestOutput
+from lean_vllm.sampling_params import SamplingParams
 
 # The scheduler can hand back an empty step (a prompt that no longer fits the
 # cache, say). Nothing but intake can change that, but poll rather than block
@@ -95,7 +95,7 @@ class AsyncLLMEngine:
     def start(self):
         """Called from the event loop that will read the streams."""
         self._loop = asyncio.get_running_loop()
-        self._thread = threading.Thread(target=self._run, name="inferweave-engine", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="lean-vllm-engine", daemon=True)
         self._thread.start()
 
     def stop(self, timeout: float = 30.0):

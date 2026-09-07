@@ -1,7 +1,7 @@
 import os
 import time
 from random import randint, seed
-from inferweave import LLM, SamplingParams
+from lean_vllm import LLM, SamplingParams
 # from vllm import LLM, SamplingParams
 
 

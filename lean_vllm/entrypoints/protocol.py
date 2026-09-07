@@ -15,9 +15,9 @@ from pydantic import BaseModel, ConfigDict, model_validator
 # Each carries the values that are a no-op, so a client sending OpenAI's default
 # for a field it never set is not punished for it.
 UNSUPPORTED = {
-    "top_p": ((1.0,), "InferWeave samples with temperature only"),
-    "top_k": ((0, -1), "InferWeave samples with temperature only"),
-    "min_p": ((0.0,), "InferWeave samples with temperature only"),
+    "top_p": ((1.0,), "lean-vLLM samples with temperature only"),
+    "top_k": ((0, -1), "lean-vLLM samples with temperature only"),
+    "min_p": ((0.0,), "lean-vLLM samples with temperature only"),
     "best_of": ((1,), "n > 1 is out of scope"),
     "logprobs": ((False, 0), "the sampler does not return logprobs"),
     "top_logprobs": ((0,), "the sampler does not return logprobs"),
@@ -118,7 +118,7 @@ class ModelCard(BaseModel):
     id: str
     object: str = "model"
     created: int = 0
-    owned_by: str = "inferweave"
+    owned_by: str = "lean-vllm"
 
 
 class ModelList(BaseModel):

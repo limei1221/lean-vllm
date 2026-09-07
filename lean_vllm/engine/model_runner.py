@@ -5,14 +5,14 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from inferweave.attention import get_attention_backend
-from inferweave.config import Config
-from inferweave.engine.sequence import Sequence
-from inferweave.models.qwen3 import Qwen3ForCausalLM
-from inferweave.layers.sampler import Sampler
-from inferweave.utils.context import set_context, get_context, reset_context
-from inferweave.utils.loader import load_model
-from inferweave.utils import device as dev
+from lean_vllm.attention import get_attention_backend
+from lean_vllm.config import Config
+from lean_vllm.engine.sequence import Sequence
+from lean_vllm.models.qwen3 import Qwen3ForCausalLM
+from lean_vllm.layers.sampler import Sampler
+from lean_vllm.utils.context import set_context, get_context, reset_context
+from lean_vllm.utils.loader import load_model
+from lean_vllm.utils import device as dev
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +51,11 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="inferweave", create=True, size=2**20)
+                self.shm = SharedMemory(name="lean_vllm", create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="inferweave")
+                self.shm = SharedMemory(name="lean_vllm")
                 self.loop()
 
     def exit(self):

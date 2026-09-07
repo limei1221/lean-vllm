@@ -8,11 +8,11 @@ pytest.importorskip("fastapi", reason="the serve extra is not installed")
 
 from fastapi.testclient import TestClient
 
-from inferweave.engine.async_engine import EngineDeadError
-from inferweave.engine.metrics import Metrics
-from inferweave.engine.output import RequestOutput
-from inferweave.engine.scheduler import QueueFull
-from inferweave.entrypoints.api_server import build_app
+from lean_vllm.engine.async_engine import EngineDeadError
+from lean_vllm.engine.metrics import Metrics
+from lean_vllm.engine.output import RequestOutput
+from lean_vllm.engine.scheduler import QueueFull
+from lean_vllm.entrypoints.api_server import build_app
 
 MODEL = "fake-model"
 
@@ -111,8 +111,8 @@ class TestEndpoints:
         complete(client)
         response = client.get("/metrics")
         assert response.headers["content-type"].startswith("text/plain")
-        assert "# TYPE inferweave:num_requests_received_total counter" in response.text
-        assert "inferweave:num_requests_received_total 1" in response.text
+        assert "# TYPE lean_vllm:num_requests_received_total counter" in response.text
+        assert "lean_vllm:num_requests_received_total 1" in response.text
 
     def test_metrics_json_is_the_benchmark_summary(self, client):
         complete(client)

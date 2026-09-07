@@ -3,12 +3,12 @@ from torch import nn
 import torch.distributed as dist
 from transformers import Qwen3Config
 
-from inferweave.layers.activation import SiluAndMul
-from inferweave.layers.attention import Attention
-from inferweave.layers.layernorm import RMSNorm
-from inferweave.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
-from inferweave.layers.rotary_embedding import get_rope
-from inferweave.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from lean_vllm.layers.activation import SiluAndMul
+from lean_vllm.layers.attention import Attention
+from lean_vllm.layers.layernorm import RMSNorm
+from lean_vllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from lean_vllm.layers.rotary_embedding import get_rope
+from lean_vllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 class Qwen3Attention(nn.Module):

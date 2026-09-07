@@ -2,8 +2,8 @@
 
 import pytest
 
-from inferweave.engine.metrics import Counter, Gauge, Histogram, Metrics
-from inferweave.sampling_params import SamplingParams
+from lean_vllm.engine.metrics import Counter, Gauge, Histogram, Metrics
+from lean_vllm.sampling_params import SamplingParams
 
 FOREVER = SamplingParams(max_tokens=64, ignore_eos=True)
 
@@ -15,39 +15,39 @@ def prompt(n: int, start: int = 0) -> list[int]:
 class TestExposition:
 
     def test_a_counter_renders_its_total(self):
-        counter = Counter("inferweave:things_total", "Things.")
+        counter = Counter("lean_vllm:things_total", "Things.")
         counter.inc()
         counter.inc(3)
-        assert counter.render()[-1] == "inferweave:things_total 4"
+        assert counter.render()[-1] == "lean_vllm:things_total 4"
 
     def test_a_labelled_counter_renders_one_line_per_value(self):
-        counter = Counter("inferweave:request_success_total", "Finishes.", label="finish_reason")
+        counter = Counter("lean_vllm:request_success_total", "Finishes.", label="finish_reason")
         counter.inc(label_value="stop")
         counter.inc(label_value="length")
         counter.inc(label_value="stop")
         assert counter.render()[-2:] == [
-            'inferweave:request_success_total{finish_reason="length"} 1',
-            'inferweave:request_success_total{finish_reason="stop"} 2',
+            'lean_vllm:request_success_total{finish_reason="length"} 1',
+            'lean_vllm:request_success_total{finish_reason="stop"} 2',
         ]
 
     def test_a_gauge_renders_the_last_value_set(self):
-        gauge = Gauge("inferweave:num_requests_running", "Running.")
+        gauge = Gauge("lean_vllm:num_requests_running", "Running.")
         gauge.set(5)
         gauge.set(2)
-        assert gauge.render()[-1] == "inferweave:num_requests_running 2"
+        assert gauge.render()[-1] == "lean_vllm:num_requests_running 2"
 
     def test_histogram_buckets_are_cumulative(self):
-        histogram = Histogram("inferweave:seconds", "Seconds.", (1.0, 10.0, float("inf")))
+        histogram = Histogram("lean_vllm:seconds", "Seconds.", (1.0, 10.0, float("inf")))
         for value in (0.5, 5.0, 50.0):
             histogram.observe(value)
         rendered = histogram.render()
         assert rendered[-5:-1] == [
-            'inferweave:seconds_bucket{le="1"} 1',
-            'inferweave:seconds_bucket{le="10"} 2',
-            'inferweave:seconds_bucket{le="+Inf"} 3',
-            "inferweave:seconds_sum 55.5",
+            'lean_vllm:seconds_bucket{le="1"} 1',
+            'lean_vllm:seconds_bucket{le="10"} 2',
+            'lean_vllm:seconds_bucket{le="+Inf"} 3',
+            "lean_vllm:seconds_sum 55.5",
         ]
-        assert rendered[-1] == "inferweave:seconds_count 3"
+        assert rendered[-1] == "lean_vllm:seconds_count 3"
 
     def test_every_metric_is_declared_before_it_is_sampled(self):
         """A sample with no preceding # TYPE is not scrapeable."""

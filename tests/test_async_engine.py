@@ -6,10 +6,10 @@ import threading
 import pytest
 
 from conftest import FakeConfig, FakeLLMEngine, FakeModelRunner, asyncio_test
-from inferweave.engine.async_engine import AsyncLLMEngine, EngineDeadError
-from inferweave.engine.scheduler import QueueFull
-from inferweave.engine.sequence import Sequence
-from inferweave.sampling_params import SamplingParams
+from lean_vllm.engine.async_engine import AsyncLLMEngine, EngineDeadError
+from lean_vllm.engine.scheduler import QueueFull
+from lean_vllm.engine.sequence import Sequence
+from lean_vllm.sampling_params import SamplingParams
 
 FOREVER = SamplingParams(max_tokens=64, ignore_eos=True)
 

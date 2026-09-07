@@ -4,9 +4,9 @@ import os
 
 import pytest
 
-from inferweave.utils.detokenizer import IncrementalDetokenizer
+from lean_vllm.utils.detokenizer import IncrementalDetokenizer
 
-MODEL = os.path.expanduser(os.getenv("INFERWEAVE_TEST_MODEL", "~/huggingface/Qwen3-0.6B"))
+MODEL = os.path.expanduser(os.getenv("LEAN_VLLM_TEST_MODEL", "~/huggingface/Qwen3-0.6B"))
 SPECIAL = 256
 
 

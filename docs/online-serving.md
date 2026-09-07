@@ -4,7 +4,7 @@ Status: M0-M5 have landed, except for two M2 items (see M2). M6 is still a plan.
 
 ## Goal
 
-Turn InferWeave from an offline batch generator into an online serving engine:
+Turn lean-vLLM from an offline batch generator into an online serving engine:
 requests arrive at arbitrary times over HTTP, tokens stream back as they are
 produced, and one token-budget scheduler decides every step what to run —
 mixing chunked prefill with decode, with admission control, preemption, and a
@@ -12,11 +12,11 @@ pluggable fairness policy.
 
 Done when three things are true:
 
-1. `inferweave serve` speaks OpenAI-compatible SSE, and a disconnected client's
+1. `lean-vllm serve` speaks OpenAI-compatible SSE, and a disconnected client's
    KV blocks are freed mid-generation.
 2. One step can hold prefill chunks and decode rows together, with the backends
    still matching the dense oracle.
-3. One Poisson-arrival benchmark script runs against both InferWeave and vLLM,
+3. One Poisson-arrival benchmark script runs against both lean-vLLM and vLLM,
    and this document publishes the resulting curves: goodput (completed
    requests per second, not counting rejections) against p99 latency.
 
@@ -75,7 +75,7 @@ Where the design forks, what vLLM does and what this project does.
 | Where does priority come from? | Client-supplied `priority` field, lower means earlier, arrival breaks ties. | Same. Deriving it server-side from prompt length was rejected: it turns the policy comparison into a comparison of two heuristics. |
 | Admission control | Unbounded queueing, no rejection. | Queue by default, matching vLLM, so the M6 comparison runs the same discipline on both sides. `max_waiting_requests` (429 at arrival) and `request_timeout` (504 after waiting too long) are opt-in, because unbounded queueing converts overload into unbounded TTFT and the benchmark can show it. |
 | Engine loop: thread or process? | V1 uses a separate process with ZMQ to keep GIL contention off the engine. | A thread first: no serialization, no IPC, far less code. The process boundary is the known next move if Python work shows up in step time. |
-| Metric names | `vllm:time_to_first_token_seconds`, `vllm:num_requests_running`, ... | Mirrored under `inferweave:`, so one dashboard reads both engines. |
+| Metric names | `vllm:time_to_first_token_seconds`, `vllm:num_requests_running`, ... | Mirrored under `lean_vllm:`, so one dashboard reads both engines. |
 
 ## Milestones
 
@@ -229,7 +229,7 @@ above.
 
 - Hand-rolled rather than `prometheus_client`: three metric types and a renderer
   is less code than the dependency, and the same registry produces the JSON
-  summary. Names mirror vLLM's under `inferweave:`.
+  summary. Names mirror vLLM's under `lean_vllm:`.
 - The engine thread records, the HTTP handler renders, and one lock covers both
   — otherwise a scrape can catch a histogram between its bucket and its sum.
 - Per request, at finish: TTFT, TPOT, queue delay, E2E, prompt and completion
@@ -359,7 +359,7 @@ Two confounds to control for:
   memory — so changing the token budget silently changes the number of KV
   blocks. Pin `num_kvcache_blocks` for every run.
 - vLLM queues without bound, so its rejection rate is zero by construction and
-  overload lands in its p99. InferWeave does the same by default, but with
+  overload lands in its p99. lean-vLLM does the same by default, but with
   admission control switched on it moves that pressure into its rejection rate
   instead. Compare on goodput-versus-p99, never p99 alone.
 

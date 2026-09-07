@@ -1,7 +1,7 @@
 import torch
 
-from inferweave.attention.abstract import AttentionBackend
-from inferweave.utils.context import Context
+from lean_vllm.attention.abstract import AttentionBackend
+from lean_vllm.utils.context import Context
 
 _IMPORT_ERROR: ImportError | None = None
 try:

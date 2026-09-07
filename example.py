@@ -1,5 +1,5 @@
 import os
-from inferweave import LLM, SamplingParams
+from lean_vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
 

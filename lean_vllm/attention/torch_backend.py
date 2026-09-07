@@ -1,8 +1,8 @@
 import torch
 import torch.nn.functional as F
 
-from inferweave.attention.abstract import AttentionBackend
-from inferweave.utils.context import Context
+from lean_vllm.attention.abstract import AttentionBackend
+from lean_vllm.utils.context import Context
 
 
 def _probe_enable_gqa() -> bool:

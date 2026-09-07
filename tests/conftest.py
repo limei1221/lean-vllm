@@ -7,11 +7,11 @@ from time import perf_counter
 from functools import wraps
 from itertools import count
 
-from inferweave.engine.metrics import Metrics
-from inferweave.engine.output import RequestOutput
-from inferweave.engine.scheduler import QueueFull, Scheduler
-from inferweave.engine.sequence import Sequence
-from inferweave.sampling_params import SamplingParams
+from lean_vllm.engine.metrics import Metrics
+from lean_vllm.engine.output import RequestOutput
+from lean_vllm.engine.scheduler import QueueFull, Scheduler
+from lean_vllm.engine.sequence import Sequence
+from lean_vllm.sampling_params import SamplingParams
 
 EOS = 7
 

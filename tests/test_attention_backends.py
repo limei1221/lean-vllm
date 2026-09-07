@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from inferweave.attention import BACKENDS
-from inferweave.utils.context import Context
+from lean_vllm.attention import BACKENDS
+from lean_vllm.utils.context import Context
 
 torch.manual_seed(0)
 
@@ -275,7 +275,7 @@ def test_gqa_fallback_matches_broadcast(backend, device, block_size, dtype, tol,
     if backend.get_name() != "torch":
         pytest.skip("fallback is specific to the torch backend")
 
-    from inferweave.attention import torch_backend
+    from lean_vllm.attention import torch_backend
 
     seqlen = 2 * block_size + 3
     block_table = [0, 1, 2]

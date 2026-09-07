@@ -7,8 +7,8 @@ the milestone that is expected to change it.
 import pytest
 from time import sleep
 
-from inferweave.engine.scheduler import QueueFull
-from inferweave.sampling_params import SamplingParams
+from lean_vllm.engine.scheduler import QueueFull
+from lean_vllm.sampling_params import SamplingParams
 
 FOREVER = SamplingParams(max_tokens=64, ignore_eos=True)
 

@@ -100,7 +100,7 @@ long also has query length 1, and it must take the varlen path so that
 ## Backend selection
 
 `get_attention_backend()` resolves in order: explicit argument,
-`$INFERWEAVE_ATTENTION_BACKEND`, then the first available entry of `BACKENDS`.
+`$LEAN_VLLM_ATTENTION_BACKEND`, then the first available entry of `BACKENDS`.
 `TorchAttention.is_available()` is unconditionally true and sits last, so
 resolution cannot fail. Requesting an unavailable backend by name raises rather
 than silently falling back — a silent downgrade to a 50x slower backend during a

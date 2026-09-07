@@ -4,7 +4,7 @@ import torch
 
 
 def get_device() -> torch.device:
-    if override := os.getenv("INFERWEAVE_DEVICE"):
+    if override := os.getenv("LEAN_VLLM_DEVICE"):
         return torch.device(override)
     if torch.cuda.is_available():
         return torch.device("cuda")

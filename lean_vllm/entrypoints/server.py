@@ -2,8 +2,8 @@
 
 import uvicorn
 
-from inferweave.engine.async_engine import AsyncLLMEngine
-from inferweave.entrypoints.api_server import build_app
+from lean_vllm.engine.async_engine import AsyncLLMEngine
+from lean_vllm.entrypoints.api_server import build_app
 
 
 def run(args, engine_kwargs: dict):

@@ -1,8 +1,8 @@
 import torch
 from torch import nn
 
-from inferweave.attention import AttentionBackend, get_attention_backend
-from inferweave.utils.context import get_context
+from lean_vllm.attention import AttentionBackend, get_attention_backend
+from lean_vllm.utils.context import get_context
 
 
 class Attention(nn.Module):

@@ -2,7 +2,7 @@ import heapq
 from abc import ABC, abstractmethod
 from collections import deque
 
-from inferweave.engine.sequence import Sequence
+from lean_vllm.engine.sequence import Sequence
 
 
 class SchedulingPolicy(ABC):

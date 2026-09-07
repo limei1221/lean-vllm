@@ -1,4 +1,4 @@
-# InferWeave
+# lean-vLLM
 
 A lightweight vLLM implementation used as a testbed for production inference
 engineering: scheduling, attention kernels, model architectures, speculative
@@ -34,7 +34,7 @@ Apple Silicon via the `torch` attention backend, at laptop speed — enough to
 develop and test the scheduler and cache against a small model.
 
 The device is picked automatically (cuda, then mps, then cpu) and can be forced
-with `INFERWEAVE_DEVICE`. Off CUDA there is no `mem_get_info` to size the KV
+with `LEAN_VLLM_DEVICE`. Off CUDA there is no `mem_get_info` to size the KV
 cache from, so it comes from `kvcache_memory_gb` (default 2.0) instead of
 `gpu_memory_utilization`.
 
@@ -46,21 +46,21 @@ uv run python example.py
 ```
 
 ```python
-from inferweave import LLM, SamplingParams
+from lean_vllm import LLM, SamplingParams
 
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-outputs = llm.generate(["Hello, InferWeave."], sampling_params)
+outputs = llm.generate(["Hello, lean-vLLM."], sampling_params)
 outputs[0]["text"]
 ```
 
 The attention backend is picked automatically and can be forced with
-`INFERWEAVE_ATTENTION_BACKEND`.
+`LEAN_VLLM_ATTENTION_BACKEND`.
 
 ## Serving
 
 ```bash
-uv run inferweave serve ~/huggingface/Qwen3-0.6B --port 8000
+uv run lean-vllm serve ~/huggingface/Qwen3-0.6B --port 8000
 ```
 
 An OpenAI-compatible server: `/v1/completions`, `/v1/chat/completions` (both
@@ -72,12 +72,12 @@ blocks straight away.
 
 ```bash
 curl http://localhost:8000/v1/completions -H 'Content-Type: application/json' \
-  -d '{"model": "qwen", "prompt": "Hello, InferWeave.", "max_tokens": 32, "temperature": 0}'
+  -d '{"model": "qwen", "prompt": "Hello, lean-vLLM.", "max_tokens": 32, "temperature": 0}'
 ```
 
 Sampling parameters the engine does not implement (`top_p`, `seed`, penalties,
 `n > 1`, and the rest) are refused with a 400 rather than ignored. Every engine
-flag is a `Config` field; `inferweave serve --help` lists them. Design and
+flag is a `Config` field; `lean-vllm serve --help` lists them. Design and
 milestones are in [docs/online-serving.md](docs/online-serving.md).
 
 ## Benchmarks
@@ -107,7 +107,7 @@ Attention backend design and selection are covered in
 
 ## Credit
 
-InferWeave is a fork of [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)
+lean-vLLM is a fork of [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)
 by Xingkai Yu, branched at
 [`bb823b3`](https://github.com/GeeeekExplorer/nano-vllm/commit/bb823b3e06983d71485a8e1f23715ebd87d98ef8).
 The scheduler, block manager, paged KV cache, and Qwen3 implementation are its

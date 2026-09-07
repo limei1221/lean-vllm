@@ -2,7 +2,7 @@
 
 import torch
 
-from inferweave.layers.sampler import Sampler
+from lean_vllm.layers.sampler import Sampler
 
 torch.manual_seed(0)
 

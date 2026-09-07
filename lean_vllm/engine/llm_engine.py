@@ -5,14 +5,14 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
-from inferweave.config import Config
-from inferweave.sampling_params import SamplingParams
-from inferweave.engine.output import RequestOutput
-from inferweave.engine.sequence import Sequence
-from inferweave.engine.metrics import Metrics
-from inferweave.engine.scheduler import QueueFull, Scheduler
-from inferweave.engine.model_runner import ModelRunner
-from inferweave.utils.detokenizer import IncrementalDetokenizer
+from lean_vllm.config import Config
+from lean_vllm.sampling_params import SamplingParams
+from lean_vllm.engine.output import RequestOutput
+from lean_vllm.engine.sequence import Sequence
+from lean_vllm.engine.metrics import Metrics
+from lean_vllm.engine.scheduler import QueueFull, Scheduler
+from lean_vllm.engine.model_runner import ModelRunner
+from lean_vllm.utils.detokenizer import IncrementalDetokenizer
 
 
 class LLMEngine:

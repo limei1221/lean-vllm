@@ -1,6 +1,6 @@
 """Stop strings are matched on text, so they can span token boundaries."""
 
-from inferweave.entrypoints.stop_checker import StopChecker
+from lean_vllm.entrypoints.stop_checker import StopChecker
 
 
 def deltas(checker: StopChecker, pieces: list[str]) -> list[str]:

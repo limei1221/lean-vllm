@@ -3,8 +3,8 @@ from enum import Enum, auto
 from itertools import count
 from time import perf_counter
 
-from inferweave.engine.output import RequestMetrics
-from inferweave.sampling_params import SamplingParams
+from lean_vllm.engine.output import RequestMetrics
+from lean_vllm.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
