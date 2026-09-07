@@ -36,11 +36,17 @@ inferweave = "inferweave.entrypoints.cli:main"
 
 # a group, not an extra: uv installs it on a bare `uv sync`
 [dependency-groups]
-dev = ["pytest", "httpx"]    # httpx drives the server tests over its ASGI transport
+dev = ["pytest", "httpx2"]    # httpx2 drives the server tests over its ASGI transport
 
 [project.urls]
 Homepage="https://github.com/limei1221/inferweave"
 Upstream="https://github.com/GeeeekExplorer/nano-vllm"
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # starlette 1.6.0 imports a deprecated anyio alias; drop this when it stops.
+    'ignore:The anyio\.abc\.BlockingPortal alias is deprecated:DeprecationWarning',
+]
 
 [tool.uv]
 required-version = ">=0.10"    # extra-build-dependencies is stable from 0.10
