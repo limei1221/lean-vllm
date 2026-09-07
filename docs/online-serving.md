@@ -1,6 +1,6 @@
 # Online Serving + Advanced Scheduler
 
-Status: M0-M4 landed, bar two M2 bullets noted below. M5-M6 are plan.
+Status: M0-M5 landed, bar two M2 bullets noted below. M6 is plan.
 
 ## Goal
 
@@ -208,17 +208,58 @@ Verified on Qwen3-0.6B: greedy completions and chat, SSE streaming with
 client hanging up mid-stream with the server healthy after, and each 400/429/503
 above.
 
-### M5 — metrics
+### M5 — metrics — *done*
 
-`engine/metrics.py` (new), and the `/metrics` endpoint M4 deferred: per-request
-TTFT, TPOT, queue delay and E2E; gauges for running and waiting depth, KV
-utilization, preemption count, prefix-cache hit rate, per-step batch
-composition, graph-covered step fraction, and step time. Prometheus at
-`/metrics`, plus a JSON summary for the benchmark.
+`engine/metrics.py` (new), with `/metrics` (Prometheus text) and `/metrics.json`
+(the summary the benchmark records beside its own client-side numbers).
 
-On GPU utilization: the honest metric is the model-busy fraction of wall clock
-from step timing. The `nvidia-smi` number is reported beside it, with a note on
-why they differ.
+- Hand-rolled rather than `prometheus_client`: three metric types and a renderer
+  is less code than the dependency, and the same registry produces the JSON
+  summary. Names mirror vLLM's under `inferweave:`.
+- The engine thread records, the HTTP handler renders, and one lock covers both
+  — otherwise a scrape can catch a histogram between its bucket and its sum.
+- Per request, at finish: TTFT, TPOT, queue delay, E2E, prompt and completion
+  length. Counters for received / rejected / aborted / finished-by-reason, so
+  M6's goodput and rejection rate come off the server as well as the client.
+- Per step: duration, batch size, prefill-vs-decode token split, and whether the
+  step replayed a CUDA graph. A step that scheduled nothing is not counted as a
+  forward pass; counting the idle poll would inflate the step count and deflate
+  the busy fraction.
+- Prefix-cache hit rate is counted in *blocks* at admission, where
+  `can_allocate`'s return value already says how many the cache supplied.
+  Extracting `Scheduler._admit()` for that also removed the duplicate admission
+  body the two schedule paths were carrying.
+- The scheduler does not know about metrics. It reports what it did on
+  `SchedulerOutput` — now including `num_queried_blocks` / `num_cached_blocks` —
+  and `LLMEngine.step()` records. Keeping the recording out of the scheduler is
+  what lets the test harness exercise it with no model.
+
+The summary reports counts, sums and means, and no percentiles: these buckets
+are too coarse to interpolate one from without lying about it, and M6's client
+measures the real ones. Rates are `None` rather than `0.0` before anything has
+happened, since a hit rate of zero and no queries at all are different claims.
+
+On GPU utilization: the honest metric is `model_busy_fraction`, the share of
+wall clock spent inside a step. `nvidia-smi` is reported beside it as
+`gpu_utilization_percent_nvidia_smi` and counts any live kernel as busy, so it
+reads high even when the batch is one row wide. It is there to be compared, not
+believed.
+
+Verified on Qwen3-0.6B, one 48-token chat completion, scraped from both
+endpoints: `num_requests_received_total 1`, `request_success_total{finish_reason="length"} 1`,
+`prompt_tokens_total 13`, `generation_tokens_total 48`, `num_steps_total 48`.
+The split is `prefill: 13, decode: 47` — the prefill step samples the first
+token, so decodes run one behind generations, which is the arithmetic the unit
+tests assert.
+
+That run also shows what M6 is for: `mean_step_seconds` 0.99 and
+`mean_batch_tokens` 1.25, a full forward pass per token with a single-row batch.
+`model_busy_fraction` was 0.81 over a 58s uptime that included idle time before
+the request arrived. `graph_step_fraction` is 0.0 and the `nvidia-smi` reading
+`null`, both correct on a machine with no CUDA.
+
+Still open: `init_process_group` binds a hardcoded `localhost:2333` even at
+`tensor_parallel_size=1`, so only one engine can exist per machine.
 
 ### M6 — benchmarks and the write-up
 

@@ -9,7 +9,8 @@ from inferweave.config import Config
 from inferweave.sampling_params import SamplingParams
 from inferweave.engine.output import RequestOutput
 from inferweave.engine.sequence import Sequence
-from inferweave.engine.scheduler import Scheduler
+from inferweave.engine.metrics import Metrics
+from inferweave.engine.scheduler import QueueFull, Scheduler
 from inferweave.engine.model_runner import ModelRunner
 from inferweave.utils.detokenizer import IncrementalDetokenizer
 
@@ -34,6 +35,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.metrics = Metrics()
         self.detokenizers: dict[str, IncrementalDetokenizer] = {}
         atexit.register(self.exit)
 
@@ -48,22 +50,33 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params, request_id)
         detokenizer = IncrementalDetokenizer(self.tokenizer, prompt, seq.skip_special_tokens)
-        self.scheduler.add(seq)    # last, so a refused request leaves nothing behind
+        try:
+            self.scheduler.add(seq)    # last, so a refused request leaves nothing behind
+        except QueueFull:
+            self.metrics.record_rejected()
+            raise
+        self.metrics.record_received()
         self.detokenizers[seq.request_id] = detokenizer
         return seq.request_id
 
     def abort_request(self, request_id: str) -> bool:
         aborted = self.scheduler.abort(request_id)
         self.detokenizers.pop(request_id, None)
+        if aborted:
+            self.metrics.record_aborted()
         return aborted
 
     def step(self) -> tuple[list[RequestOutput], int, int]:
+        started = perf_counter()
         output = self.scheduler.schedule()
         stepped = []
         if output:
             token_ids = self.model_runner.call("run", output.scheduled)
             stepped = self.scheduler.postprocess(output.scheduled, token_ids)
         outputs = [self._output(seq) for seq in stepped] + [self._dropped(seq) for seq in output.dropped]
+        self.metrics.record_step(
+            self.scheduler, output, outputs, perf_counter() - started, self.model_runner.used_graph
+        )
         return outputs, output.num_prefill_tokens, output.num_decode_tokens
 
     def _output(self, seq: Sequence) -> RequestOutput:

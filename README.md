@@ -14,7 +14,7 @@ hardware.
 | | Project | Status |
 |---|---|---|
 | 0 | Attention backend abstraction | interface + Torch/FlashAttention backends done |
-| 1 | Online serving + advanced scheduler | scheduler, async engine and OpenAI server done |
+| 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server and metrics done |
 | 2 | DeepSeek-style model support: MLA + MoE + YaRN | |
 | 3 | Speculative decoding | |
 | 4 | Disaggregated prefill / decode | |
@@ -64,7 +64,8 @@ uv run inferweave serve ~/huggingface/Qwen3-0.6B --port 8000
 ```
 
 An OpenAI-compatible server: `/v1/completions`, `/v1/chat/completions` (both
-with SSE streaming), `/v1/models` and `/health`. Requests arrive at any time and
+with SSE streaming), `/v1/models`, `/health`, and `/metrics` in Prometheus
+format (plus `/metrics.json` for the same numbers as a summary). Requests arrive at any time and
 share one token budget per step, so a prompt being prefilled in chunks and a
 batch of decoding requests run together; a client that hangs up frees its KV
 blocks straight away.

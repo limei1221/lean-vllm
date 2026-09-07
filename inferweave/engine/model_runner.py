@@ -27,6 +27,7 @@ class ModelRunner:
         attention_backend = get_attention_backend()
         if rank == 0:
             logger.info("attention backend: %s", attention_backend.get_name())
+        self.used_graph = False    # whether the last step replayed a CUDA graph
         self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
                               or not attention_backend.supports_cuda_graph())
         self.world_size = config.tensor_parallel_size
@@ -188,7 +189,8 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        self.used_graph = not (is_prefill or self.enforce_eager or input_ids.size(0) > 512)
+        if not self.used_graph:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)

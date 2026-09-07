@@ -74,6 +74,7 @@ class AsyncLLMEngine:
         self.engine = engine
         self.tokenizer = engine.tokenizer
         self.max_model_len = engine.config.max_model_len
+        self.metrics = engine.metrics
         self.error: BaseException | None = None
         self.on_death: Callable[[], None] | None = None
         self._intake: SimpleQueue = SimpleQueue()

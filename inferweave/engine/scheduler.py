@@ -17,6 +17,8 @@ class SchedulerOutput:
     # Counted while scheduling: postprocess() clears num_scheduled_tokens.
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
+    num_queried_blocks: int = 0    # prefix cache, counted at admission
+    num_cached_blocks: int = 0
 
     def __bool__(self):
         return bool(self.scheduled)
@@ -96,11 +98,7 @@ class Scheduler:
                     break
                 if self._would_chunk(seq, num_cached_blocks, budget) and self._partial_prefills_full():
                     break
-                self.waiting.pop()
-                self.block_manager.allocate(seq, num_cached_blocks)
-                seq.status = SequenceStatus.RUNNING
-                budget -= self._schedule(seq, budget, output)
-                self.running.append(seq)
+                budget -= self._admit(seq, num_cached_blocks, budget, output)
 
         return output
 
@@ -120,12 +118,19 @@ class Scheduler:
                 continue
             if num_tokens > budget:
                 break
-            self.waiting.pop()
-            self.block_manager.allocate(seq, num_cached_blocks)
-            seq.status = SequenceStatus.RUNNING
-            budget -= self._schedule(seq, budget, output)
-            self.running.append(seq)
+            budget -= self._admit(seq, num_cached_blocks, budget, output)
         return output
+
+    def _admit(self, seq: Sequence, num_cached_blocks: int, budget: int, output: SchedulerOutput) -> int:
+        """Move the head of the waiting queue into the running set."""
+        self.waiting.pop()
+        self.block_manager.allocate(seq, num_cached_blocks)
+        output.num_queried_blocks += seq.num_blocks
+        output.num_cached_blocks += num_cached_blocks
+        seq.status = SequenceStatus.RUNNING
+        num_tokens = self._schedule(seq, budget, output)
+        self.running.append(seq)
+        return num_tokens
 
     def _schedule(self, seq: Sequence, budget: int, output: SchedulerOutput) -> int:
         """Give seq its share of the budget: a prompt chunk, or one decoded token."""

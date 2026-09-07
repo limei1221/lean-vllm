@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from inferweave.engine.async_engine import AsyncLLMEngine, EngineDeadError
 from inferweave.engine.output import RequestOutput
@@ -54,6 +54,14 @@ def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
         if engine.is_dead:
             raise HTTPException(503, f"the engine thread died: {engine.error!r}")
         return {"status": "ok"}
+
+    @app.get("/metrics")
+    async def metrics():
+        return PlainTextResponse(engine.metrics.render(), media_type="text/plain; version=0.0.4")
+
+    @app.get("/metrics.json")
+    async def metrics_json():
+        return engine.metrics.summary()
 
     @app.get("/v1/models")
     async def models():

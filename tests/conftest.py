@@ -3,11 +3,13 @@
 import asyncio
 import pytest
 from dataclasses import dataclass
+from time import perf_counter
 from functools import wraps
 from itertools import count
 
+from inferweave.engine.metrics import Metrics
 from inferweave.engine.output import RequestOutput
-from inferweave.engine.scheduler import Scheduler
+from inferweave.engine.scheduler import QueueFull, Scheduler
 from inferweave.engine.sequence import Sequence
 from inferweave.sampling_params import SamplingParams
 
@@ -70,20 +72,27 @@ class FakeEngine:
         self.config = config
         self.scheduler = Scheduler(config)
         self.model_runner = runner
+        self.metrics = Metrics()
         self.last_output = None
 
-    def add(self, prompt: list[int], sampling_params: SamplingParams | None = None) -> Sequence:
-        seq = Sequence(prompt, sampling_params or SamplingParams())
-        self.scheduler.add(seq)
+    def add(self, prompt: list[int], sampling_params: SamplingParams | None = None, request_id: str | None = None) -> Sequence:
+        seq = Sequence(prompt, sampling_params or SamplingParams(), request_id)
+        try:
+            self.scheduler.add(seq)
+        except QueueFull:
+            self.metrics.record_rejected()
+            raise
+        self.metrics.record_received()
         return seq
 
     def step(self) -> list[RequestOutput]:
+        started = perf_counter()
         output = self.last_output = self.scheduler.schedule()
         stepped = []
         if output:
             token_ids = self.model_runner.call("run", output.scheduled)
             stepped = self.scheduler.postprocess(output.scheduled, token_ids)
-        return [
+        outputs = [
             RequestOutput(
                 request_id=seq.request_id,
                 token_ids=[seq.last_token],
@@ -102,6 +111,8 @@ class FakeEngine:
             )
             for seq in output.dropped
         ]
+        self.metrics.record_step(self.scheduler, output, outputs, perf_counter() - started, used_graph=False)
+        return outputs
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -123,12 +134,13 @@ class FakeLLMEngine(FakeEngine):
     tokenizer = None    # the async engine only needs one for str prompts
 
     def add_request(self, prompt: list[int], sampling_params=None, request_id: str | None = None) -> str:
-        seq = Sequence(prompt, sampling_params or SamplingParams(), request_id)
-        self.scheduler.add(seq)
-        return seq.request_id
+        return self.add(prompt, sampling_params, request_id).request_id
 
     def abort_request(self, request_id: str) -> bool:
-        return self.scheduler.abort(request_id)
+        aborted = self.scheduler.abort(request_id)
+        if aborted:
+            self.metrics.record_aborted()
+        return aborted
 
     def step(self) -> tuple[list[RequestOutput], int, int]:
         outputs = super().step()

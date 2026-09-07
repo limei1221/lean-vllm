@@ -9,6 +9,7 @@ pytest.importorskip("fastapi", reason="the serve extra is not installed")
 from fastapi.testclient import TestClient
 
 from inferweave.engine.async_engine import EngineDeadError
+from inferweave.engine.metrics import Metrics
 from inferweave.engine.output import RequestOutput
 from inferweave.engine.scheduler import QueueFull
 from inferweave.entrypoints.api_server import build_app
@@ -33,6 +34,7 @@ class FakeAsyncEngine:
     def __init__(self, pieces=("Hello", ", world"), finish_reason="length", max_model_len=64):
         self.tokenizer = FakeTokenizer()
         self.max_model_len = max_model_len
+        self.metrics = Metrics()
         self.pieces = list(pieces)
         self.finish_reason = finish_reason
         self.is_dead = False
@@ -50,7 +52,9 @@ class FakeAsyncEngine:
     async def add_request(self, prompt, sampling_params, request_id=None):
         self.requests.append((prompt, sampling_params, request_id))
         if self.admission_error is not None:
+            self.metrics.record_rejected()
             raise self.admission_error
+        self.metrics.record_received()
         return self._outputs(request_id)
 
     async def _outputs(self, request_id):
@@ -102,6 +106,19 @@ class TestEndpoints:
 
     def test_models_lists_the_served_name(self, client):
         assert [card["id"] for card in client.get("/v1/models").json()["data"]] == [MODEL]
+
+    def test_metrics_is_prometheus_text(self, client):
+        complete(client)
+        response = client.get("/metrics")
+        assert response.headers["content-type"].startswith("text/plain")
+        assert "# TYPE inferweave:num_requests_received_total counter" in response.text
+        assert "inferweave:num_requests_received_total 1" in response.text
+
+    def test_metrics_json_is_the_benchmark_summary(self, client):
+        complete(client)
+        summary = client.get("/metrics.json").json()
+        assert summary["requests"]["received"] == 1
+        assert summary["prefix_cache_hit_rate"] is None    # nothing scheduled behind this fake
 
 
 class TestCompletions:
