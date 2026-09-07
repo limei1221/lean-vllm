@@ -36,7 +36,17 @@ lean-vllm = "lean_vllm.entrypoints.cli:main"
 
 # a group, not an extra: uv installs it on a bare `uv sync`
 [dependency-groups]
-dev = ["pytest", "httpx2"]    # httpx2 drives the server tests over its ASGI transport
+dev = [
+    "pytest",
+    "httpx",       # what the openai SDK speaks: the benchmark client and the ASGI tests
+    "httpx2",      # starlette's testclient prefers it and warns when it falls back to httpx
+    # the server itself, so `uv run pytest tests/` runs the whole suite rather than
+    # skipping the two modules that importorskip fastapi
+    "lean-vllm[serve]",
+    # example_serving.py. Pinned below 3: openai 3.x streams over httpx2, which
+    # prints a cosmetic teardown traceback that makes a working example look broken.
+    "openai>=2.0.0,<3",
+]
 
 [project.urls]
 Homepage="https://github.com/limei1221/lean-vllm"

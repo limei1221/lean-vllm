@@ -1,6 +1,8 @@
 # Online Serving + Advanced Scheduler
 
-Status: M0-M5 have landed, except for two M2 items (see M2). M6 is still a plan.
+Status: M0-M6 have landed, except for two M2 items (see M2). The M6 scripts
+run, but no numbers are published: every result in the measurement plan needs
+the A100, and the engine has not been on one since the fork.
 
 ## Goal
 
@@ -276,18 +278,25 @@ the request arrived. `graph_step_fraction` is 0.0 and the `nvidia-smi` reading
 Still open: `init_process_group` binds a hardcoded `localhost:2333` even at
 `tensor_parallel_size=1`, so only one engine can exist per machine.
 
-### M6 — benchmarks and the write-up
+### M6 — benchmarks and the write-up — *scripts done, numbers pending*
 
-- `benchmarks/bench_serving.py` (new): async client, trace generators (fixed,
-  sampled ShareGPT-like, and a mixed short/long blend for the fairness story),
-  Poisson arrivals at `--request-rate`, per-request percentiles, JSON output.
-  The same script points at vLLM. It uses `/v1/completions`, so the token counts
-  in a trace are the token counts the engine sees, with no chat template
-  overhead varying by model.
-- `benchmarks/sweep.py` (new): rate sweep for the curve, plus the policy and
-  budget comparisons.
-- This document and the README roadmap row. `bench.py` stays as the offline
-  throughput number, unchanged.
+`benchmarks/bench_serving.py` (new) is the client: Poisson arrivals at
+`--request-rate`, four traces, per-request percentiles, JSON out. It points at
+vLLM unchanged.
+
+```bash
+uv run python benchmarks/bench_serving.py --dataset lognormal --request-rate 8
+uv run python benchmarks/sweep.py --model ~/huggingface/Qwen3-8B \
+    --suite rate --rates 1,2,4,8,16 --kvcache-tokens 330000 --out results/8b
+```
+
+`benchmarks/sweep.py` (new) drives it. An arm is one server configuration, and
+every run — one arm at one rate — gets a freshly started server, so the
+`/metrics.json` captured beside it describes that run rather than the one
+before, and no run inherits the block pool the last one left. Runs go one at a
+time, because `init_process_group` binds a fixed port and only one engine fits
+on a machine. Five suites: `rate` (the curve), `chunked` (the four-run A/B),
+`budget`, `policy`, and `starvation`.
 
 Accounting rules, so the numbers cannot flatter the engine: arrivals are
 **open-loop** — request *i* is sent on schedule whatever is outstanding — and a
@@ -298,6 +307,58 @@ reporting percentiles also reports rejection rate, since percentiles cover
 completed requests only and an engine shedding 90% of its load would otherwise
 show an excellent p99. Non-429 failures are counted separately and abort the run
 above a threshold; they are bugs, not admission control.
+
+- **Prompts are random token ids over `/v1/completions`.** Lengths are then
+  exactly what the trace says, with no chat template varying by model, and no
+  two prompts share a prefix — so the prefix cache cannot quietly supply half
+  the blocks in a run that was never about caching. `--dataset sharegpt` reads a
+  real ShareGPT file when the question *is* about real length distributions;
+  `lognormal` gives that shape without the download.
+- **A chunk is not a token.** Incremental detokenization holds bytes back, so
+  the SSE deltas undercount. TPOT is computed from `usage.completion_tokens`,
+  and the per-chunk gaps are reported separately as ITL.
+- **The client is the official OpenAI SDK, with `max_retries=0`.** Driving the
+  client a user would drive means the benchmark exercises the protocol the
+  engine actually serves, and it deletes the hand-rolled SSE parsing. The retry
+  default is the trap: the SDK retries a 429 twice, which would turn every
+  rejection into exactly the invisible queue the accounting rules forbid.
+  Verified against a server with `max_waiting_requests=1` — 10 offered, 2
+  completed, 8 rejected, and the engine's own counters read 2 received and 8
+  rejected, so nothing was retried. The cost is a parsed model per chunk rather
+  than a `json.loads`, client-side work the old path did not do.
+- **The connection pool is raised to 8192.** The SDK defaults to 1000 and httpx
+  to 100; either would queue arrivals inside the client at a high rate and turn
+  the open loop into a closed one — a measurement that looks fine and is wrong.
+- **`--dataset mixed` labels each request `short` or `long`, and the summary
+  reports each class on its own.** Starvation does not show up in an aggregate:
+  mean TTFT can sit still while every short request waits behind a long prefill.
+  The same breakdown carries the policy comparison, since `--long-priority 1`
+  is the only thing `--scheduling-policy priority` has to act on.
+- **`num_kvcache_blocks` is now a `serve` flag.** It was internal, on the
+  grounds that profiling derives it. But profiling derives it from what the
+  weights and the warmup batch left over, and the warmup batch is sized from
+  `max_num_batched_tokens` — so the budget sweep would have changed the cache
+  size underneath itself. The measurement plan says pin it; now it can be.
+- **The sweep pins that cache in tokens, not blocks.** A lean-vLLM block holds
+  256 tokens and a vLLM block holds 16, so handing both engines the same block
+  count would have given vLLM a sixteenth of the cache — an unfair comparison
+  that no output would have flagged. `--kvcache-tokens` converts, and pins each
+  engine's block size so the arithmetic cannot drift.
+- **The client reads the model id off `/v1/models`.** vLLM answers 404 to a
+  request naming a model it does not serve, so a hardcoded default breaks that
+  arm at the first request. lean-vLLM answers 404 now too: ignoring the field
+  made it easy to point a benchmark at the wrong server and never find out.
+
+Verified on Qwen3-0.6B on MPS: a `rate` sweep and a two-arm `starvation` sweep
+end to end, server started and stopped per arm, every request completed, and
+`/metrics.json` captured either side of each run. `tests/test_bench_serving.py`
+pins the accounting against the fake engine — a 429 counted as a rejection and
+never retried, a 503 counted as a failure that aborts the run, percentiles taken
+over completed requests only.
+
+What is not done is the point of the milestone: the numbers. Every row of the
+measurement plan below needs the A100, and this document publishes no curve
+until it runs on one.
 
 ## Blast radius
 
@@ -334,9 +395,12 @@ number ages badly.
 
 ## Measurement plan
 
+[benchmark-runbook.md](benchmark-runbook.md) turns this section into commands.
+
 Axes to sweep: request rate, `max_num_batched_tokens`, scheduling policy,
-chunked prefill on/off, and prompt/output length mix. The "before" column is
-`enable_chunked_prefill=False`, which M3 kept alive for exactly this.
+chunked prefill on/off, and prompt/output length mix — one `sweep.py` suite
+each. The "before" column is `enable_chunked_prefill=False`, which M3 kept alive
+for exactly this.
 
 KV pressure is set deliberately, not hoped for. Qwen3-0.6B is 112 KiB per token,
 so 40GB of cache holds ~374k tokens — far beyond any sane arrival rate on one
@@ -350,14 +414,14 @@ CUDA graphs, so a two-run A/B fuses the scheduling change with lost graph
 coverage. `enforce_eager=True` on both arms isolates scheduling and is the
 primary result; the default configuration on both arms is the
 deployment-realistic result, and the delta between the pairs is the graph
-effect, reported on its own line.
+effect, reported on its own line. That is `--suite chunked`.
 
 Two confounds to control for:
 
 - `warmup_model` sizes its warmup batch from `max_num_batched_tokens`, and on
   CUDA `kvcache_bytes()` derives the cache size by subtracting peak allocated
   memory — so changing the token budget silently changes the number of KV
-  blocks. Pin `num_kvcache_blocks` for every run.
+  blocks. Pin it with `sweep.py --kvcache-tokens` on every run.
 - vLLM queues without bound, so its rejection rate is zero by construction and
   overload lands in its p99. lean-vLLM does the same by default, but with
   admission control switched on it moves that pressure into its rejection rate

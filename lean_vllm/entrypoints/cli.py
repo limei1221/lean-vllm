@@ -10,8 +10,10 @@ from dataclasses import MISSING, fields
 
 from lean_vllm.config import Config
 
-# Not flags: the positional, what the tokenizer decides, and what profiling measures.
-INTERNAL = {"model", "hf_config", "eos", "num_kvcache_blocks"}
+# Not flags: the positional and what the tokenizer decides. `num_kvcache_blocks`
+# stays a flag: profiling derives it from what the weights and the warmup batch
+# left over, so a benchmark sweeping the token budget has to pin it.
+INTERNAL = {"model", "hf_config", "eos"}
 
 
 def add_engine_args(parser: argparse.ArgumentParser):

@@ -86,6 +86,11 @@ def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
 
 
 async def _serve(engine: AsyncLLMEngine, model: str, body: BaseRequest, prompt_token_ids: list[int], chat: bool):
+    if body.model != model:
+        # OpenAI's semantics, and vLLM's: a name the server does not serve is a
+        # 404, not a field to ignore. A benchmark client pointed at the wrong
+        # server should find out at the first request, not in the numbers.
+        raise HTTPException(404, f"the model {body.model!r} does not exist")
     if engine.is_dead:
         raise HTTPException(503, f"the engine thread died: {engine.error!r}")
     _check_length(engine, body, len(prompt_token_ids))

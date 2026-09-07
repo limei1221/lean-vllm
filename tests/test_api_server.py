@@ -212,6 +212,18 @@ class TestRefusals:
     def test_an_unknown_field_is_refused_rather_than_ignored(self, client):
         assert complete(client, nucleus_sampling=True).status_code == 400
 
+    def test_a_model_the_server_does_not_serve_is_a_404(self, client, engine):
+        response = complete(client, model="some-other-model")
+        assert response.status_code == 404
+        assert "does not exist" in response.json()["error"]["message"]
+        assert not engine.requests
+
+    def test_the_served_name_is_the_one_that_works(self, client):
+        assert complete(client, model=MODEL).status_code == 200
+        assert client.post("/v1/chat/completions", json={
+            "model": "some-other-model", "messages": [{"role": "user", "content": "hi"}],
+        }).status_code == 404
+
     def test_a_prompt_over_the_context_is_refused(self, client, engine):
         response = complete(client, prompt=[0] * (engine.max_model_len + 1))
         assert response.status_code == 400
