@@ -26,8 +26,9 @@ from inferweave.sampling_params import SamplingParams
 
 DONE = "data: [DONE]\n\n"
 
-# The engine's own reasons; "capacity" is not a completion and never appears here.
+# The engine's own reasons; the drops below are not completions and never appear here.
 FINISH_REASONS = {"stop": "stop", "length": "length", "abort": "stop"}
+DROP_STATUS = {"capacity": 503, "timeout": 504}
 
 
 def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
@@ -136,7 +137,8 @@ async def _deltas(outputs: AsyncIterator[RequestOutput], checker: StopChecker):
                 return    # the finally aborts, which is what frees the blocks
             if output.finished:
                 if output.finish_reason not in FINISH_REASONS:
-                    raise HTTPException(503, f"the engine dropped the request: {output.finish_reason}")
+                    status = DROP_STATUS.get(output.finish_reason, 503)
+                    raise HTTPException(status, f"the engine dropped the request: {output.finish_reason}")
                 yield text + checker.flush(), FINISH_REASONS[output.finish_reason], num_tokens
                 return
             if text:

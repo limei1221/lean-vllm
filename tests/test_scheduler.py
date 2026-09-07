@@ -5,6 +5,7 @@ the milestone that is expected to change it.
 """
 
 import pytest
+from time import sleep
 
 from inferweave.engine.scheduler import QueueFull
 from inferweave.sampling_params import SamplingParams
@@ -348,6 +349,52 @@ class TestAdmissionControl:
         for s in range(20):
             engine.add(prompt(8, s * 100), FOREVER)
         assert len(engine.scheduler.waiting) == 20
+
+
+class TestRequestTimeout:
+
+    def test_a_request_that_waits_too_long_is_dropped(self, make_engine):
+        engine = make_engine(num_kvcache_blocks=1, request_timeout=0.05)
+        engine.add(prompt(16), FOREVER)    # too big for the cache, so it only waits
+        engine.step()
+        assert len(engine.scheduler.waiting) == 1
+        sleep(0.06)
+        outputs = engine.step()
+        assert not engine.scheduler.waiting
+        assert [(o.finished, o.finish_reason) for o in outputs] == [(True, "timeout")]
+
+    def test_a_request_that_ran_is_never_expired(self, make_engine):
+        """A preempted sequence has tokens to show for itself; shedding it wastes them."""
+        engine = make_engine(num_kvcache_blocks=3, kvcache_block_size=8, max_num_seqs=2,
+                             request_timeout=0.01)
+        engine.add(prompt(8), FOREVER)
+        engine.add(prompt(8, 100), FOREVER)
+        engine.step()    # both admitted, so neither is waiting unscheduled
+        for _ in range(8):
+            sleep(0.015)
+            engine.step()
+        assert engine.metrics.preemptions.total > 0    # it did go back to the queue
+        assert "timeout" not in engine.metrics.requests_finished.values
+
+    def test_the_clock_starts_at_arrival_not_at_the_step(self, make_engine):
+        engine = make_engine(num_kvcache_blocks=1, request_timeout=0.05)
+        engine.add(prompt(16), FOREVER)
+        sleep(0.06)
+        assert [o.finish_reason for o in engine.step()] == ["timeout"]
+
+    def test_no_timeout_by_default(self, make_engine):
+        engine = make_engine(num_kvcache_blocks=1)
+        engine.add(prompt(16), FOREVER)
+        sleep(0.02)
+        engine.step()
+        assert len(engine.scheduler.waiting) == 1
+
+    def test_an_expired_request_is_counted_as_finished(self, make_engine):
+        engine = make_engine(num_kvcache_blocks=1, request_timeout=0.01)
+        engine.add(prompt(16), FOREVER)
+        sleep(0.02)
+        engine.step()
+        assert engine.metrics.requests_finished.values == {"timeout": 1}
 
 
 class TestLongPrompts:

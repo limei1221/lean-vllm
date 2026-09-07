@@ -37,6 +37,7 @@ class Scheduler:
         self.block_size = config.kvcache_block_size
         self.enable_chunked_prefill = config.enable_chunked_prefill
         self.max_waiting_requests = config.max_waiting_requests
+        self.request_timeout = config.request_timeout
         self.max_num_partial_prefills = config.max_num_partial_prefills
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -66,9 +67,10 @@ class Scheduler:
 
     def schedule(self) -> SchedulerOutput:
         """One token budget per step, running sequences first so decode is never starved."""
-        dropped = []
+        dropped = self._expire_waiting()
         if not self.enable_chunked_prefill:
             output = self._schedule_whole_prompts()
+            output.dropped = dropped + output.dropped
             if output:
                 return output    # prefill-only step, as before M2
             dropped = output.dropped    # nothing to run, but the drops still owe an output
@@ -101,6 +103,24 @@ class Scheduler:
                 budget -= self._admit(seq, num_cached_blocks, budget, output)
 
         return output
+
+    def _expire_waiting(self) -> list[Sequence]:
+        """Drop requests that have waited past request_timeout without ever running.
+
+        Only ones that never ran: a preempted sequence has tokens to show for
+        itself, and shedding it would throw that work away for nothing.
+        """
+        if not self.request_timeout:
+            return []
+        deadline = perf_counter() - self.request_timeout
+        expired = [
+            seq for seq in self.waiting
+            if seq.first_scheduled_time is None and seq.arrival_time < deadline
+        ]
+        for seq in expired:
+            self.waiting.remove(seq)
+            self._drop(seq, "timeout")
+        return expired
 
     def _schedule_whole_prompts(self) -> SchedulerOutput:
         """Chunked prefill disabled: whole prompts only, and never mixed with decode."""

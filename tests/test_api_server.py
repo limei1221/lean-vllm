@@ -239,6 +239,13 @@ class TestRefusals:
         assert response.status_code == 503
         assert "capacity" in response.json()["error"]["message"]
 
+    def test_a_timeout_drop_is_a_504(self, client, engine):
+        """It waited too long to be served, which is not the same as being over capacity."""
+        engine.pieces, engine.finish_reason = [""], "timeout"
+        response = complete(client)
+        assert response.status_code == 504
+        assert "timeout" in response.json()["error"]["message"]
+
     def test_a_capacity_drop_mid_stream_rides_in_the_stream(self, client, engine):
         engine.pieces, engine.finish_reason = ["Hello", ""], "capacity"
         payloads = events(complete(client, stream=True))

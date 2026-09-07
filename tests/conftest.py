@@ -28,6 +28,7 @@ class FakeConfig:
     enable_chunked_prefill: bool = True
     scheduling_policy: str = "fcfs"
     max_waiting_requests: int = 0
+    request_timeout: float = 0.0
     max_num_partial_prefills: int = 0
     long_prefill_token_threshold: int = 0
 
