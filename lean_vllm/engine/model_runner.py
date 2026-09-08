@@ -9,6 +9,7 @@ from lean_vllm.attention import get_attention_backend
 from lean_vllm.config import Config
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.models.qwen3 import Qwen3ForCausalLM
+from lean_vllm.layers.attention import register_layers
 from lean_vllm.layers.sampler import Sampler
 from lean_vllm.utils.context import set_context, get_context, reset_context
 from lean_vllm.utils.loader import load_model
@@ -41,6 +42,7 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device(self.device)
         self.model = Qwen3ForCausalLM(hf_config)
+        register_layers(self.model)    # before warmup_model, which runs the op
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
