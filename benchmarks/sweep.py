@@ -87,9 +87,9 @@ SUITES = {
     "starvation": starvation_suite,
 }
 
-# A block is not a block: lean-vLLM's hold 256 tokens, vLLM's hold 16. The sweep
-# pins KV capacity in *tokens* and converts, since a shared block count would
-# hand the two engines caches differing by a factor of sixteen.
+# 256 is the smallest lean-vLLM's config allows (it asserts a multiple of 256),
+# 16 is vLLM's default on CUDA. Both are pinned here, and the sweep pins KV
+# capacity in *tokens* and converts.
 BLOCK_SIZE = {"lean-vllm": 256, "vllm": 16}
 
 

@@ -1,7 +1,8 @@
 # Piecewise CUDA graphs
 
-Design for extending graph capture to prefill and mixed steps, which today run
-eager. Status: the custom-op seam has landed; nothing else has.
+Graph capture for prefill and mixed steps, which used to run eager. Status:
+built and measured on an A100. It pays at small prefill chunks and costs a
+little at large ones; the crossover is the whole result.
 
 ## The number this rests on
 
@@ -48,10 +49,10 @@ callables either side of attention and capture each with `torch.cuda.CUDAGraph`,
 the way `capture_cudagraph` already captures the whole decode model. No compile
 stack. Roughly 250 lines. No fusion — recovers launch and dispatch cost only.
 
-**Recommendation: Route B.** One architecture, one shape, and a GPU budget
-measured in hours; the failure modes of Route A are the ones that are hardest to
-debug on rented hardware. Revisit Route A if fusion turns out to be where the
-rest of the gap lives.
+**Route B was built.** Its ceiling is now visible: at large chunks the step is
+compute-bound and launch cost is already hidden, so Route B has nothing left to
+reclaim there. Fusion is the only lever that would, which is the case for
+revisiting Route A — see the measurements below.
 
 ## Shape buckets and the padding tax
 
@@ -69,21 +70,34 @@ small; here it is not. Two consequences:
 - The dispatcher should fall back to eager below the smallest bucket, where
   padding would cost more than dispatch.
 
-## Memory, which comes out of the KV cache
+Measured, the tax is what decides the result: it is smaller than the launch cost
+at 2048-token chunks and larger than it at 8192.
+
+## Memory, which does not come out of the KV cache
 
 Static buffers are `max_num_batched_tokens × hidden`, plus q/k/v. At 8192 and
 Qwen3-8B's hidden size that is ~64MB for one bf16 hidden-state buffer, and a
-handful are needed. `kvcache_bytes()` sizes the cache from what is left after
-peak allocation, so **capture shrinks the KV cache**, which changes preemption
-behaviour, which changes the benchmark.
+handful are needed.
 
-Pin `--num-kvcache-blocks` on both arms of any A/B, or the result measures two
-things at once. This is the same confound the runbook already flags for
-`--max-num-batched-tokens`.
+The design assumed this would shrink the KV cache. It does not.
+`capture_piecewise` runs *after* `allocate_kv_cache`, which has already spent
+the whole `gpu_memory_utilization` budget, so the buffers and the graph pool
+overshoot the budget instead. Measured on the 0.6B model at 8192:
+`num_kvcache_blocks` was identical in every mode, and at
+`--gpu-memory-utilization 0.98` the process ended up on 77.92GB against a
+77.66GB budget.
+
+Two consequences, opposite in sign:
+
+- The A/B is fair for free — both arms get the same cache, so the confound the
+  runbook flags for `--max-num-batched-tokens` does not apply here.
+- On a tighter card or a larger model, capture OOMs rather than trading cache
+  for graphs. Sizing the cache after capture, or reserving the buffers before
+  `kvcache_bytes()` measures, is the fix if that bites.
 
 ## Dispatch
 
-`_eager_reason` becomes a mode chooser, and `Config` gains `cudagraph_mode`
+`_eager_reason` became a mode chooser, and `Config` gained `cudagraph_mode`
 (`none` | `full` | `piecewise` | `full_and_piecewise`), mirroring vLLM's names:
 
 | step | mode |
@@ -92,8 +106,15 @@ things at once. This is the same confound the runbook already flags for
 | anything else, tokens ≤ largest token bucket and ≥ smallest | piecewise |
 | otherwise | eager |
 
-`eager_steps` gains `piecewise` as a kind, so `/metrics.json` keeps answering
+`eager_steps` gained `piecewise` as a kind, so `/metrics.json` keeps answering
 where the time went.
+
+One label is wrong. `_step_kind` ends `"prefill" if is_prefill else "oversized"`,
+so a decode step that falls *below* the smallest token bucket is counted as
+`oversized`. Under `--cudagraph-mode piecewise` alone that is most of the run:
+23 of 27 steps in one measurement. It needs a third label, or the metric misreads
+a bucket list that is too coarse at the bottom as one that is too short at the
+top.
 
 ## Staging
 
@@ -102,55 +123,86 @@ Each step leaves the suite green.
 1. ~~Attention as a custom op~~ — done, `a77ecac`.
 2. ~~`cudagraph_mode` config, the dispatcher, and the metric kind~~ — done.
 3. ~~Split `Qwen3DecoderLayer` into `pre_attention()` and `post_attention()`~~ — done.
-4. ~~Capture and replay the pieces~~ — written, unverified: no CUDA on the
-   machine it was written on, so not one capture has executed.
-5. Verify, then measure.
+4. ~~Capture and replay the pieces~~ — done and verified on an A100.
+5. ~~Verify, then measure~~ — done on Qwen3-0.6B; the 8B sweep is still owed.
 
-Steps 2 and 3 were done off the GPU, so that session only spends its time on
-step 4.
+Steps 2 and 3 were written off the GPU. `ModelRunner.__init__` read
+`self.enforce_eager` two lines before assigning it, so every construction raised
+`AttributeError` — the first thing the A100 said.
 
 ## Verification
 
-Correctness first, on a small model:
+**Greedy output is not token-identical to eager, and cannot be.** Padding to a
+bucket changes the row count of every GEMM in the pieces, and cuBLAS selects a
+different kernel by M for the tall-K ones — `o_proj` at K=2048 and `down_proj`
+at K=3072 both move by ~1 ULP between M=300 and M=512, while `qkv_proj`,
+`gate_up_proj`, both RMSNorms, rope and the embedding are bitwise stable. One
+ULP at layer 0 reaches ~0.25% relative by layer 27, which is enough to flip a
+greedy argmax: one prompt of six diverged at token 4 in one configuration, none
+of thirty-six in another.
 
-- Greedy output token-identical between `--cudagraph-mode none` and
-  `piecewise`, over a prompt set that spans one chunk, several chunks, and a
-  mixed step. This is the check M3 used for chunked prefill, and it catches the
-  failure that matters: a mis-captured graph replays stale pointers and returns
-  plausible wrong tokens rather than raising.
+So the check that catches a mis-capture is the one that holds exactly:
+
+- **Replay equals the same pieces run eagerly at the same padded width,
+  bitwise.** Verified over all 28 layers. This is the property a stale pointer
+  or a mis-ordered buffer breaks, and unlike token equality it has no tolerance
+  to argue about.
+- **Pad rows are inert.** Every pad row filled with NaN, and pad ids and
+  positions with junk, leaves the real rows bitwise unchanged — on pure prefill,
+  chunked, and mixed steps. Nothing in a piece mixes rows, and this is what says
+  so.
 - **RMSNorm writes in place, and only copies when it has to cast.** `x.float()`
   is a copy in bf16, which is what the runner runs; in fp32 it returns the same
   tensor and the `mul_` rewrites the caller's. Static capture buffers make that
   aliasing a live hazard rather than a latent one, so a piece must not be handed
   a buffer anything else still needs. It is also why the piece tests run bf16.
-- Host syncs inside a piece break capture. `layers/` and `models/` are clean of
-  `.item()`, `.tolist()` and `.cpu()` today — the only `.tolist()` is in
+- **Host syncs inside a piece break capture.** `layers/` and `models/` are clean
+  of `.item()`, `.tolist()` and `.cpu()` today — the only `.tolist()` is in
   `torch_backend`, inside attention, which stays eager. Re-check after any change
   to the layers, since this is a property that rots quietly.
 
-Then the rate sweep, comparing `step_seconds` by kind against
-`results/graphs/rate`, with the cache pinned.
+## What the A100 said
 
-## What step 4 assumes
+Qwen3-0.6B, A100-80GB, 128 prompts of 200–1024 tokens, 64 output tokens each,
+greedy, `--max-num-seqs 256`, KV cache identical across arms.
 
-Written but never run. Each of these is a guess until the A100 says otherwise:
+| budget | mode | elapsed | tok/s | prefill step |
+| ---: | --- | ---: | ---: | --- |
+| 2048 | none | 3.89s | 2108 | — |
+| 2048 | full | 2.04s | 4007 | 36 eager @ 40.6ms |
+| 2048 | full_and_piecewise | **1.42s** | **5776** | 36 piecewise @ **23.0ms** |
+| 8192 | none | 3.29s | 2488 | — |
+| 8192 | full | 1.23s | **6681** | 9 eager @ 58.7ms |
+| 8192 | full_and_piecewise | 1.24s | 6580 | 9 piecewise @ 61.8ms |
 
-- **Capture cost at startup.** 74 pieces per bucket for a 36-layer model, times
-  the buckets, is ~740 captures each preceded by a warmup pass. Tens of seconds,
-  and the bucket list is the dial if that is too slow.
-- **Pool memory.** All pieces share one `graph_pool`, but the intermediates for
-  the largest bucket live in it. This is on top of the ~290MB of static buffers,
-  and all of it comes out of the KV cache.
-- **That capture succeeds through the custom op at all.** The op wrapper does
-  its own checking around the call; nothing has proved that is capture-safe.
+**There is a crossover and it sits below 8192 tokens on this model.** At 2048 the
+prefill step loses 43% and end-to-end throughput gains 44%. At 8192 the step is
+already compute-bound, the launch cost is hidden behind it, and the padding tax
+is all that is left: 5% slower.
+
+The two guesses that were wrong in the other direction:
+
+- **Capture cost is cheap.** 2.9s for the ten buckets at 8192 — 580 captures on
+  a 28-layer model — and 1.0s for the six at 2048, against a guess of tens of
+  seconds. The 8B default budget is 814 captures of larger pieces, so still
+  seconds rather than a minute.
+- **Buffers and pool are small.** Piecewise added 0.25GB over `full` at 8192 and
+  0.14GB at 2048, on the 0.6B model — but see the memory section for where it
+  comes from.
+
+Owed: the same table on Qwen3-8B. A 0.6B model is far more launch-bound per
+FLOP, so its crossover is not the 8B one, and the 8B crossover is what decides
+whether the default mode should be `full_and_piecewise` or `full`.
 
 ## Kill criteria
 
-Stop and revert if any of these hold after step 4:
+Stop and revert if any of these hold. Judged on 0.6B; the 8B sweep can still
+overturn them.
 
-- Measured per-pass overhead at rate 16 is well under 24ms. The 24ms comes from
-  a rate-4 decode batch; at saturation the CPU runs ahead of a GPU that is 96%
-  busy, so much of it may already be hidden.
-- Reclaimed time is under ~3% of forward-pass time end to end.
-- The KV cache loses enough to raise preemptions at rate 16, where the archive
-  currently shows zero.
+- ~~Measured per-pass overhead at rate 16 is well under 24ms.~~ At 2048-token
+  chunks it is 17.6ms of a 40.6ms step — real, and reclaimed.
+- **Reclaimed time is under ~3% of forward-pass time end to end.** Passes at
+  2048 (+44% throughput), **fails at 8192** (−1.5%). This is the live one: the
+  8B run at its production `--max-num-batched-tokens` decides it.
+- ~~The KV cache loses enough to raise preemptions at rate 16.~~ The cache does
+  not shrink at all, and no arm preempted.
