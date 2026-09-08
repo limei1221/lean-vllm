@@ -14,6 +14,9 @@ from time import perf_counter
 
 INF = float("inf")
 
+# Step kinds that replayed a graph; the rest name why the step ran eager.
+GRAPH_KINDS = ("graph", "piecewise")
+
 LATENCY_BUCKETS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0, INF)
 TPOT_BUCKETS = (0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, INF)
 STEP_BUCKETS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, INF)
@@ -184,15 +187,15 @@ class Metrics:
         with self.lock:
             self.requests_aborted.inc()
 
-    def record_step(self, scheduler, output, outputs, duration: float, eager_reason: str | None):
+    def record_step(self, scheduler, output, outputs, duration: float, step_kind: str):
         with self.lock:
             if output:    # a step that scheduled nothing ran no model
                 self.steps.inc()
-                if eager_reason is None:
+                if step_kind in GRAPH_KINDS:
                     self.graph_steps.inc()
                 else:
-                    self.eager_steps.inc(label_value=eager_reason)
-                self.step_seconds.inc(duration, label_value=eager_reason or "graph")
+                    self.eager_steps.inc(label_value=step_kind)
+                self.step_seconds.inc(duration, label_value=step_kind)
                 self.model_busy.inc(duration)
                 self.step_duration.observe(duration)
                 self.iteration_tokens.observe(output.num_prefill_tokens + output.num_decode_tokens)

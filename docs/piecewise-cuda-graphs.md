@@ -100,15 +100,14 @@ where the time went.
 Each step leaves the suite green.
 
 1. ~~Attention as a custom op~~ — done, `a77ecac`.
-2. `cudagraph_mode` config, the dispatcher, and the metric kind. CPU-testable:
-   the mode chosen per step is a pure function of shape and config.
+2. ~~`cudagraph_mode` config, the dispatcher, and the metric kind~~ — done.
 3. Split `Qwen3DecoderLayer` into `pre_attention()` and `post_attention()`.
    CPU-testable: output must be token-identical to today's `forward`.
 4. Capture and replay the pieces. GPU only.
 5. Verify, then measure.
 
-Steps 2 and 3 are worth doing before the GPU session, so that session only
-spends its time on step 4.
+Step 3 is worth doing before the GPU session too, so that session only spends
+its time on step 4.
 
 ## Verification
 

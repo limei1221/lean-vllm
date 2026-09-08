@@ -111,7 +111,7 @@ class FakeEngine:
             )
             for seq in output.dropped
         ]
-        self.metrics.record_step(self.scheduler, output, outputs, perf_counter() - started, eager_reason="enforced")
+        self.metrics.record_step(self.scheduler, output, outputs, perf_counter() - started, step_kind="enforced")
         return outputs
 
     def is_finished(self):

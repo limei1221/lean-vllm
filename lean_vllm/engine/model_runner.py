@@ -6,7 +6,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from lean_vllm.attention import get_attention_backend
-from lean_vllm.config import Config
+from lean_vllm.config import Config, FULL_MODES, PIECEWISE_MODES
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.models.qwen3 import Qwen3ForCausalLM
 from lean_vllm.layers.attention import register_layers
@@ -29,7 +29,10 @@ class ModelRunner:
         attention_backend = get_attention_backend()
         if rank == 0:
             logger.info("attention backend: %s", attention_backend.get_name())
-        self.eager_reason: str | None = "enforced"    # why the last step ran eager; None if it replayed a graph
+        self.step_kind = "enforced"    # how the last step ran: see _step_kind
+        self.cudagraph_mode = "none" if self.enforce_eager else config.cudagraph_mode
+        self.graph_bs: list[int] = []          # captured batch sizes, full graphs
+        self.piecewise_bs: list[int] = []      # captured token counts, piecewise graphs
         self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
                               or not attention_backend.supports_cuda_graph())
         self.world_size = config.tensor_parallel_size
@@ -192,24 +195,29 @@ class ModelRunner:
         temperatures = None if all_greedy else dev.make_tensor(temperatures, torch.float32, self.device)
         return input_ids, positions, temperatures, is_prefill
 
-    def _eager_reason(self, is_prefill: bool, batch_size: int) -> str | None:
-        """Why this step cannot replay a graph. None means it can.
+    def _step_kind(self, is_prefill: bool, num_tokens: int) -> str:
+        """How this step runs: "graph", "piecewise", or why it must run eager.
 
-        "prefill" is what piecewise capture would reclaim, "oversized" what a
-        larger bucket would; the split decides whether either is worth doing.
+        A pure-decode batch has one token per row, so num_tokens is its batch
+        size too. Each branch needs the graphs to exist, not just the mode: a
+        mode naming a capture that never happened falls through to eager.
         """
-        if self.enforce_eager:
+        if self.cudagraph_mode == "none":
             return "enforced"
-        if is_prefill:
-            return "prefill"
-        if batch_size > 512:
-            return "oversized"
-        return None
+        if not is_prefill and self.cudagraph_mode in FULL_MODES and self.graph_bs:
+            if num_tokens <= self.graph_bs[-1]:
+                return "graph"
+        if self.cudagraph_mode in PIECEWISE_MODES and self.piecewise_bs:
+            if self.piecewise_bs[0] <= num_tokens <= self.piecewise_bs[-1]:
+                return "piecewise"
+        # "prefill" is what piecewise capture reclaims, "oversized" what a larger
+        # bucket would; the split says which is worth building.
+        return "prefill" if is_prefill else "oversized"
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        self.eager_reason = self._eager_reason(is_prefill, input_ids.size(0))
-        if self.eager_reason:
+        self.step_kind = self._step_kind(is_prefill, input_ids.size(0))
+        if self.step_kind != "graph":
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)

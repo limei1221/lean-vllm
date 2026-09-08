@@ -62,6 +62,52 @@ def test_an_all_greedy_batch_sends_no_temperatures(runner):
     assert temperatures is None
 
 
+class TestStepKind:
+    """Which capture, if any, a step is eligible for. Pure: shape and config."""
+
+    @pytest.fixture
+    def runner(self, runner):
+        runner.cudagraph_mode = "full_and_piecewise"
+        runner.graph_bs = [1, 2, 4, 8, 16]
+        runner.piecewise_bs = [256, 512, 1024]
+        return runner
+
+    def test_a_small_decode_batch_replays_a_full_graph(self, runner):
+        assert runner._step_kind(is_prefill=False, num_tokens=8) == "graph"
+
+    def test_a_decode_batch_past_the_buckets_is_oversized(self, runner):
+        assert runner._step_kind(is_prefill=False, num_tokens=17) == "oversized"
+
+    def test_a_prefill_step_goes_piecewise(self, runner):
+        assert runner._step_kind(is_prefill=True, num_tokens=512) == "piecewise"
+
+    def test_a_prefill_step_past_the_buckets_stays_eager(self, runner):
+        assert runner._step_kind(is_prefill=True, num_tokens=2048) == "prefill"
+
+    def test_a_prefill_step_under_the_smallest_bucket_stays_eager(self, runner):
+        """Padding 8 tokens up to 256 would cost more than the dispatch it saves."""
+        assert runner._step_kind(is_prefill=True, num_tokens=8) == "prefill"
+
+    def test_a_mode_without_piecewise_leaves_prefill_eager(self, runner):
+        runner.cudagraph_mode = "full"
+        assert runner._step_kind(is_prefill=True, num_tokens=512) == "prefill"
+
+    def test_a_mode_without_full_sends_decode_piecewise(self, runner):
+        runner.cudagraph_mode = "piecewise"
+        assert runner._step_kind(is_prefill=False, num_tokens=512) == "piecewise"
+
+    def test_none_is_enforced_eager(self, runner):
+        runner.cudagraph_mode = "none"
+        assert runner._step_kind(is_prefill=False, num_tokens=8) == "enforced"
+
+    def test_a_mode_naming_a_capture_that_never_happened_falls_back(self, runner):
+        """The mode is what was asked for; the bucket lists are what exists."""
+        runner.piecewise_bs = []
+        assert runner._step_kind(is_prefill=True, num_tokens=512) == "prefill"
+        runner.graph_bs = []
+        assert runner._step_kind(is_prefill=False, num_tokens=8) == "oversized"
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_preemption_recomputes_the_generated_suffix(runner, make_engine, chunked):
     engine = make_engine(num_kvcache_blocks=6, enable_chunked_prefill=chunked)

@@ -75,7 +75,7 @@ class LLMEngine:
             stepped = self.scheduler.postprocess(output.scheduled, token_ids)
         outputs = [self._output(seq) for seq in stepped] + [self._dropped(seq) for seq in output.dropped]
         self.metrics.record_step(
-            self.scheduler, output, outputs, perf_counter() - started, self.model_runner.eager_reason
+            self.scheduler, output, outputs, perf_counter() - started, self.model_runner.step_kind
         )
         return outputs, output.num_prefill_tokens, output.num_decode_tokens
 
