@@ -164,13 +164,16 @@ PATH=~/vllm-env/bin:$PATH uv run python benchmarks/sweep.py \
   --model $MODEL --engine vllm --suite rate \
   --rates 1,2,4,8,12,16,24 --num-requests 1000 \
   --max-model-len 4096 --kvcache-tokens $KVTOKENS \
-  --server-args "--served-model-name qwen --max-num-batched-tokens 8192 --max-num-seqs 256 --disable-log-requests" \
+  --server-args "--served-model-name qwen --max-num-batched-tokens 8192 --max-num-seqs 256" \
   --client-args "--dataset lognormal --input-len 512 --output-len 128 --timeout 1200" \
   --out results/vllm-8b
 ```
 
 The `PATH=` prefix puts the vLLM venv's binary in reach while the script itself
 still runs under lean-vLLM's interpreter.
+
+vLLM 0.11 dropped `--disable-log-requests`; per-request logging is off by
+default now. On an older vLLM, add it back or the log drowns the run.
 
 Run only the `rate` suite against vLLM. The others drive lean-vLLM's own flags.
 
@@ -241,6 +244,17 @@ uv run lean-vllm serve $MODEL --tensor-parallel-size 2 --port 8000 &
 sleep 120
 uv run python benchmarks/bench_serving.py --num-requests 50 --request-rate 4 \
   --dataset fixed --input-len 512 --output-len 128
+```
+Outputs:
+```
+50/50 done, 0 failed
+--- fixed @ 4.0/s ---
+50 completed, 0 rejected, 0 failed in 13.8s
+goodput 3.63 req/s, offered 3.63 req/s, output 465 tok/s, rejected 0.0%
+ttft         mean    223.0 p50     92.3 p99   1572.3   (ms)
+tpot         mean     12.4 p50     12.0 p99     20.3   (ms)
+itl          mean     12.5 p50      9.7 p99     82.0   (ms)
+e2e          mean   1803.4 p50   1630.8 p99   3381.4   (ms)
 ```
 
 ## Known limits
