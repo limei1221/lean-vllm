@@ -23,6 +23,7 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        Sequence.block_size = self.block_size    # spawned workers never run LLMEngine.__init__
         self.device = dev.get_device()
         attention_backend = get_attention_backend()
         if rank == 0:
