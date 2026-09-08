@@ -154,7 +154,8 @@ class ModelRunner:
             context_lens.append(end)
             if end == seq.num_tokens:    # the prompt is complete, so this row samples
                 logits_indices.append(cu_seqlens_q[-1] - 1)
-                temperatures.append(seq.temperature)
+                if self.rank == 0:    # only the sampling rank owns sampling parameters
+                    temperatures.append(seq.temperature)
             if not seq.block_table:    # warmup
                 continue
             start_block = start // self.block_size

@@ -129,10 +129,32 @@ class TestAdmission:
     @asyncio_test
     async def test_a_full_queue_is_refused_before_any_output(self, make_async_engine):
         """The 429 must surface from add_request, while a status code can still be chosen."""
-        engine = make_async_engine(max_waiting_requests=1, num_kvcache_blocks=1)
-        await engine.add_request(prompt(16), FOREVER)    # too big for the cache, so it stays waiting
+        engine = make_async_engine(gated=True, max_waiting_requests=1, num_kvcache_blocks=1)
+        await engine.add_request(prompt(1), FOREVER)    # occupies the cache
+        waiting = asyncio.create_task(engine.add_request(prompt(8, 100), FOREVER))
+        await asyncio.sleep(0)    # enqueue before releasing the current step
+        runner_of(engine).release()
+        await waiting
+
+        refused = asyncio.create_task(engine.add_request(prompt(8, 200), FOREVER))
+        await asyncio.sleep(0)
+        runner_of(engine).release()
         with pytest.raises(QueueFull):
-            await engine.add_request(prompt(16, 100), FOREVER)
+            await refused
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    @asyncio_test
+    async def test_oversized_prompt_reports_capacity_and_engine_keeps_serving(self, make_async_engine, chunked):
+        engine = make_async_engine(num_kvcache_blocks=1, enable_chunked_prefill=chunked)
+        outputs = await engine.add_request(prompt(9), FOREVER)
+
+        output = await asyncio.wait_for(anext(outputs), timeout=1)
+
+        assert output.finished and output.finish_reason == "capacity"
+        assert output.token_ids == []
+        await outputs.aclose()
+        assert len(await asyncio.wait_for(collect(engine, 2, prompt(1)), timeout=1)) == 2
+        assert not engine.is_dead
 
     @asyncio_test
     async def test_a_prompt_that_cannot_fit_finishes_rather_than_hanging(self, make_async_engine):

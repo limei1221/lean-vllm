@@ -83,7 +83,7 @@ class Scheduler:
             if budget <= 0 or len(output.scheduled) >= self.max_num_seqs:
                 still_running.append(seq)    # left untouched this step
                 continue
-            if seq.num_cached_tokens >= seq.num_prompt_tokens:    # decoding, so the cache grows
+            if not seq.is_prefill:    # decoding, so the cache grows
                 if not self._make_room(seq, still_running, output):
                     continue
                 self.block_manager.may_append(seq)
@@ -95,6 +95,10 @@ class Scheduler:
         if not output.preempted:
             while self.waiting and len(output.scheduled) < self.max_num_seqs and budget > 0:
                 seq = self.waiting.peek()
+                if seq.num_blocks > len(self.block_manager.blocks):
+                    self.waiting.pop()    # impossible even with the entire cache free
+                    self._drop(seq, "capacity", output)
+                    continue
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
                     break
@@ -128,6 +132,10 @@ class Scheduler:
         budget = self.max_num_batched_tokens
         while self.waiting and len(output.scheduled) < self.max_num_seqs:
             seq = self.waiting.peek()
+            if seq.num_blocks > len(self.block_manager.blocks):
+                self.waiting.pop()
+                self._drop(seq, "capacity", output)
+                continue
             num_cached_blocks = self.block_manager.can_allocate(seq)
             if num_cached_blocks == -1:
                 break
@@ -154,7 +162,7 @@ class Scheduler:
 
     def _schedule(self, seq: Sequence, budget: int, output: SchedulerOutput) -> int:
         """Give seq its share of the budget: a prompt chunk, or one decoded token."""
-        seq.is_prefill = seq.num_cached_tokens < seq.num_prompt_tokens
+        # A preempted request also prefills its generated suffix until it samples again.
         num_tokens = min(seq.num_tokens - seq.num_cached_tokens, budget) if seq.is_prefill else 1
         if seq.is_prefill and self.long_prefill_token_threshold:
             num_tokens = min(num_tokens, self.long_prefill_token_threshold)
@@ -175,13 +183,14 @@ class Scheduler:
     def _partial_prefills_full(self) -> bool:
         if not self.max_num_partial_prefills:
             return False
-        partial = sum(1 for seq in self.running if seq.num_cached_tokens < seq.num_prompt_tokens)
+        partial = sum(1 for seq in self.running if seq.is_prefill)
         return partial >= self.max_num_partial_prefills
 
     def _make_room(self, seq: Sequence, still_running: deque[Sequence], output: SchedulerOutput) -> bool:
         """Free blocks for one more decoded token. False if seq itself gave way.
 
-        A prompt chunk needs no room: its blocks were all taken at admission.
+        A prefill chunk needs no room: its blocks were all taken at admission,
+        including any generated suffix being recomputed after preemption.
         """
         while not self.block_manager.can_append(seq):
             if self.running:
@@ -226,9 +235,10 @@ class Scheduler:
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if seq.num_cached_tokens < seq.num_tokens:
-                continue    # prompt not finished, so no logits for this sequence
+                continue    # prefill/recomputation not finished, so no logits for this sequence
             token_id = next(tokens)
             seq.append_token(token_id)
+            seq.is_prefill = False
             if seq.first_token_time is None:
                 seq.first_token_time = perf_counter()
             stepped.append(seq)

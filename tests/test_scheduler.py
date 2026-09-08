@@ -331,6 +331,24 @@ class TestPolicy:
 
 class TestAdmissionControl:
 
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_oversized_prompt_is_dropped_without_blocking_smaller_requests(self, make_engine, chunked):
+        engine = make_engine(num_kvcache_blocks=1, enable_chunked_prefill=chunked)
+        oversized = engine.add(prompt(9), FOREVER)
+        small = engine.add(prompt(8, 100), SamplingParams(max_tokens=1))
+
+        outputs = {output.request_id: output for output in engine.step()}
+
+        assert oversized.request_id in outputs
+        assert outputs[oversized.request_id].finish_reason == "capacity"
+        assert outputs[oversized.request_id].token_ids == []
+        assert outputs[small.request_id].finish_reason == "length"
+        assert len(outputs[small.request_id].token_ids) == 1
+        assert engine.is_finished()
+        assert not engine.scheduler.seqs
+        assert not engine.scheduler.block_manager.used_block_ids
+        assert engine.metrics.requests_finished.values == {"length": 1, "capacity": 1}
+
     def test_a_full_queue_is_refused(self, make_engine):
         engine = make_engine(max_waiting_requests=2)
         engine.add(prompt(8), FOREVER)
@@ -355,13 +373,15 @@ class TestRequestTimeout:
 
     def test_a_request_that_waits_too_long_is_dropped(self, make_engine):
         engine = make_engine(num_kvcache_blocks=1, request_timeout=0.05)
-        engine.add(prompt(16), FOREVER)    # too big for the cache, so it only waits
+        engine.add(prompt(1), FOREVER)
+        engine.step()
+        engine.add(prompt(8, 100), FOREVER)    # fits the cache once the running request leaves
         engine.step()
         assert len(engine.scheduler.waiting) == 1
         sleep(0.06)
         outputs = engine.step()
         assert not engine.scheduler.waiting
-        assert [(o.finished, o.finish_reason) for o in outputs] == [(True, "timeout")]
+        assert [o.finish_reason for o in outputs if o.finished] == ["timeout"]
 
     def test_a_request_that_ran_is_never_expired(self, make_engine):
         """A preempted sequence has tokens to show for itself; shedding it wastes them."""
@@ -378,20 +398,22 @@ class TestRequestTimeout:
 
     def test_the_clock_starts_at_arrival_not_at_the_step(self, make_engine):
         engine = make_engine(num_kvcache_blocks=1, request_timeout=0.05)
-        engine.add(prompt(16), FOREVER)
+        engine.add(prompt(8), FOREVER)
         sleep(0.06)
         assert [o.finish_reason for o in engine.step()] == ["timeout"]
 
     def test_no_timeout_by_default(self, make_engine):
         engine = make_engine(num_kvcache_blocks=1)
-        engine.add(prompt(16), FOREVER)
+        engine.add(prompt(1), FOREVER)
+        engine.step()
+        engine.add(prompt(8, 100), FOREVER)
         sleep(0.02)
         engine.step()
         assert len(engine.scheduler.waiting) == 1
 
     def test_an_expired_request_is_counted_as_finished(self, make_engine):
         engine = make_engine(num_kvcache_blocks=1, request_timeout=0.01)
-        engine.add(prompt(16), FOREVER)
+        engine.add(prompt(8), FOREVER)
         sleep(0.02)
         engine.step()
         assert engine.metrics.requests_finished.values == {"timeout": 1}

@@ -124,7 +124,9 @@ as "long" and capping those separately.
 
 A sequence that is alone in the cache and still cannot grow is dropped with
 `finish_reason="capacity"` rather than preempted forever. The old code asserted
-here instead.
+here instead. Prompts that exceed total cache capacity are also dropped at
+scheduling time, so smaller requests behind them can proceed even with no
+request timeout configured.
 
 One client can still starve others. The fix is to age a request's effective
 priority by how long it has queued — left out until the benchmark shows the
