@@ -44,7 +44,7 @@ lean-vLLM:
 git clone <remote> ~/lean-vllm && cd ~/lean-vllm
 uv sync --extra cuda      # the dev group brings the server, the OpenAI SDK and the test deps
 uv run python -c "import torch, flash_attn; print(torch.__version__, torch.cuda.get_device_name(0))"
-uv run hf download Qwen/Qwen3-8B --local-dir ~/huggingface/Qwen3-8B
+uv run hf download Qwen/Qwen3-8B --local-dir /workspace/huggingface/Qwen3-8B
 ```
 
 The flash-attn wheel is pinned to `cu12torch2.9` on Python 3.12, which is what
@@ -85,7 +85,7 @@ pin clocks, so watch the log twice as closely.
 cd ~/lean-vllm
 uv run pytest tests/ -q
 
-uv run lean-vllm serve ~/huggingface/Qwen3-8B --port 8000 --max-model-len 4096 \
+uv run lean-vllm serve /workspace/huggingface/Qwen3-8B --port 8000 --max-model-len 4096 \
   --served-model-name qwen &
 sleep 90
 curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
@@ -109,7 +109,7 @@ lean-vLLM and vLLM get the same capacity despite 256-token and 16-token blocks.
 ```bash
 uv run python - <<'EOF'
 from transformers import AutoConfig
-c = AutoConfig.from_pretrained("/root/huggingface/Qwen3-8B")   # adjust
+c = AutoConfig.from_pretrained("/workspace/huggingface/Qwen3-8B")   # adjust
 head_dim = getattr(c, "head_dim", c.hidden_size // c.num_attention_heads)
 per_token = 2 * c.num_hidden_layers * c.num_key_value_heads * head_dim * 2   # bf16
 print(f"{per_token/2**10:.0f} KiB per token")
@@ -124,8 +124,8 @@ roughly 330k tokens for 45 GB. Take two values: **comfortable** (~45 GB) and
 than merely implemented.
 
 ```bash
-export KVTOKENS=330000     # whatever the script printed
-export MODEL=~/huggingface/Qwen3-8B
+export KVTOKENS=327680     # whatever the script printed
+export MODEL=/workspace/huggingface/Qwen3-8B
 ```
 
 ## 5. lean-vLLM rate curve
