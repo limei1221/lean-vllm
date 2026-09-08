@@ -185,7 +185,8 @@ class ModelRunner:
         )
         input_ids = dev.make_tensor(input_ids, torch.int64, self.device)
         positions = dev.make_tensor(positions, torch.int64, self.device)
-        temperatures = dev.make_tensor(temperatures, torch.float32, self.device) if self.rank == 0 else None
+        all_greedy = all(temperature == 0 for temperature in temperatures)
+        temperatures = None if all_greedy else dev.make_tensor(temperatures, torch.float32, self.device)
         return input_ids, positions, temperatures, is_prefill
 
     @torch.inference_mode()

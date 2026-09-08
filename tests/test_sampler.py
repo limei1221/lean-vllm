@@ -17,6 +17,11 @@ def test_zero_temperature_is_argmax():
     assert torch.equal(Sampler()(x, temperatures), x.argmax(dim=-1))
 
 
+def test_no_temperatures_is_the_greedy_fast_path():
+    x = logits()
+    assert torch.equal(Sampler()(x, None), x.argmax(dim=-1))
+
+
 def test_greedy_and_random_rows_coexist_in_one_batch():
     x = logits()
     temperatures = torch.tensor([0.0, 1.0, 0.0, 1.0])

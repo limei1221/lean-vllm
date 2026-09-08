@@ -51,6 +51,17 @@ def test_batch_preparation_on_tensor_parallel_ranks(runner, rank, decode):
         assert temperatures.tolist() == [0.5]
 
 
+def test_an_all_greedy_batch_sends_no_temperatures(runner):
+    """None is the sampler's fast path, and one transfer the step does not make."""
+    seq = Sequence([10, 11, 12], SamplingParams(temperature=0.0))
+    seq.append_token(13)
+    seq.num_cached_tokens, seq.num_scheduled_tokens, seq.is_prefill = 3, 1, False
+
+    _, _, temperatures, _ = runner.prepare_batch([seq])
+
+    assert temperatures is None
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_preemption_recomputes_the_generated_suffix(runner, make_engine, chunked):
     engine = make_engine(num_kvcache_blocks=6, enable_chunked_prefill=chunked)
@@ -103,7 +114,8 @@ def test_recomputed_suffix_stays_prefill_across_chunks(runner, make_engine):
         assert positions.tolist() == expected_positions
         assert len(seq.block_table) == 2    # replay uses the blocks reserved at admission
         last = expected_positions == [8]
-        assert temperatures.tolist() == ([1.0] if last else [])
+        # None until the chunk that samples: no row asks for a temperature before it.
+        assert (temperatures.tolist() if last else temperatures) == ([1.0] if last else None)
         assert get_context().logits_indices.tolist() == ([0] if last else [])
         stepped = engine.scheduler.postprocess(scheduled, [27] if last else [])
         assert stepped == ([seq] if last else [])

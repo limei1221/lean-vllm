@@ -4,8 +4,13 @@ from torch import nn
 
 class Sampler(nn.Module):
 
+    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor | None):
+        if temperatures is None:
+            return logits.argmax(dim=-1)
+        return self.sample(logits, temperatures)
+
     @torch.compile
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
+    def sample(self, logits: torch.Tensor, temperatures: torch.Tensor):
         logits = logits.float()
         greedy_tokens = logits.argmax(dim=-1)
         logits = logits.div_(temperatures.clamp_min(1e-10).unsqueeze(dim=1))
