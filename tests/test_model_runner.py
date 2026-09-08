@@ -62,6 +62,26 @@ def test_an_all_greedy_batch_sends_no_temperatures(runner):
     assert temperatures is None
 
 
+class TestPiecewiseBuckets:
+
+    def buckets(self, budget):
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.config = type("C", (), {"max_num_batched_tokens": budget})()
+        return runner._piecewise_buckets()
+
+    def test_the_budget_is_always_the_top_bucket(self):
+        assert self.buckets(8192)[-1] == 8192
+        assert self.buckets(5000)[-1] == 5000    # not a listed size, still covered
+
+    def test_buckets_are_sorted_and_within_the_budget(self):
+        sizes = self.buckets(5000)
+        assert sizes == sorted(set(sizes))
+        assert all(size <= 5000 for size in sizes)
+
+    def test_a_budget_under_the_smallest_size_is_the_only_bucket(self):
+        assert self.buckets(128) == [128]
+
+
 class TestStepKind:
     """Which capture, if any, a step is eligible for. Pure: shape and config."""
 

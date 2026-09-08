@@ -33,6 +33,9 @@ class ModelRunner:
         self.cudagraph_mode = "none" if self.enforce_eager else config.cudagraph_mode
         self.graph_bs: list[int] = []          # captured batch sizes, full graphs
         self.piecewise_bs: list[int] = []      # captured token counts, piecewise graphs
+        self.graphs: dict = {}
+        self.piecewise_graphs: dict = {}
+        self.graph_pool = None                 # shared by both capture kinds
         self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
                               or not attention_backend.supports_cuda_graph())
         self.world_size = config.tensor_parallel_size
@@ -50,8 +53,10 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
+        if self.cudagraph_mode in FULL_MODES:
             self.capture_cudagraph()
+        if self.cudagraph_mode in PIECEWISE_MODES:
+            self.capture_piecewise()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -70,8 +75,8 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+        if self.cudagraph_mode != "none":
+            del self.graphs, self.piecewise_graphs, self.graph_pool
         dev.synchronize(self.device)
         dist.destroy_process_group()
 
@@ -217,22 +222,54 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         self.step_kind = self._step_kind(is_prefill, input_ids.size(0))
-        if self.step_kind != "graph":
-            return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+        if self.step_kind == "graph":
+            return self.model.compute_logits(self._replay_full(input_ids, positions))
+        if self.step_kind == "piecewise":
+            return self.model.compute_logits(self._replay_piecewise(input_ids, positions))
+        return self.model.compute_logits(self.model(input_ids, positions))
+
+    def _replay_full(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """One graph for the whole model. Pure decode only: attention is inside it."""
+        bs = input_ids.size(0)
+        context = get_context()
+        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        graph_vars = self.graph_vars
+        graph_vars["input_ids"][:bs] = input_ids
+        graph_vars["positions"][:bs] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        graph.replay()
+        return graph_vars["outputs"][:bs]
+
+    def _replay_piecewise(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """A graph per piece, with attention run eager between them.
+
+        Pad rows compute alongside the real ones and are dropped. Nothing in a
+        piece mixes rows -- every op is per token -- so whatever the pad region
+        holds cannot reach a real one, and attention is handed the real rows
+        only, so no pad reaches the KV cache either.
+        """
+        num_tokens = input_ids.size(0)
+        bucket = next(size for size in self.piecewise_bs if size >= num_tokens)
+        graphs, buffers = self.piecewise_graphs[bucket], self.piecewise_vars
+        buffers["input_ids"][:num_tokens] = input_ids
+        buffers["positions"][:num_tokens] = positions
+
+        graphs["head"].replay()
+        for layer, pre, post in zip(self.model.model.layers, graphs["pre"], graphs["post"]):
+            pre.replay()
+            # The real rows only: attention reads this step's sequence layout,
+            # which is exactly what cannot go in a graph.
+            attn_out = layer.self_attn.attn(
+                buffers["q"][:num_tokens], buffers["k"][:num_tokens], buffers["v"][:num_tokens]
+            )
+            buffers["attn_out"][:num_tokens] = attn_out
+            post.replay()
+        graphs["tail"].replay()
+        return buffers["output"][:num_tokens]
 
     def run(self, seqs: list[Sequence]) -> list[int]:
         input_ids, positions, temperatures, is_prefill = self.prepare_batch(seqs)
@@ -240,6 +277,85 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def _piecewise_buckets(self) -> list[int]:
+        """Token counts to capture at, fine at the bottom where padding hurts most.
+
+        A step padded from 300 tokens to 512 does 70% more work in the pieces,
+        which is the tax the decode path never pays: there a bucket is rows.
+        """
+        budget = self.config.max_num_batched_tokens
+        sizes = [256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192]
+        # The budget itself is always the top bucket, or the largest steps -- the
+        # ones worth capturing most -- would fall past the last one and go eager.
+        return sorted({size for size in sizes if size < budget} | {budget})
+
+    @torch.inference_mode()
+    def capture_piecewise(self):
+        """Capture the model either side of attention, one graph per piece per bucket.
+
+        The pieces read and write fixed buffers, so a replay always finds its
+        inputs where the capture left them. They touch no context and no KV
+        cache -- that is what makes them capturable while attention is not.
+        """
+        hf_config = self.config.hf_config
+        layers = self.model.model.layers
+        self.piecewise_bs = self._piecewise_buckets()
+        largest = self.piecewise_bs[-1]
+        attn = layers[0].self_attn
+        buffers = dict(
+            input_ids=torch.zeros(largest, dtype=torch.int64),
+            positions=torch.zeros(largest, dtype=torch.int64),
+            hidden=torch.zeros(largest, hf_config.hidden_size),
+            residual=torch.zeros(largest, hf_config.hidden_size),
+            output=torch.zeros(largest, hf_config.hidden_size),
+            q=torch.zeros(largest, attn.num_heads, attn.head_dim),
+            k=torch.zeros(largest, attn.num_kv_heads, attn.head_dim),
+            v=torch.zeros(largest, attn.num_kv_heads, attn.head_dim),
+            attn_out=torch.zeros(largest, attn.num_heads, attn.head_dim),
+        )
+        self.piecewise_vars = buffers
+        self.piecewise_graphs = {}
+
+        def capture(run):
+            """Warm up, then capture. The warmup pass is what allocates."""
+            run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, self.graph_pool):
+                run()
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+            torch.cuda.synchronize()
+            return graph
+
+        for size in reversed(self.piecewise_bs):
+            def head(size=size):
+                buffers["hidden"][:size].copy_(self.model.model.embed_tokens(buffers["input_ids"][:size]))
+
+            def tail(size=size):
+                normed, _ = self.model.model.norm(buffers["hidden"][:size], buffers["residual"][:size])
+                buffers["output"][:size].copy_(normed)
+
+            def pre(layer, first, size=size):
+                # The first layer takes no residual in; its graph bakes that in.
+                carried = None if first else buffers["residual"][:size]
+                q, k, v, residual = layer.pre_attention(buffers["positions"][:size], buffers["hidden"][:size], carried)
+                buffers["q"][:size].copy_(q)
+                buffers["k"][:size].copy_(k)
+                buffers["v"][:size].copy_(v)
+                buffers["residual"][:size].copy_(residual)
+
+            def post(layer, size=size):
+                hidden, residual = layer.post_attention(buffers["attn_out"][:size], buffers["residual"][:size])
+                buffers["hidden"][:size].copy_(hidden)
+                buffers["residual"][:size].copy_(residual)
+
+            self.piecewise_graphs[size] = {
+                "head": capture(head),
+                "pre": [capture(lambda layer=layer, first=i == 0: pre(layer, first)) for i, layer in enumerate(layers)],
+                "post": [capture(lambda layer=layer: post(layer)) for layer in layers],
+                "tail": capture(tail),
+            }
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -254,8 +370,6 @@ class ModelRunner:
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
-        self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()

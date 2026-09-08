@@ -102,7 +102,8 @@ Each step leaves the suite green.
 1. ~~Attention as a custom op~~ — done, `a77ecac`.
 2. ~~`cudagraph_mode` config, the dispatcher, and the metric kind~~ — done.
 3. ~~Split `Qwen3DecoderLayer` into `pre_attention()` and `post_attention()`~~ — done.
-4. Capture and replay the pieces. GPU only.
+4. ~~Capture and replay the pieces~~ — written, unverified: no CUDA on the
+   machine it was written on, so not one capture has executed.
 5. Verify, then measure.
 
 Steps 2 and 3 were done off the GPU, so that session only spends its time on
@@ -129,6 +130,19 @@ Correctness first, on a small model:
 
 Then the rate sweep, comparing `step_seconds` by kind against
 `results/graphs/rate`, with the cache pinned.
+
+## What step 4 assumes
+
+Written but never run. Each of these is a guess until the A100 says otherwise:
+
+- **Capture cost at startup.** 74 pieces per bucket for a 36-layer model, times
+  the buckets, is ~740 captures each preceded by a warmup pass. Tens of seconds,
+  and the bucket list is the dial if that is too slow.
+- **Pool memory.** All pieces share one `graph_pool`, but the intermediates for
+  the largest bucket live in it. This is on top of the ~290MB of static buffers,
+  and all of it comes out of the KV cache.
+- **That capture succeeds through the custom op at all.** The op wrapper does
+  its own checking around the call; nothing has proved that is capture-safe.
 
 ## Kill criteria
 
