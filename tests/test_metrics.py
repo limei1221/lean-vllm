@@ -155,6 +155,7 @@ class TestSummary:
         summary = engine.metrics.summary()
         assert summary["requests"]["finished"] == {"length": 1}
         assert summary["graph_step_fraction"] == 0.0    # the fake runner captures no graphs
+        assert summary["eager_steps"] == {"enforced": summary["steps"]}
         assert 0 < summary["model_busy_fraction"] <= 1
         assert summary["latency"]["e2e"]["count"] == 1
 

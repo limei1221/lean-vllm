@@ -28,7 +28,7 @@ class ModelRunner:
         attention_backend = get_attention_backend()
         if rank == 0:
             logger.info("attention backend: %s", attention_backend.get_name())
-        self.used_graph = False    # whether the last step replayed a CUDA graph
+        self.eager_reason: str | None = "enforced"    # why the last step ran eager; None if it replayed a graph
         self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
                               or not attention_backend.supports_cuda_graph())
         self.world_size = config.tensor_parallel_size
@@ -190,10 +190,24 @@ class ModelRunner:
         temperatures = None if all_greedy else dev.make_tensor(temperatures, torch.float32, self.device)
         return input_ids, positions, temperatures, is_prefill
 
+    def _eager_reason(self, is_prefill: bool, batch_size: int) -> str | None:
+        """Why this step cannot replay a graph. None means it can.
+
+        "prefill" is what piecewise capture would reclaim, "oversized" what a
+        larger bucket would; the split decides whether either is worth doing.
+        """
+        if self.enforce_eager:
+            return "enforced"
+        if is_prefill:
+            return "prefill"
+        if batch_size > 512:
+            return "oversized"
+        return None
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        self.used_graph = not (is_prefill or self.enforce_eager or input_ids.size(0) > 512)
-        if not self.used_graph:
+        self.eager_reason = self._eager_reason(is_prefill, input_ids.size(0))
+        if self.eager_reason:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)

@@ -157,6 +157,7 @@ class Metrics:
 
         self.steps = Counter("lean_vllm:num_steps_total", "Forward passes.")
         self.graph_steps = Counter("lean_vllm:num_graph_steps_total", "Forward passes replayed from a CUDA graph.")
+        self.eager_steps = Counter("lean_vllm:num_eager_steps_total", "Forward passes that ran eager.", label="reason")
         self.model_busy = Counter("lean_vllm:model_busy_seconds_total", "Wall seconds spent inside a step.")
 
         self.ttft = Histogram("lean_vllm:time_to_first_token_seconds", "Arrival to first token.", LATENCY_BUCKETS)
@@ -180,12 +181,14 @@ class Metrics:
         with self.lock:
             self.requests_aborted.inc()
 
-    def record_step(self, scheduler, output, outputs, duration: float, used_graph: bool):
+    def record_step(self, scheduler, output, outputs, duration: float, eager_reason: str | None):
         with self.lock:
             if output:    # a step that scheduled nothing ran no model
                 self.steps.inc()
-                if used_graph:
+                if eager_reason is None:
                     self.graph_steps.inc()
+                else:
+                    self.eager_steps.inc(label_value=eager_reason)
                 self.model_busy.inc(duration)
                 self.step_duration.observe(duration)
                 self.iteration_tokens.observe(output.num_prefill_tokens + output.num_decode_tokens)
@@ -242,6 +245,7 @@ class Metrics:
                 "gpu_utilization_percent_nvidia_smi": gpu_utilization(),
                 "steps": self.steps.total,
                 "graph_step_fraction": _rate(self.graph_steps.total, self.steps.total),
+                "eager_steps": dict(sorted(self.eager_steps.values.items())),
                 "mean_step_seconds": self.step_duration.mean,
                 "mean_batch_tokens": self.iteration_tokens.mean,
                 "prefix_cache_hit_rate": _rate(self.prefix_cache_hits.total, self.prefix_cache_queries.total),
