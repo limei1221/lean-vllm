@@ -70,9 +70,11 @@ class Gauge(_Metric):
     def __init__(self, name: str, documentation: str):
         super().__init__(name, documentation)
         self.value: float = 0.0
+        self.peak: float = 0.0
 
     def set(self, value: float):
         self.value = value
+        self.peak = max(self.peak, value)
 
     def render(self) -> list[str]:
         return self._header() + [f"{self.name} {_number(self.value)}"]
@@ -250,6 +252,7 @@ class Metrics:
                     "finished": dict(sorted(self.requests_finished.values.items())),
                     "running": self.running.value,
                     "waiting": self.waiting.value,
+                    "waiting_peak": self.waiting.peak,
                 },
                 "tokens": {
                     "prompt": self.prompt_tokens.total,
@@ -258,6 +261,7 @@ class Metrics:
                     "decode": self.decode_tokens.total,
                 },
                 "kv_cache_usage": self.kv_usage.value,
+                "kv_cache_usage_peak": self.kv_usage.peak,
                 "preemptions": self.preemptions.total,
                 # Percentiles are the benchmark client's job: these buckets are
                 # too coarse to interpolate one from without lying about it.

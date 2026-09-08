@@ -99,6 +99,16 @@ class TestEngineRecording:
         assert engine.metrics.waiting.value == 0
         assert engine.metrics.kv_usage.value == 1.0    # both blocks taken
 
+    def test_the_kv_usage_peak_outlives_the_drain(self, make_engine):
+        """The benchmark reads the summary once, after everything finished."""
+        engine = make_engine(num_kvcache_blocks=2)
+        engine.add(prompt(8), SamplingParams(max_tokens=3, ignore_eos=True))
+        engine.add(prompt(8, 100), SamplingParams(max_tokens=3, ignore_eos=True))
+        engine.run_to_completion()
+        summary = engine.metrics.summary()
+        assert summary["kv_cache_usage"] == 0.0
+        assert summary["kv_cache_usage_peak"] == 1.0    # both blocks were taken while they ran
+
     def test_preemptions_are_counted(self, make_engine):
         engine = make_engine(num_kvcache_blocks=3, kvcache_block_size=8, max_num_seqs=2)
         engine.add(prompt(8), FOREVER)
