@@ -158,6 +158,9 @@ class Metrics:
         self.steps = Counter("lean_vllm:num_steps_total", "Forward passes.")
         self.graph_steps = Counter("lean_vllm:num_graph_steps_total", "Forward passes replayed from a CUDA graph.")
         self.eager_steps = Counter("lean_vllm:num_eager_steps_total", "Forward passes that ran eager.", label="reason")
+        # Eager steps are the expensive kind, so their share of the count
+        # understates their share of the clock. This is the share that matters.
+        self.step_seconds = Counter("lean_vllm:step_seconds_total", "Time in forward passes.", label="kind")
         self.model_busy = Counter("lean_vllm:model_busy_seconds_total", "Wall seconds spent inside a step.")
 
         self.ttft = Histogram("lean_vllm:time_to_first_token_seconds", "Arrival to first token.", LATENCY_BUCKETS)
@@ -189,6 +192,7 @@ class Metrics:
                     self.graph_steps.inc()
                 else:
                     self.eager_steps.inc(label_value=eager_reason)
+                self.step_seconds.inc(duration, label_value=eager_reason or "graph")
                 self.model_busy.inc(duration)
                 self.step_duration.observe(duration)
                 self.iteration_tokens.observe(output.num_prefill_tokens + output.num_decode_tokens)
@@ -246,6 +250,7 @@ class Metrics:
                 "steps": self.steps.total,
                 "graph_step_fraction": _rate(self.graph_steps.total, self.steps.total),
                 "eager_steps": dict(sorted(self.eager_steps.values.items())),
+                "step_seconds": dict(sorted(self.step_seconds.values.items())),
                 "mean_step_seconds": self.step_duration.mean,
                 "mean_batch_tokens": self.iteration_tokens.mean,
                 "prefix_cache_hit_rate": _rate(self.prefix_cache_hits.total, self.prefix_cache_queries.total),

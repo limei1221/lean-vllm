@@ -156,6 +156,9 @@ class TestSummary:
         assert summary["requests"]["finished"] == {"length": 1}
         assert summary["graph_step_fraction"] == 0.0    # the fake runner captures no graphs
         assert summary["eager_steps"] == {"enforced": summary["steps"]}
+        # the same clock as model_busy, split by kind
+        assert summary["step_seconds"]["enforced"] == pytest.approx(
+            summary["model_busy_fraction"] * summary["uptime_seconds"])
         assert 0 < summary["model_busy_fraction"] <= 1
         assert summary["latency"]["e2e"]["count"] == 1
 
