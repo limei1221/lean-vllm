@@ -101,13 +101,12 @@ Each step leaves the suite green.
 
 1. ~~Attention as a custom op~~ — done, `a77ecac`.
 2. ~~`cudagraph_mode` config, the dispatcher, and the metric kind~~ — done.
-3. Split `Qwen3DecoderLayer` into `pre_attention()` and `post_attention()`.
-   CPU-testable: output must be token-identical to today's `forward`.
+3. ~~Split `Qwen3DecoderLayer` into `pre_attention()` and `post_attention()`~~ — done.
 4. Capture and replay the pieces. GPU only.
 5. Verify, then measure.
 
-Step 3 is worth doing before the GPU session too, so that session only spends
-its time on step 4.
+Steps 2 and 3 were done off the GPU, so that session only spends its time on
+step 4.
 
 ## Verification
 
@@ -118,6 +117,11 @@ Correctness first, on a small model:
   mixed step. This is the check M3 used for chunked prefill, and it catches the
   failure that matters: a mis-captured graph replays stale pointers and returns
   plausible wrong tokens rather than raising.
+- **RMSNorm writes in place, and only copies when it has to cast.** `x.float()`
+  is a copy in bf16, which is what the runner runs; in fp32 it returns the same
+  tensor and the `mul_` rewrites the caller's. Static capture buffers make that
+  aliasing a live hazard rather than a latent one, so a piece must not be handed
+  a buffer anything else still needs. It is also why the piece tests run bf16.
 - Host syncs inside a piece break capture. `layers/` and `models/` are clean of
   `.item()`, `.tolist()` and `.cpu()` today — the only `.tolist()` is in
   `torch_backend`, inside attention, which stays eager. Re-check after any change

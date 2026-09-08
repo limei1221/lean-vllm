@@ -69,11 +69,12 @@ class Qwen3Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
-    def forward(
+    def project(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Up to attention: qkv, the per-head norms, and rope."""
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -82,10 +83,11 @@ class Qwen3Attention(nn.Module):
         if not self.qkv_bias:
             q = self.q_norm(q)
             k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
-        output = self.o_proj(o.flatten(1, -1))
-        return output
+        return self.rotary_emb(positions, q, k) + (v,)
+
+    def combine(self, o: torch.Tensor) -> torch.Tensor:
+        """From attention's output back to the residual stream."""
+        return self.o_proj(o.flatten(1, -1))
 
 
 class Qwen3MLP(nn.Module):
@@ -143,20 +145,37 @@ class Qwen3DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def pre_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The layer up to attention. Touches no KV cache, so it is capturable."""
+        if residual is None:
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        return self.self_attn.project(positions, hidden_states) + (residual,)
+
+    def post_attention(
+        self,
+        attn_out: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The layer after attention. Capturable for the same reason."""
+        hidden_states = self.self_attn.combine(attn_out)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return self.mlp(hidden_states), residual
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        q, k, v, residual = self.pre_attention(positions, hidden_states, residual)
+        return self.post_attention(self.self_attn.attn(q, k, v), residual)
 
 
 class Qwen3Model(nn.Module):
