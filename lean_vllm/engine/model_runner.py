@@ -30,14 +30,14 @@ class ModelRunner:
         if rank == 0:
             logger.info("attention backend: %s", attention_backend.get_name())
         self.step_kind = "enforced"    # how the last step ran: see _step_kind
+        self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
+                              or not attention_backend.supports_cuda_graph())
         self.cudagraph_mode = "none" if self.enforce_eager else config.cudagraph_mode
         self.graph_bs: list[int] = []          # captured batch sizes, full graphs
         self.piecewise_bs: list[int] = []      # captured token counts, piecewise graphs
         self.graphs: dict = {}
         self.piecewise_graphs: dict = {}
         self.graph_pool = None                 # shared by both capture kinds
-        self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
-                              or not attention_backend.supports_cuda_graph())
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
