@@ -72,10 +72,6 @@ class Result:
 # ---------------------------------------------------------------- traces
 
 
-def _clamp(value: int, low: int, high: int) -> int:
-    return max(low, min(high, value))
-
-
 def _prompt(rng: random.Random, num_tokens: int, vocab_size: int) -> list[int]:
     """Random ids, so no two prompts share a prefix and the cache cannot flatter.
 
@@ -86,7 +82,7 @@ def _prompt(rng: random.Random, num_tokens: int, vocab_size: int) -> list[int]:
 
 
 def _lognormal(rng: random.Random, median: int, sigma: float, low: int, high: int) -> int:
-    return _clamp(round(rng.lognormvariate(math.log(median), sigma)), low, high)
+    return max(low, min(high, round(rng.lognormvariate(math.log(median), sigma))))
 
 
 def fixed_trace(rng: random.Random, args) -> list[Request]:
@@ -337,9 +333,12 @@ def distribution(values) -> dict | None:
     values = sorted(value for value in values if value is not None)
     if not values:
         return None
-    summary = {"count": len(values), "mean": sum(values) / len(values)}
-    summary |= {f"p{quantile * 100:g}": percentile(values, quantile) for quantile in QUANTILES}
-    return summary | {"max": values[-1]}
+    return {
+        "count": len(values),
+        "mean": sum(values) / len(values),
+        **{f"p{quantile * 100:g}": percentile(values, quantile) for quantile in QUANTILES},
+        "max": values[-1],
+    }
 
 
 def summarize(results: list[Result], duration: float, split_labels: bool = True) -> dict:

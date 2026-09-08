@@ -275,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     arms = SUITES[args.suite](args)
     rows, aborted = [], False
     printer = Table(arms)
+    print(printer.header(), flush=True)
 
     for arm in arms:
         for rate in args.rates:
@@ -282,16 +283,15 @@ def main(argv: list[str] | None = None) -> int:
             with Server(args, arm, out / f"{stem}.server.log"):
                 result = bench.run(client_args(args, arm, rate))
             (out / f"{stem}.json").write_text(json.dumps(result, indent=2))
-            rows.append(row(arm, rate, result))
+            entry = row(arm, rate, result)
+            rows.append(entry)
             aborted |= result["aborted"]
-            if len(rows) == 1:
-                print(printer.header(), flush=True)
-            print(printer.row(rows[-1]), flush=True)
+            print(printer.row(entry), flush=True)
 
     summary = {
         "engine": args.engine,
         "suite": args.suite,
-        "config": {key: value for key, value in vars(args).items() if key != "rates"} | {"rates": args.rates},
+        "config": vars(args),
         "arms": {arm.name: {"server": arm.server, "client": arm.client} for arm in arms},
         "rows": rows,
     }
