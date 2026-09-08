@@ -196,6 +196,8 @@ cython_debug/
 
 # Benchmark output (sweep.py --out)
 results/
+results_bak/
+results-*.tar.gz
 
 # Personal notes, not part of the project
 docs/llm_inference_engineering_projects.md
