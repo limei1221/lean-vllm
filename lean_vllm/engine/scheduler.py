@@ -38,7 +38,6 @@ class Scheduler:
         self.enable_chunked_prefill = config.enable_chunked_prefill
         self.max_waiting_requests = config.max_waiting_requests
         self.request_timeout = config.request_timeout
-        self.max_num_partial_prefills = config.max_num_partial_prefills
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting = SchedulingPolicy.create(config.scheduling_policy)
@@ -101,8 +100,6 @@ class Scheduler:
                     continue
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
-                    break
-                if self._would_chunk(seq, num_cached_blocks, budget) and self._partial_prefills_full():
                     break
                 budget -= self._admit(seq, num_cached_blocks, budget, output)
 
@@ -175,16 +172,6 @@ class Scheduler:
         else:
             output.num_decode_tokens += 1
         return num_tokens
-
-    def _would_chunk(self, seq: Sequence, num_cached_blocks: int, budget: int) -> bool:
-        num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
-        return num_tokens > budget or 0 < self.long_prefill_token_threshold < num_tokens
-
-    def _partial_prefills_full(self) -> bool:
-        if not self.max_num_partial_prefills:
-            return False
-        partial = sum(1 for seq in self.running if seq.is_prefill)
-        return partial >= self.max_num_partial_prefills
 
     def _make_room(self, seq: Sequence, still_running: deque[Sequence], output: SchedulerOutput) -> bool:
         """Free blocks for one more decoded token. False if seq itself gave way.

@@ -21,7 +21,6 @@ class Config:
     scheduling_policy: str = "fcfs"    # or "priority"
     max_waiting_requests: int = 0      # 0 is unlimited
     request_timeout: float = 0.0       # seconds a request may wait unscheduled; 0 is none
-    max_num_partial_prefills: int = 0  # concurrent chunked prompts; 0 is unlimited
     long_prefill_token_threshold: int = 0    # per-step token cap for one prompt; 0 is none
 
     def __post_init__(self):

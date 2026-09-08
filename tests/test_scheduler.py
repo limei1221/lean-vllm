@@ -1,7 +1,7 @@
-"""Pins the scheduler's behaviour before Project 1 rewrites it. See docs/online-serving.md.
+"""The scheduler, against the fake runner in conftest: no model, no GPU.
 
-Several tests assert limitations rather than features. Each says so, and names
-the milestone that is expected to change it.
+TestChunkedPrefillDisabled covers the `enable_chunked_prefill=False` arm, which
+is the pre-mixed-batch shape kept alive so the A/B has a "before".
 """
 
 import pytest
@@ -428,21 +428,6 @@ class TestLongPrompts:
         engine.step()
         assert engine.model_runner.batches[0] == (True, [(first.request_id, 8), (second.request_id, 8)])
 
-    def test_concurrent_chunked_prompts_are_capped(self, make_engine):
-        engine = make_engine(max_num_batched_tokens=16, max_num_partial_prefills=1)
-        first = engine.add(prompt(40), FOREVER)
-        second = engine.add(prompt(40, 100), FOREVER)
-        engine.step()
-        assert engine.model_runner.batches[0] == (True, [(first.request_id, 16)])
-        assert second in engine.scheduler.waiting
-
-    def test_a_prompt_that_fits_is_admitted_past_the_cap(self, make_engine):
-        engine = make_engine(max_num_batched_tokens=48, max_num_partial_prefills=1)
-        first = engine.add(prompt(40), FOREVER)
-        short = engine.add(prompt(8, 100), FOREVER)
-        engine.step()
-        assert engine.model_runner.batches[0] == (True, [(first.request_id, 40), (short.request_id, 8)])
-
 
 class TestBatchCounts:
     """postprocess() clears num_scheduled_tokens, so the counts must be taken at schedule time."""
@@ -481,7 +466,7 @@ class TestChunkedPrefillDisabled:
         arriving = engine.add(prompt(8, 100), FOREVER)
         engine.step()
         assert engine.model_runner.batches[1] == (True, [(arriving.request_id, 8)])
-        assert running.num_completion_tokens == 1    # starved this step, as before M2
+        assert running.num_completion_tokens == 1    # starved this step, as a whole prompt does
 
     def test_a_prompt_larger_than_the_budget_is_dropped(self, make_engine):
         engine = make_engine(max_num_batched_tokens=16, enable_chunked_prefill=False)

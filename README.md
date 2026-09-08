@@ -87,7 +87,8 @@ Sampling parameters the engine does not implement (`top_p`, `seed`, penalties,
 `n > 1`, and the rest) are refused with a 400 rather than ignored, and a `model`
 the server does not serve is a 404 — `/v1/models` lists the name it answers to.
 Every engine flag is a `Config` field; `lean-vllm serve --help` lists them.
-Design and milestones are in [docs/online-serving.md](docs/online-serving.md).
+[docs/online-serving.md](docs/online-serving.md) covers the endpoints, the
+scheduling flags and admission control.
 
 ## Benchmarks
 

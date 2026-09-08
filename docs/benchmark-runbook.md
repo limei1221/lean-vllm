@@ -1,7 +1,6 @@
 # Benchmark runbook
 
-How to produce the numbers `docs/online-serving.md` asks for, on a rented
-A100 80GB SXM, against vLLM on the same box.
+How to produce the serving numbers on a A100 80GB SXM against vLLM.
 
 Budget 4-5 hours of GPU time. Do steps 0-4 and check the numbers look sane
 before committing to the long sweeps.

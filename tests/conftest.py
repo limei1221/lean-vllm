@@ -29,7 +29,6 @@ class FakeConfig:
     scheduling_policy: str = "fcfs"
     max_waiting_requests: int = 0
     request_timeout: float = 0.0
-    max_num_partial_prefills: int = 0
     long_prefill_token_threshold: int = 0
 
 
@@ -67,7 +66,7 @@ class FakeModelRunner:
 
 
 class FakeEngine:
-    """LLMEngine.step without the model. Mirrors it deliberately; M1 changes both together."""
+    """LLMEngine.step without the model. Mirrors it deliberately: change both together."""
 
     def __init__(self, config: FakeConfig, runner: FakeModelRunner):
         self.config = config
