@@ -1,4 +1,5 @@
-from collections import deque
+from collections import OrderedDict
+from typing import Iterable
 import xxhash
 import numpy as np
 
@@ -23,13 +24,40 @@ class Block:
         self.token_ids = []
 
 
+class FreeBlockQueue:
+    """Free blocks in eviction order, least recently released at the head.
+
+    A block keeps its cached contents while it waits here, so a prefix hit takes
+    one back out of the middle. That removal is why this is an OrderedDict and
+    not a deque: on a deque it is a linear scan of every free block.
+    """
+
+    def __init__(self, block_ids: Iterable[int]):
+        self._ids: OrderedDict[int, None] = OrderedDict.fromkeys(block_ids)
+
+    def popleft(self) -> int:
+        return self._ids.popitem(last=False)[0]
+
+    def append(self, block_id: int):
+        self._ids[block_id] = None
+
+    def remove(self, block_id: int):
+        del self._ids[block_id]
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def __iter__(self):
+        return iter(self._ids)
+
+
 class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        self.free_block_ids = FreeBlockQueue(range(num_blocks))
         self.used_block_ids: set[int] = set()
 
     @property
