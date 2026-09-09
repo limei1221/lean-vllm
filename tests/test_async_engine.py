@@ -117,6 +117,25 @@ class TestAbort:
         assert not engine.engine.scheduler.seqs
 
     @asyncio_test
+    async def test_cancelling_admission_leaves_nothing_running(self, make_async_engine):
+        """No generator exists yet to abort in its finally, so add_request has to do it."""
+        engine = make_async_engine(gated=True)
+        blocks = engine.engine.scheduler.block_manager
+        free_before = len(blocks.free_block_ids)
+
+        adding = asyncio.create_task(engine.add_request(prompt(8), FOREVER, "cancelled"))
+        await asyncio.sleep(0)    # submitted, now waiting on admission
+        adding.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await adding
+
+        runner_of(engine).release(2)    # the add is drained, then the abort behind it
+        await settle(engine)
+        assert not engine.engine.scheduler.seqs
+        assert not engine._streams
+        assert len(blocks.free_block_ids) == free_before
+
+    @asyncio_test
     async def test_abort_of_an_unknown_request_is_harmless(self, make_async_engine):
         engine = make_async_engine()
         engine.abort("req-nobody")

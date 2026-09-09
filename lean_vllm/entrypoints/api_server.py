@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from lean_vllm.engine.async_engine import AsyncLLMEngine, EngineDeadError
 from lean_vllm.engine.output import RequestOutput
-from lean_vllm.engine.scheduler import QueueFull
+from lean_vllm.engine.scheduler import InvalidRequest, QueueFull
 from lean_vllm.entrypoints import protocol
 from lean_vllm.entrypoints.protocol import (
     BaseRequest,
@@ -103,6 +103,8 @@ async def _serve(engine: AsyncLLMEngine, model: str, body: BaseRequest, prompt_t
     )
     try:
         outputs = await engine.add_request(prompt_token_ids, sampling_params, request_id)
+    except InvalidRequest as invalid:
+        raise HTTPException(400, str(invalid))
     except QueueFull as full:
         raise HTTPException(429, f"the engine is at capacity: {full}")
     except EngineDeadError as dead:

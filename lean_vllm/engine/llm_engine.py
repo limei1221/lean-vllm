@@ -10,9 +10,25 @@ from lean_vllm.sampling_params import SamplingParams
 from lean_vllm.engine.output import RequestOutput
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.engine.metrics import Metrics
-from lean_vllm.engine.scheduler import QueueFull, Scheduler
+from lean_vllm.engine.scheduler import InvalidRequest, QueueFull, Scheduler
 from lean_vllm.engine.model_runner import ModelRunner
 from lean_vllm.utils.detokenizer import IncrementalDetokenizer
+
+
+def validate_request(prompt: list[int], sampling_params: SamplingParams, vocab_size: int, max_model_len: int):
+    """Every front door comes through here, so nothing invalid reaches the runner."""
+    if not prompt:
+        raise InvalidRequest("the prompt is empty")
+    bad = next((token_id for token_id in prompt if not 0 <= token_id < vocab_size), None)
+    if bad is not None:
+        raise InvalidRequest(f"token id {bad} is outside the {vocab_size}-token vocabulary")
+    if len(prompt) >= max_model_len:
+        raise InvalidRequest(f"prompt is {len(prompt)} tokens, over the {max_model_len}-token context")
+    if len(prompt) + sampling_params.max_tokens > max_model_len:
+        raise InvalidRequest(
+            f"prompt ({len(prompt)}) plus max_tokens ({sampling_params.max_tokens}) "
+            f"is over the {max_model_len}-token context"
+        )
 
 
 class LLMEngine:
@@ -48,6 +64,7 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams, request_id: str | None = None) -> str:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        validate_request(prompt, sampling_params, self.config.hf_config.vocab_size, self.config.max_model_len)
         seq = Sequence(prompt, sampling_params, request_id)
         detokenizer = IncrementalDetokenizer(self.tokenizer, prompt, seq.skip_special_tokens)
         try:

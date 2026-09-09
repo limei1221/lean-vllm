@@ -28,6 +28,14 @@ class QueueFull(Exception):
     """The waiting queue is at max_waiting_requests. The server answers 429."""
 
 
+class InvalidRequest(Exception):
+    """The request can never run as asked. The server answers 400."""
+
+
+class DuplicateRequestId(InvalidRequest):
+    """Another request with this id is still in flight, and seqs holds only one."""
+
+
 class Scheduler:
 
     def __init__(self, config: Config):
@@ -48,6 +56,8 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        if seq.request_id in self.seqs:
+            raise DuplicateRequestId(f"{seq.request_id} is already in flight")
         if self.max_waiting_requests and len(self.waiting) >= self.max_waiting_requests:
             raise QueueFull(f"{len(self.waiting)} requests already waiting")
         self.seqs[seq.request_id] = seq

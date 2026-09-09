@@ -7,7 +7,7 @@ is the pre-mixed-batch shape kept alive so the A/B has a "before".
 import pytest
 from time import sleep
 
-from lean_vllm.engine.scheduler import QueueFull
+from lean_vllm.engine.scheduler import DuplicateRequestId, QueueFull
 from lean_vllm.sampling_params import SamplingParams
 
 FOREVER = SamplingParams(max_tokens=64, ignore_eos=True)
@@ -361,6 +361,21 @@ class TestAdmissionControl:
         engine.add(prompt(8), FOREVER)
         engine.step()
         engine.add(prompt(8, 100), FOREVER)    # the first one left the queue
+
+    def test_a_duplicate_request_id_is_refused(self, make_engine):
+        """Both would queue behind one entry in seqs, and the second to finish would KeyError."""
+        engine = make_engine()
+        engine.add(prompt(8), FOREVER, request_id="dup")
+        with pytest.raises(DuplicateRequestId):
+            engine.add(prompt(8, 100), FOREVER, request_id="dup")
+        assert len(engine.scheduler.waiting) == 1
+        engine.run_to_completion()
+
+    def test_an_id_is_reusable_once_its_request_finished(self, make_engine):
+        engine = make_engine()
+        engine.add(prompt(8), SamplingParams(max_tokens=1, ignore_eos=True), request_id="reused")
+        engine.run_to_completion()
+        engine.add(prompt(8, 100), FOREVER, request_id="reused")
 
     def test_unlimited_by_default(self, make_engine):
         engine = make_engine()

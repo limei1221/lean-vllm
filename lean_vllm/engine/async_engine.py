@@ -118,7 +118,11 @@ class AsyncLLMEngine:
         stream = AsyncStream(self._loop)
         accepted = self._loop.create_future()
         self._submit(_Add(prompt, sampling_params, request_id, stream, accepted))
-        await accepted    # admission is settled before the caller sends a status code
+        try:
+            await accepted    # admission is settled before the caller sends a status code
+        except asyncio.CancelledError:
+            self.abort(request_id)    # intake is FIFO, so the abort lands behind the add
+            raise
         return self._generate(request_id, stream)
 
     async def _generate(self, request_id: str, stream: AsyncStream) -> AsyncIterator[RequestOutput]:

@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from lean_vllm.engine.async_engine import EngineDeadError
 from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.output import RequestOutput
-from lean_vllm.engine.scheduler import QueueFull
+from lean_vllm.engine.scheduler import InvalidRequest, QueueFull
 from lean_vllm.entrypoints.api_server import build_app
 
 MODEL = "fake-model"
@@ -231,6 +231,13 @@ class TestRefusals:
 
     def test_max_tokens_that_overruns_the_context_is_refused(self, client, engine):
         assert complete(client, prompt=[0] * 60, max_tokens=10).status_code == 400
+
+    def test_a_prompt_the_engine_rejects_is_a_400_and_not_a_500(self, client, engine):
+        """Token ids are only checkable against the vocabulary, which lives in the engine."""
+        engine.admission_error = InvalidRequest("token id 999999 is outside the 100-token vocabulary")
+        response = complete(client, prompt=[999999])
+        assert response.status_code == 400
+        assert "outside the 100-token vocabulary" in response.json()["error"]["message"]
 
     def test_a_full_queue_is_a_429(self, client, engine):
         engine.admission_error = QueueFull("4 requests already waiting")
