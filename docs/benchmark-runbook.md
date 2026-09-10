@@ -1,266 +1,186 @@
-# Benchmark runbook
+# Benchmark runbook: lean-vLLM versus vLLM
 
-How to produce the serving numbers on a A100 80GB SXM against vLLM.
+Compare Qwen3-8B on one NVIDIA A100-SXM4-80GB using the same workload and resource
+limits. Run **one rate curve per engine**, with **chunked prefill enabled** and
+**full + piecewise CUDA graphs** on both engines.
 
-Budget 4-5 hours of GPU time. Do steps 0-4 and check the numbers look sane
-before committing to the long sweeps.
+The six offered loads—**1, 4, 8, 12, 16, and 24 requests/s**—cover low-load
+latency, the transition to queueing, and saturated throughput. Each point uses
+1,000 requests, for 12 runs total. Run the engines sequentially on the same
+machine and compare these fresh results.
 
-## Why SXM, not PCIe
+Use the same Bash session for the commands below.
 
-Same GA100 die; what differs is the envelope it runs in.
+## 1. Install both engines
 
-| | A100 80GB SXM4 | A100 80GB PCIe |
-|---|---|---|
-| Memory bandwidth | ~2039 GB/s | ~1935 GB/s |
-| TDP | 400W | 300W |
-| Cooling | baseboard, active | passive card, chassis airflow |
-| GPU-to-GPU | NVLink 3 / NVSwitch, ~600 GB/s | PCIe 4.0 x16, ~64 GB/s |
-
-Sustained clocks are the reason. A sweep runs arms sequentially for an hour or
-more, and a 300W passively cooled card throttles partway through — later arms
-then run slower than earlier ones, which is indistinguishable from a scheduling
-regression. Decode is also bandwidth-bound at 8B, the tensor-parallel smoke test
-is an order of magnitude off over PCIe, and published vLLM numbers come from
-HGX/DGX SXM nodes.
-
-On PCIe anyway: lock clocks, watch `clocks_throttle_reasons.active`, record the
-SKU, and treat only the within-sweep A/B as meaningful.
-
-## 0. Record the box
+Clone once; for an existing checkout, start with `cd`:
 
 ```bash
-nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
-uname -r; python3 --version
-```
-
-This is the only free moment to get the driver version the results table
-promises.
-
-## 1. Setup
-
-lean-vLLM:
-
-```bash
-git clone <remote> ~/lean-vllm && cd ~/lean-vllm
-uv sync --extra cuda      # the dev group brings the server, the OpenAI SDK and the test deps
-uv run python -c "import torch, flash_attn; print(torch.__version__, torch.cuda.get_device_name(0))"
+git clone git@github.com:limei1221/lean-vllm.git /workspace/lean-vllm
+cd /workspace/lean-vllm
+git checkout feature/online-serving
+uv sync --extra cuda
 uv run hf download Qwen/Qwen3-8B --local-dir /workspace/huggingface/Qwen3-8B
 ```
 
-The flash-attn wheel is pinned to `cu12torch2.9` on Python 3.12, which is what
-`.python-version` already selects.
-
-vLLM goes in a **separate** venv — it pins its own torch and will break the
-flash-attn pin if it shares one:
+Keep vLLM in a separate environment because it manages its own PyTorch
+dependencies. Version `0.28.0` matches the previous comparison:
 
 ```bash
-uv venv ~/vllm-env --python 3.12
-VIRTUAL_ENV=~/vllm-env uv pip install vllm
-~/vllm-env/bin/vllm --version    # record it; vLLM's scheduler changed a lot between V0 and V1
+uv venv /workspace/vllm-env --python 3.12
+uv pip install --python /workspace/vllm-env/bin/python vllm==0.28.0
 ```
 
-## 2. Pin the clocks
+## 2. Set the shared workload and server limits
+
+```bash
+export MODEL=/workspace/huggingface/Qwen3-8B
+export RUN_RESULTS="results/$(date -u +%Y%m%dT%H%M%SZ)"
+export RATES="1,4,8,12,16,24"
+export KVTOKENS=327680
+export PINNED="--max-num-batched-tokens 8192 --max-num-seqs 256 --enable-chunked-prefill"
+export TRACE_ARGS="--dataset lognormal --input-len 512 --output-len 128 --sigma 0.8 --temperature 0 --warmup 3 --timeout 1200"
+export LEAN_SERVER_ARGS="$PINNED --cudagraph-mode full_and_piecewise"
+export VLLM_SERVER_ARGS="$PINNED --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}'"
+mkdir -p "$RUN_RESULTS"
+```
+
+| Setting | Both engines |
+| --- | --- |
+| Model | Same local Qwen3-8B weights |
+| Input / output lengths | Lognormal distribution, medians 512 / 128 tokens, σ = 0.8 |
+| Sampling | Greedy, seed 0 |
+| Requests per point | 1,000 measured requests, plus 3 warmup requests |
+| Maximum context | 4,096 tokens |
+| KV cache capacity | 327,680 tokens |
+| Batch token budget / maximum sequences | 8,192 / 256 |
+| Chunked prefill | Enabled |
+| CUDA graphs | Full + piecewise |
+
+The graph-mode option differs between engines: lean-vLLM uses
+`--cudagraph-mode full_and_piecewise`; vLLM uses the equivalent
+`FULL_AND_PIECEWISE` setting in `--compilation-config`.
+
+`sweep.py` converts KV capacity to each engine's block count, so both get the
+same number of cache tokens. Each point starts a fresh server. The 1,200-second
+client timeout allows queued requests to finish under heavy load.
+
+## 3. Save metadata and monitor the GPU
+
+Record the build and environment with the results:
+
+```bash
+{
+  git rev-parse HEAD
+  git status --short
+  nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+  uname -r
+  uv run python --version
+  uv run python -c 'import torch; print("lean-vLLM torch:", torch.__version__)'
+  /workspace/vllm-env/bin/vllm --version
+  /workspace/vllm-env/bin/python -c 'import torch; print("vLLM torch:", torch.__version__)'
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+  date '+%Y-%m-%dT%H:%M:%S%z'
+} | tee "$RUN_RESULTS/environment.txt"
+git diff HEAD > "$RUN_RESULTS/working-tree.patch"
+```
+
+Save any untracked source files separately; they are not included in the patch.
+
+If the host allows it, enable persistence mode and lock the clock:
 
 ```bash
 sudo nvidia-smi -pm 1
-nvidia-smi -q -d SUPPORTED_CLOCKS | head -20
-sudo nvidia-smi -lgc 1410        # A100 boost
+sudo nvidia-smi -lgc 1410
 ```
 
-Leave a throttle log running for the whole session:
+If the container refuses, continue with monitoring. Record settings and keep a
+GPU log running through both curves:
 
 ```bash
-mkdir -p ~/lean-vllm/results
-nvidia-smi --query-gpu=timestamp,clocks.sm,temperature.gpu,power.draw,clocks_throttle_reasons.active \
-  --format=csv -l 10 > ~/lean-vllm/results/nvidia-smi.log &
+nvidia-smi --query-gpu=name,persistence_mode,clocks.applications.graphics,clocks.max.graphics,power.limit,power.max_limit \
+  --format=csv | tee "$RUN_RESULTS/gpu-settings.csv"
+
+nvidia-smi --query-gpu=timestamp,utilization.gpu,clocks.sm,temperature.gpu,power.draw,clocks_throttle_reasons.active \
+  --format=csv -l 10 > "$RUN_RESULTS/nvidia-smi.log" &
+GPU_LOG_PID=$!
 ```
 
-If `clocks_throttle_reasons.active` ever leaves `Not Active` during a sweep, that
-sweep's arms are no longer comparable to each other. Without `sudo` you cannot
-pin clocks, so watch the log twice as closely.
+## 4. Run the two curves
 
-## 3. Sanity check
+Make sure no other model server is running. The sweep handles startup, health
+checks, warmup, and shutdown automatically.
 
-```bash
-cd ~/lean-vllm
-uv run pytest tests/ -q
-
-uv run lean-vllm serve /workspace/huggingface/Qwen3-8B --port 8000 --max-model-len 4096 \
-  --served-model-name qwen &
-sleep 90
-curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
-  -d '{"model":"qwen","prompt":"The capital of France is","max_tokens":16,"temperature":0}' | jq .
-curl -s localhost:8000/metrics.json | jq '.mean_step_seconds, .mean_batch_tokens, .graph_step_fraction'
-kill %1
-```
-
-`graph_step_fraction` must be non-zero. If it is not, CUDA graphs are not
-capturing and the `chunked` suite's graph-effect line means nothing.
-
-## 4. Pin the KV cache size
-
-Choose the cache size; do not let profiling choose it. `warmup_model` sizes its
-warmup batch from `max_num_batched_tokens` and the cache is whatever is left
-over, so an unpinned budget sweep moves the cache underneath itself.
-
-`sweep.py` pins it in **tokens** and converts to each engine's block count, so
-lean-vLLM and vLLM get the same capacity despite 256-token and 16-token blocks.
-
-```bash
-uv run python - <<'EOF'
-from transformers import AutoConfig
-c = AutoConfig.from_pretrained("/workspace/huggingface/Qwen3-8B")   # adjust
-head_dim = getattr(c, "head_dim", c.hidden_size // c.num_attention_heads)
-per_token = 2 * c.num_hidden_layers * c.num_key_value_heads * head_dim * 2   # bf16
-print(f"{per_token/2**10:.0f} KiB per token")
-for gb in (6, 20, 45):
-    print(f"  {gb} GB -> {int(gb * 2**30 // per_token):,} tokens")
-EOF
-```
-
-Qwen3-8B (36 layers, 8 KV heads, head_dim 128) lands near 144 KiB per token, so
-roughly 330k tokens for 45 GB. Take two values: **comfortable** (~45 GB) and
-**cache-thrashing** (about an eighth of it), so preemption is exercised rather
-than merely implemented.
-
-```bash
-export KVTOKENS=327680     # whatever the script printed
-export MODEL=/workspace/huggingface/Qwen3-8B
-```
-
-## 5. lean-vLLM rate curve
+### lean-vLLM
 
 ```bash
 uv run python benchmarks/sweep.py \
-  --model $MODEL --engine lean-vllm --suite rate \
-  --rates 1,2,4,8,12,16,24 --num-requests 1000 \
-  --max-model-len 4096 --kvcache-tokens $KVTOKENS \
-  --server-args "--max-num-batched-tokens 8192 --max-num-seqs 256" \
-  --client-args "--dataset lognormal --input-len 512 --output-len 128 --timeout 1200" \
-  --out results/lean-8b
+  --model "$MODEL" --engine lean-vllm --suite rate \
+  --rates "$RATES" --num-requests 1000 --seed 0 \
+  --max-model-len 4096 --kvcache-tokens "$KVTOKENS" \
+  --server-args "$LEAN_SERVER_ARGS" \
+  --client-args "$TRACE_ARGS" --out "$RUN_RESULTS/lean-8b"
 ```
 
-- **1000 requests.** p99 over 300 completed requests is three samples.
-- **`--timeout 1200`.** Past saturation a request takes minutes. A client timeout
-  counts as a failure, and failures past 5% abort the run — so a short timeout
-  turns the overload point into a dead sweep. Read overload off the exploding
-  p99, not off an abort.
-- **Batched tokens and seqs set explicitly.** lean-vLLM and vLLM ship different
-  defaults; pin them or the comparison is between two configurations rather than
-  two schedulers.
-
-Goodput should climb, flatten, and then stall while `ttft_p99` runs away. That
-knee is the result.
-
-## 6. vLLM rate curve
-
-Same trace, same seed, same token capacity. `sweep.py` converts
-`--kvcache-tokens` into vLLM's 16-token blocks, and `bench_serving.py` reads the
-model id off `/v1/models`, so nothing needs adjusting by hand.
+### vLLM
 
 ```bash
-PATH=~/vllm-env/bin:$PATH uv run python benchmarks/sweep.py \
-  --model $MODEL --engine vllm --suite rate \
-  --rates 1,2,4,8,12,16,24 --num-requests 1000 \
-  --max-model-len 4096 --kvcache-tokens $KVTOKENS \
-  --server-args "--served-model-name qwen --max-num-batched-tokens 8192 --max-num-seqs 256" \
-  --client-args "--dataset lognormal --input-len 512 --output-len 128 --timeout 1200" \
-  --out results/vllm-8b
+PATH="/workspace/vllm-env/bin:$PATH" uv run python benchmarks/sweep.py \
+  --model "$MODEL" --engine vllm --suite rate \
+  --rates "$RATES" --num-requests 1000 --seed 0 \
+  --max-model-len 4096 --kvcache-tokens "$KVTOKENS" \
+  --server-args "$VLLM_SERVER_ARGS" \
+  --client-args "$TRACE_ARGS" --out "$RUN_RESULTS/vllm-8b"
 ```
 
-The `PATH=` prefix puts the vLLM venv's binary in reach while the script itself
-still runs under lean-vLLM's interpreter.
+If startup fails, read the corresponding `.server.log` and confirm the process
+has stopped before retrying. The default startup timeout is 900 seconds.
+Use a new output directory for a rerun to preserve the previous results.
 
-vLLM 0.11 dropped `--disable-log-requests`; per-request logging is off by
-default now. On an older vLLM, add it back or the log drowns the run.
+## 5. Compare and archive
 
-Run only the `rate` suite against vLLM. The others drive lean-vLLM's own flags.
-
-## 7. The lean-vLLM suites
-
-Separate invocations, after both curves exist.
+Print the same metrics for both engines:
 
 ```bash
-# four-run A/B: scheduling isolated from the CUDA-graph effect
-uv run python benchmarks/sweep.py --model $MODEL --suite chunked \
-  --rates 4,8,16 --num-requests 1000 --kvcache-tokens $KVTOKENS \
-  --client-args "--dataset lognormal --timeout 1200" --out results/lean-8b
-
-# token budget
-uv run python benchmarks/sweep.py --model $MODEL --suite budget \
-  --budgets 512,2048,8192 --rates 8 --num-requests 1000 --kvcache-tokens $KVTOKENS \
-  --client-args "--dataset lognormal --timeout 1200" --out results/lean-8b
-
-# does capping one prompt's share of a step protect short requests?
-uv run python benchmarks/sweep.py --model $MODEL --suite starvation \
-  --rates 8 --num-requests 1000 --kvcache-tokens $KVTOKENS \
-  --client-args "--long-fraction 0.2 --long-input-len 3072 --timeout 1200" \
-  --out results/lean-8b
-
-# fcfs vs priority, long prompts arriving at priority 1
-uv run python benchmarks/sweep.py --model $MODEL --suite policy \
-  --rates 8 --num-requests 1000 --kvcache-tokens $KVTOKENS \
-  --client-args "--long-fraction 0.2 --long-input-len 3072 --timeout 1200" \
-  --out results/lean-8b
+jq -r '.engine as $engine | .rows[] | [$engine, .request_rate, .completed, .rejection_rate, .failure_rate, .goodput, .output_tok_s, .ttft_p99, .tpot_p50, .e2e_p99] | @tsv' \
+  "$RUN_RESULTS/lean-8b/rate/summary.json" \
+  "$RUN_RESULTS/vllm-8b/rate/summary.json"
 ```
 
-The last two are answered by the per-label breakdown, not the table:
+Columns are engine, offered load, completed requests, rejection rate, failure
+rate, goodput, output tokens/s, p99 TTFT, median TPOT, and p99 E2E. Latency
+values are in seconds.
+
+| Metric | What to compare |
+| --- | --- |
+| Goodput | Completed requests per second, including queue drain time; higher is better |
+| Output tokens/s | Generation throughput; higher is better |
+| p99 TTFT | Time until the first token for slow requests; lower is better |
+| Median TPOT | Time per output token after the first; use load 1 for low-load latency |
+| p99 E2E | Time to finish slow requests; lower is better |
+
+Before drawing conclusions:
+
+- Check that each run completed all 1,000 requests without failures or rejections.
+  Goodput has no latency cutoff, so read it alongside latency.
+- Compare matching offered loads and workload settings. Find where throughput
+  levels off and tail latency rises sharply—the saturation knee.
+- Check GPU-busy clocks and throttling for each pair. Aim for mean clocks within
+  about 1%; report differences that could affect the comparison.
+
+Per-run JSON contains client summaries and server snapshots. Server counters
+include warmup; use `server.after - server.before` for cumulative counters when
+needed. Result files lack explicit wall-clock run boundaries, so align the GPU
+log using file modification times and `duration_seconds`, allowing for shutdown
+and checking timezone offsets.
+
+Stop the logger and archive the session:
 
 ```bash
-jq '.summary.by_label | to_entries[] | {label: .key, ttft_p99: .value.ttft_seconds.p99, e2e_p99: .value.e2e_seconds.p99}' \
-   results/lean-8b/starvation/*.json
+kill "$GPU_LOG_PID"
+wait "$GPU_LOG_PID" || true
+tar czf "${RUN_RESULTS}.tar.gz" "$RUN_RESULTS"
 ```
 
-## 8. Cache pressure
-
-Repeat the rate curve with the small cache:
-
-```bash
-uv run python benchmarks/sweep.py --model $MODEL --suite rate \
-  --rates 4,8,16 --num-requests 1000 --kvcache-tokens $((KVTOKENS / 8)) \
-  --client-args "--dataset lognormal --timeout 1200" --out results/lean-8b-tight
-```
-
-The `preempt` column should stop being zero. If it does not, shrink further.
-
-## 9. Collect
-
-```bash
-tar czf results-$(date +%F).tar.gz results/
-```
-
-Every `summary.json` carries the full argument set, so runs reproduce from the
-archive alone. Add the version block from step 0 and `vllm --version` by hand —
-nothing captures those automatically.
-
-## Optional: tensor-parallel smoke test
-
-Needs a 2xA100 node. Not a sweep — it exists so the TP path does not rot, since
-rank 0 is the only rank that samples.
-
-```bash
-uv run lean-vllm serve $MODEL --tensor-parallel-size 2 --port 8000 &
-sleep 120
-uv run python benchmarks/bench_serving.py --num-requests 50 --request-rate 4 \
-  --dataset fixed --input-len 512 --output-len 128
-```
-Outputs:
-```
-50/50 done, 0 failed
---- fixed @ 4.0/s ---
-50 completed, 0 rejected, 0 failed in 13.8s
-goodput 3.63 req/s, offered 3.63 req/s, output 465 tok/s, rejected 0.0%
-ttft         mean    223.0 p50     92.3 p99   1572.3   (ms)
-tpot         mean     12.4 p50     12.0 p99     20.3   (ms)
-itl          mean     12.5 p50      9.7 p99     82.0   (ms)
-e2e          mean   1803.4 p50   1630.8 p99   3381.4   (ms)
-```
-
-## Known limits
-
-- `init_process_group` binds a hardcoded `localhost:2333`, so only one engine
-  exists per machine. Never run lean-vLLM and vLLM at once; if a sweep crashes,
-  confirm the old process is gone before starting the next.
-- `/metrics.json` counters cover the server's whole lifetime. `sweep.py` starts a
-  fresh server per run, so each run's snapshot describes that run — plus its
-  three warmup requests.
+Write the report around the matched throughput and latency curves, with the
+commit, engine versions, hardware, and clock conditions alongside them.
