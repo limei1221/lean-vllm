@@ -107,6 +107,9 @@ dropped rather than preempted forever.
 Preemption recomputes rather than swaps, and a preempted sequence goes back to
 the head of the queue.
 
+`--long-prefill-token-threshold` follows vLLM's V1 meaning: a per-step token cap
+on one prompt, applied to every prefill.
+
 ## Admission control
 
 Both off by default, which matches vLLM and keeps a comparison honest:

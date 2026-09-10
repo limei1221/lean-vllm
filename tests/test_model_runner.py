@@ -5,7 +5,8 @@ import pickle
 import pytest
 import torch
 
-from lean_vllm.engine.model_runner import ModelRunner
+from lean_vllm.engine.model_runner import (
+    ModelRunner, PIECEWISE_MAX_PAD, PIECEWISE_MAX_TOKENS, PIECEWISE_MIN_TOKENS)
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.sampling_params import SamplingParams
 from lean_vllm.utils.context import get_context, reset_context
@@ -69,17 +70,28 @@ class TestPiecewiseBuckets:
         runner.config = type("C", (), {"max_num_batched_tokens": budget})()
         return runner._piecewise_buckets()
 
-    def test_the_budget_is_always_the_top_bucket(self):
-        assert self.buckets(8192)[-1] == 8192
-        assert self.buckets(5000)[-1] == 5000    # not a listed size, still covered
+    def test_the_grid_stops_at_the_cap(self):
+        """Steps above it run eager: padding them costs more than the dispatch saves."""
+        assert self.buckets(8192)[-1] == PIECEWISE_MAX_TOKENS
+        assert self.buckets(16384)[-1] == PIECEWISE_MAX_TOKENS
 
-    def test_buckets_are_sorted_and_within_the_budget(self):
+    def test_a_budget_under_the_cap_is_the_top_bucket(self):
+        assert self.buckets(300)[-1] == 300    # not a listed size, still covered
+
+    def test_buckets_are_sorted_and_unique(self):
         sizes = self.buckets(5000)
         assert sizes == sorted(set(sizes))
-        assert all(size <= 5000 for size in sizes)
 
     def test_a_budget_under_the_smallest_size_is_the_only_bucket(self):
-        assert self.buckets(128) == [128]
+        assert self.buckets(32) == [32]
+
+    @pytest.mark.parametrize("budget", [256, 512, 8192, 16384])
+    def test_no_step_pads_past_the_cap(self, budget):
+        """The gap above a bucket is what a step one token past it pads through."""
+        sizes = self.buckets(budget)
+        assert sizes[0] == PIECEWISE_MIN_TOKENS
+        for smaller, larger in zip(sizes, sizes[1:]):
+            assert larger <= (smaller + 1) * (1 + PIECEWISE_MAX_PAD), f"{smaller} -> {larger}"
 
 
 class TestStepKind:

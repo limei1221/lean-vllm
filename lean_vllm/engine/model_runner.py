@@ -17,6 +17,13 @@ from lean_vllm.utils import device as dev
 
 logger = logging.getLogger(__name__)
 
+# Piecewise buckets: the range of step sizes worth capturing, the smallest gap
+# between buckets, and the most padding a replay may add over the step it serves.
+PIECEWISE_MIN_TOKENS = 64
+PIECEWISE_MAX_TOKENS = 512
+PIECEWISE_MIN_GAP = 16
+PIECEWISE_MAX_PAD = 0.25
+
 
 class ModelRunner:
 
@@ -212,11 +219,10 @@ class ModelRunner:
         if not is_prefill and self.cudagraph_mode in FULL_MODES and self.graph_bs:
             if num_tokens <= self.graph_bs[-1]:
                 return "graph"
-        if self.cudagraph_mode in PIECEWISE_MODES and self.piecewise_bs:
-            if self.piecewise_bs[0] <= num_tokens <= self.piecewise_bs[-1]:
-                return "piecewise"
-        # "prefill" is what piecewise capture reclaims, "oversized" what a larger
-        # bucket would; the split says which is worth building.
+        if self.cudagraph_mode in PIECEWISE_MODES and self._piecewise_bucket(num_tokens):
+            return "piecewise"
+        # "prefill" covers the large steps the piecewise grid deliberately leaves
+        # eager; "oversized" is a decode batch past the full-graph buckets.
         return "prefill" if is_prefill else "oversized"
 
     @torch.inference_mode()
@@ -244,6 +250,15 @@ class ModelRunner:
         graph.replay()
         return graph_vars["outputs"][:bs]
 
+    def _piecewise_bucket(self, num_tokens: int) -> int | None:
+        """The bucket a step of this size replays in, or None if there is none.
+
+        Shared by the dispatch and the replay so they cannot disagree about which
+        bucket -- or whether there is one -- for the same step.
+        """
+        bucket = next((size for size in self.piecewise_bs if size >= num_tokens), None)
+        return None if bucket is None or num_tokens < self.piecewise_bs[0] else bucket
+
     def _replay_piecewise(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """A graph per piece, with attention run eager between them.
 
@@ -253,7 +268,7 @@ class ModelRunner:
         only, so no pad reaches the KV cache either.
         """
         num_tokens = input_ids.size(0)
-        bucket = next(size for size in self.piecewise_bs if size >= num_tokens)
+        bucket = self._piecewise_bucket(num_tokens)
         graphs, buffers = self.piecewise_graphs[bucket], self.piecewise_vars
         buffers["input_ids"][:num_tokens] = input_ids
         buffers["positions"][:num_tokens] = positions
@@ -279,16 +294,18 @@ class ModelRunner:
         return token_ids
 
     def _piecewise_buckets(self) -> list[int]:
-        """Token counts to capture at, fine at the bottom where padding hurts most.
+        """Token counts to capture at: small steps only, none padded past a quarter.
 
-        A step padded from 300 tokens to 512 does 70% more work in the pieces,
-        which is the tax the decode path never pays: there a bucket is rows.
+        Capture pays where launching the pieces costs as much as running them,
+        which is small steps. Above the top bucket a step stays eager, as in vLLM.
         """
-        budget = self.config.max_num_batched_tokens
-        sizes = [256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192]
-        # The budget itself is always the top bucket, or the largest steps -- the
-        # ones worth capturing most -- would fall past the last one and go eager.
-        return sorted({size for size in sizes if size < budget} | {budget})
+        top = min(PIECEWISE_MAX_TOKENS, self.config.max_num_batched_tokens)
+        sizes, size = [], PIECEWISE_MIN_TOKENS
+        while size < top:
+            sizes.append(size)
+            gap = max(int(size * PIECEWISE_MAX_PAD), PIECEWISE_MIN_GAP)
+            size += 1 << (gap.bit_length() - 1)    # a power of two, so sizes stay round
+        return sorted(set(sizes) | {top})
 
     @torch.inference_mode()
     def capture_piecewise(self):
