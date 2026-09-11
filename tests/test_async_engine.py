@@ -98,6 +98,50 @@ class TestStreaming:
 
 class TestAbort:
 
+    @pytest.mark.parametrize("spec_version", ["2.0", "2.4"])
+    @pytest.mark.parametrize("disconnect_at", ["http.response.start", "http.response.body"])
+    @asyncio_test
+    async def test_chat_disconnect_before_tokens_frees_the_blocks(
+        self, make_async_engine, spec_version, disconnect_at,
+    ):
+        pytest.importorskip("fastapi", reason="the serve extra is not installed")
+        from starlette.requests import ClientDisconnect
+        from lean_vllm.entrypoints.api_server import _serve
+        from lean_vllm.entrypoints.protocol import ChatCompletionRequest
+
+        engine = make_async_engine(gated=True)
+        blocks = engine.engine.scheduler.block_manager
+        free_before = len(blocks.free_block_ids)
+        body = ChatCompletionRequest(
+            model="fake", messages=[{"role": "user", "content": "hi"}], stream=True,
+        )
+        response = await _serve(engine, "fake", body, prompt(8), chat=True)
+        disconnected = asyncio.Event()
+
+        async def send(message):
+            if message["type"] == disconnect_at:
+                if spec_version == "2.4":
+                    raise OSError("client disconnected")
+                disconnected.set()
+                await asyncio.Future()    # cancelled by the disconnect listener
+
+        async def receive():
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        scope = {"type": "http", "asgi": {"spec_version": spec_version}}
+        if spec_version == "2.4":
+            with pytest.raises(ClientDisconnect):
+                await asyncio.wait_for(response(scope, receive, send), timeout=1)
+        else:
+            await asyncio.wait_for(response(scope, receive, send), timeout=1)
+
+        runner_of(engine).release()    # drain the abort after the in-flight step
+        await wait_until(lambda: not engine._streams)
+        assert not engine.engine.scheduler.seqs
+        assert len(blocks.free_block_ids) == free_before
+        assert engine.metrics.requests_aborted.total == 1
+
     @asyncio_test
     async def test_closing_the_generator_frees_the_blocks(self, make_async_engine):
         """This is what makes a client disconnect release KV, so it is the load-bearing test."""

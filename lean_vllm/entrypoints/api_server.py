@@ -1,7 +1,7 @@
 """OpenAI-compatible HTTP server over `AsyncLLMEngine`."""
 
 import json
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from time import time
 from typing import AsyncIterator
 from uuid import uuid4
@@ -29,6 +29,23 @@ DONE = "data: [DONE]\n\n"
 # The engine's own reasons; the drops below are not completions and never appear here.
 FINISH_REASONS = {"stop": "stop", "length": "length", "abort": "stop"}
 DROP_STATUS = {"capacity": 503, "timeout": 504}
+
+
+class _RequestStreamingResponse(StreamingResponse):
+    """Own admission cleanup even if sending headers or the first chunk fails."""
+
+    def __init__(self, stream, engine: AsyncLLMEngine, request_id: str):
+        super().__init__(stream, media_type="text/event-stream")
+        self.engine = engine
+        self.request_id = request_id
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Closing an unstarted generator does not run its finally block.
+            self.engine.abort(self.request_id)
+            await self.body_iterator.aclose()
 
 
 def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
@@ -113,7 +130,7 @@ async def _serve(engine: AsyncLLMEngine, model: str, body: BaseRequest, prompt_t
     deltas = _deltas(outputs, StopChecker(body.stop_strings))
     if body.stream:
         stream = _stream(deltas, request_id, model, body, len(prompt_token_ids), chat)
-        return StreamingResponse(stream, media_type="text/event-stream")
+        return _RequestStreamingResponse(stream, engine, request_id)
     try:
         return await _collect(deltas, request_id, model, len(prompt_token_ids), chat)
     except EngineDeadError as dead:
@@ -164,29 +181,30 @@ async def _collect(deltas, request_id: str, model: str, num_prompt_tokens: int, 
 
 
 async def _stream(deltas, request_id: str, model: str, body: BaseRequest, num_prompt_tokens: int, chat: bool):
-    created = int(time())
-    num_tokens = 0
-    if chat:
-        yield _event(protocol.chat_chunk(request_id, model, created, {"role": "assistant", "content": ""}, None))
-    try:
-        async for delta, reason, num_tokens in deltas:
-            if chat:
-                yield _event(protocol.chat_chunk(request_id, model, created, {"content": delta}, reason))
-            else:
-                yield _event(protocol.completion_chunk(request_id, model, created, delta, reason))
-    except (EngineDeadError, HTTPException) as error:
-        # A status code cannot be retracted once the 200 went out, so the error
-        # rides in the stream instead.
-        yield _event(_error("server_error", str(getattr(error, "detail", error))))
+    async with aclosing(deltas):
+        created = int(time())
+        num_tokens = 0
+        if chat:
+            yield _event(protocol.chat_chunk(request_id, model, created, {"role": "assistant", "content": ""}, None))
+        try:
+            async for delta, reason, num_tokens in deltas:
+                if chat:
+                    yield _event(protocol.chat_chunk(request_id, model, created, {"content": delta}, reason))
+                else:
+                    yield _event(protocol.completion_chunk(request_id, model, created, delta, reason))
+        except (EngineDeadError, HTTPException) as error:
+            # A status code cannot be retracted once the 200 went out, so the error
+            # rides in the stream instead.
+            yield _event(_error("server_error", str(getattr(error, "detail", error))))
+            yield DONE
+            return
+        if body.include_usage:
+            chunk = protocol.chat_chunk if chat else protocol.completion_chunk
+            body_dict = chunk(request_id, model, created, {} if chat else "", None)
+            body_dict["choices"] = []
+            body_dict["usage"] = protocol.usage(num_prompt_tokens, num_tokens).model_dump()
+            yield _event(body_dict)
         yield DONE
-        return
-    if body.include_usage:
-        chunk = protocol.chat_chunk if chat else protocol.completion_chunk
-        body_dict = chunk(request_id, model, created, {} if chat else "", None)
-        body_dict["choices"] = []
-        body_dict["usage"] = protocol.usage(num_prompt_tokens, num_tokens).model_dump()
-        yield _event(body_dict)
-    yield DONE
 
 
 def _event(payload: dict) -> str:
