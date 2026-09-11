@@ -101,7 +101,7 @@ dropped rather than preempted forever.
 | `--scheduling-policy` | `fcfs` | or `priority`, which reads the request's `priority` |
 | `--long-prefill-token-threshold` | 0 | cap on one prompt's share of a step; 0 is none |
 | `--num-kvcache-blocks` | profiled | pin it to hold cache capacity still across runs |
-| `--kvcache-block-size` | 256 | tokens per block |
+| `--kvcache-block-size` | 16 | tokens per block; positive multiple of 16 |
 | `--enforce-eager` | off | on disables CUDA graphs |
 
 Preemption recomputes rather than swaps, and a preempted sequence goes back to

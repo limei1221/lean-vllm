@@ -16,7 +16,7 @@ Use the same Bash session for the commands below.
 Clone once; for an existing checkout, start with `cd`:
 
 ```bash
-git clone git@github.com:limei1221/lean-vllm.git /workspace/lean-vllm
+git clone https://github.com/limei1221/lean-vllm.git /workspace/lean-vllm
 cd /workspace/lean-vllm
 git checkout feature/online-serving
 uv sync --extra cuda

@@ -25,13 +25,31 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                  # deps, dev tools, the server and the package, into .venv
-uv sync --extra cuda     # add FlashAttention and Triton (NVIDIA only)
+uv sync --extra cuda     # build vLLM FlashAttention and add Triton (Linux/NVIDIA)
 uv sync --extra serve    # the server deps alone, for installing without the dev group
 ```
 
 FlashAttention and Triton are optional. Without them the engine runs on CPU and
 Apple Silicon via the `torch` attention backend, at laptop speed — enough to
 develop and test the scheduler and cache against a small model.
+
+The CUDA backend uses the `vllm-flash-attn` source revision pinned in
+`pyproject.toml`, with **16-token KV-cache blocks** by default. It is the
+[revision used by vLLM 0.11.2](https://github.com/vllm-project/vllm/blob/v0.11.2/cmake/external_projects/vllm_flash_attn.cmake)
+with Torch 2.9. The published `vllm-flash-attn==2.6.2` wheels target Torch 2.4
+and cannot replace this build. The source build needs Git, a C++ compiler, and
+a CUDA toolkit with `nvcc`; use CUDA 12.8 for the locked Torch 2.9.1 CUDA wheels.
+`uv sync --extra cuda` installs the Python build tools first, then compiles
+against the installed Torch. Set `MAX_JOBS=4` to limit compiler memory use.
+The first CUDA install can take several minutes.
+
+After installing on a GPU machine, verify that the kernel loads and run the
+16-token paging and CUDA graph replay checks:
+
+```bash
+uv run --extra cuda python -c 'from lean_vllm.attention import FlashAttentionBackend; assert FlashAttentionBackend.is_available()'
+uv run --extra cuda pytest tests/test_attention_backends.py tests/test_flash_backend.py -q
+```
 
 The device is picked automatically (cuda, then mps, then cpu) and can be forced
 with `LEAN_VLLM_DEVICE`. Off CUDA there is no `mem_get_info` to size the KV

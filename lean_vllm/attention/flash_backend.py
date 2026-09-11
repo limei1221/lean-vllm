@@ -7,7 +7,7 @@ _IMPORT_ERROR: ImportError | None = None
 try:
     import triton
     import triton.language as tl
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    from vllm_flash_attn import flash_attn_varlen_func, is_fa_version_supported
 except ImportError as e:    # CUDA only
     _IMPORT_ERROR = e
 else:
@@ -36,7 +36,7 @@ else:
 
 
 class FlashAttentionBackend(AttentionBackend):
-    """FlashAttention kernels with a Triton KV-cache scatter. CUDA only."""
+    """vLLM FlashAttention-2 with a Triton KV-cache scatter. CUDA only."""
 
     @staticmethod
     def get_name() -> str:
@@ -44,7 +44,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def is_available() -> bool:
-        return _IMPORT_ERROR is None and torch.cuda.is_available()
+        return _IMPORT_ERROR is None and torch.cuda.is_available() and is_fa_version_supported(2)
 
     @staticmethod
     def supports_cuda_graph() -> bool:
@@ -62,19 +62,32 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
+        cu_seqlens_k = context.cu_seqlens_k
+        seqused_k = None
         if context.block_tables is not None:    # prefix cache
             k, v = k_cache, v_cache
+            # The fork wants individual KV lengths for paged attention.
+            seqused_k = context.context_lens
+            if seqused_k is None:
+                seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            cu_seqlens_k = None
         return flash_attn_varlen_func(
             q, k, v,
             max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-            max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+            max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=cu_seqlens_k, seqused_k=seqused_k,
             softmax_scale=self.scale, causal=True, block_table=context.block_tables,
+            fa_version=2,
         )
 
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
-        o = flash_attn_with_kvcache(
-            q.unsqueeze(1), k_cache, v_cache,
-            cache_seqlens=context.context_lens, block_table=context.block_tables,
-            softmax_scale=self.scale, causal=True,
+        # One query per sequence, including zero-length padding rows in graphs.
+        # Use the table's capacity as an upper bound; reading context_lens.max()
+        # back to the CPU would synchronize and prevent CUDA graph capture.
+        return flash_attn_varlen_func(
+            q, k_cache, v_cache,
+            max_seqlen_q=1,
+            cu_seqlens_q=torch.arange(q.shape[0] + 1, dtype=torch.int32, device=q.device),
+            max_seqlen_k=context.block_tables.shape[1] * k_cache.shape[1],
+            seqused_k=context.context_lens, block_table=context.block_tables,
+            softmax_scale=self.scale, causal=True, fa_version=2,
         )
-        return o.squeeze(1)    # match the [batch, heads, dim] contract

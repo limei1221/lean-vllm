@@ -32,7 +32,7 @@ AttentionBackend                  # store_kvcache / prefill / decode
       |
       +-- TorchAttention          # SDPA, any device, reference oracle
       |
-      +-- FlashAttentionBackend   # flash-attn + Triton scatter, CUDA only
+      +-- FlashAttentionBackend   # vllm-flash-attn + Triton scatter, CUDA only
 ```
 
 `Attention.__init__` resolves a backend class once and instantiates it per
@@ -56,9 +56,11 @@ Identical across backends; sequences are packed, not padded.
 | `decode` q | `[batch_size, num_heads, head_dim]` |
 | `decode` returns | `[batch_size, num_heads, head_dim]` |
 
-`flash_attn_with_kvcache` returns a singleton query axis; the flash backend
-squeezes it so both backends return the same rank. An abstraction whose
-implementations return different shapes is not an abstraction.
+The flash backend uses vLLM's `flash_attn_varlen_func` with `fa_version=2`
+for both paths. Decode has one query per sequence and returns the same rank
+as prefill. Paged calls pass individual KV lengths as `seqused_k`; unpaged
+prefill passes cumulative lengths as `cu_seqlens_k`. The default page size is
+16 tokens; positive multiples of 16 are accepted.
 
 ### Causal masking is bottom-right aligned
 
@@ -90,9 +92,11 @@ decode row, resumed chunk, cold prefill — against the dense oracle, and
 `test_mixed_batch_matches_running_the_rows_separately` checks that one mixed
 call equals the separate `prefill` and `decode` calls it replaces.
 
-`decode` survives as the pure-decode fast path, because it reaches
-`flash_attn_with_kvcache` and is the only shape a CUDA graph can capture. The
-runner selects it only when **no** row is a prompt chunk. "Every query length is
+`decode` remains the pure-decode path captured by the runner's full CUDA
+graphs. It uses the block table's capacity as `max_seqlen_k`, so graph capture
+does not need to read a length tensor back to the CPU. Actual lengths, including
+zero-length padding rows, come from `seqused_k`. The runner selects it only
+when **no** row is a prompt chunk. "Every query length is
 1" would be the wrong test: a prompt whose last chunk happens to be one token
 long also has query length 1, and it must take the varlen path so that
 `logits_indices` decides whether it samples.

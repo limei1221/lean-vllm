@@ -13,9 +13,8 @@ NUM_KV_HEADS = 2  # exercises GQA head broadcasting
 HEAD_DIM = 32
 SCALE = 0.137    # not head_dim**-0.5, so a dropped scale argument is detectable
 
-# flash-attn's paged kernels require 256 and torch works at any size, so both
-# backends run the same page layout.
-BLOCK_SIZE = 256
+# vLLM FlashAttention supports 16-token pages; exercise the production default.
+BLOCK_SIZE = 16
 DTYPE = {"torch": torch.float32, "flash_attn": torch.float16}    # flash kernels are fp16/bf16 only
 
 # Tolerances per dtype for comparison against the fp32 oracle. bf16 is not checked
@@ -427,3 +426,32 @@ def test_mixed_batch_matches_running_the_rows_separately(backend, device, block_
         block_tables=torch.tensor([block_tables_list[1]], dtype=torch.int32, device=device),
     ))
     torch.testing.assert_close(merged, torch.cat([chunk, decoded]), atol=tol, rtol=tol)
+
+
+def test_decode_cuda_graph_replays_new_lengths_with_padding(backend, device, block_size, dtype, tol):
+    """A captured decode must use updated lengths and tolerate empty padding rows."""
+    if backend.get_name() != "flash_attn":
+        pytest.skip("requires vLLM FlashAttention on CUDA")
+
+    total = block_size + 3
+    k_cache, v_cache = make_cache(3, device, block_size, dtype)
+    k = randn(total, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype)
+    v = randn(total, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype)
+    write_prefix(k_cache, v_cache, k, v, [2, 0], block_size, total)
+    q = randn(2, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype)
+    context = Context(
+        context_lens=torch.tensor([block_size + 1, 0], dtype=torch.int32, device=device),
+        block_tables=torch.tensor([[2, 0], [1, 1]], dtype=torch.int32, device=device),
+    )
+    # Initialize kernels before capture, as ModelRunner does.
+    backend.decode(q, k_cache, v_cache, context)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = backend.decode(q, k_cache, v_cache, context)
+
+    context.context_lens[0] = total
+    q.copy_(randn(2, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype))
+    graph.replay()
+    torch.testing.assert_close(out[:1], dense_attention(q[:1], k, v), atol=tol, rtol=tol)
+    torch.testing.assert_close(out[1], torch.zeros_like(out[1]), atol=0, rtol=0)

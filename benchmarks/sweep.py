@@ -87,10 +87,8 @@ SUITES = {
     "starvation": starvation_suite,
 }
 
-# 256 is the smallest lean-vLLM's config allows (it asserts a multiple of 256),
-# 16 is vLLM's default on CUDA. Both are pinned here, and the sweep pins KV
-# capacity in *tokens* and converts.
-BLOCK_SIZE = {"lean-vllm": 256, "vllm": 16}
+# Both engines use 16-token pages. Pin capacity in tokens and convert to blocks.
+BLOCK_SIZE = {"lean-vllm": 16, "vllm": 16}
 
 
 def cache_flags(args) -> dict:

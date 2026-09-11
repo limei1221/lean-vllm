@@ -23,12 +23,18 @@ serve = [
     "uvicorn>=0.30",
 ]
 cuda = [
-    "triton>=3.0.0",
-    # flash-attn wheels are built against a specific torch minor + CUDA major; pin torch to match.
-    # uv resolves all extras into one lock, so this pin holds in every environment, not just this extra.
+    "triton>=3.0.0; sys_platform == 'linux'",
+    # Keep the Torch minor used by the graph implementation and the pinned FA source.
     "torch>=2.9,<2.10",
-    # exact version, so the source-build fallback below matches the pinned wheel
-    "flash-attn==2.8.3",
+    "vllm-flash-attn==2.7.2.post1; sys_platform == 'linux'",
+    # Build tools are installed before the non-isolated FlashAttention build.
+    "cmake>=3.26; sys_platform == 'linux'",
+    "ninja; sys_platform == 'linux'",
+    "packaging; sys_platform == 'linux'",
+    "setuptools; sys_platform == 'linux'",
+    "wheel; sys_platform == 'linux'",
+    "jinja2; sys_platform == 'linux'",
+    "psutil; sys_platform == 'linux'",
 ]
 
 [project.scripts]
@@ -59,25 +65,21 @@ filterwarnings = [
 ]
 
 [tool.uv]
-required-version = ">=0.10"    # extra-build-dependencies is stable from 0.10
+required-version = ">=0.10"
+# The fork's standalone build metadata still pins Torch 2.4. Build against the
+# installed runtime instead; vLLM 0.11.2 uses this revision with Torch 2.9.0.
+no-build-isolation-package = ["vllm-flash-attn"]
 
-# flash-attn provides prebuilt wheels on GitHub with encoded torch minor, CUDA major, and ABI. Use these to avoid local CUDA compilation.
 [tool.uv.sources]
-flash-attn = [
-    { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version >= '3.12'" },
-]
+vllm-flash-attn = { git = "https://github.com/vllm-project/flash-attention.git", rev = "58e0626a692f09241182582659e3bf8f16472659" }
 
-# Fallback when no wheel above matches — notably Linux on Python 3.10/3.11 and
-# aarch64 (the aarch64 wheel is unverified, so it resolves from PyPI instead):
-[tool.uv.extra-build-dependencies]
-flash-attn = [
-    { requirement = "torch", match-runtime = true },
-    "psutil",
-    "setuptools",
-    "wheel",
-    "packaging",
-    "einops",
-]
+# Static metadata lets uv lock on machines without CUDA. The source pin above
+# ensures this override never selects the old Torch-2.4 PyPI binary wheels.
+[[tool.uv.dependency-metadata]]
+name = "vllm-flash-attn"
+version = "2.7.2.post1"
+requires-dist = ["torch>=2.9,<2.10"]
+requires-python = ">=3.9"
 
 [tool.setuptools.packages.find]
 where = ["."]
