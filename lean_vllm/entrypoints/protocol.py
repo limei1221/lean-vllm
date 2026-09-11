@@ -9,7 +9,7 @@ rest.
 from time import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Refused by name, with a reason, rather than left to the extra="forbid" message.
 # Each carries the values that are a no-op, so a client sending OpenAI's default
@@ -105,7 +105,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseRequest):
-    messages: list[ChatMessage]
+    messages: list[ChatMessage] = Field(min_length=1)
 
 
 class UsageInfo(BaseModel):

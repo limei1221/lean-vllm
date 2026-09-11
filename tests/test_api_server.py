@@ -148,6 +148,15 @@ class TestCompletions:
 
 class TestChatCompletions:
 
+    def test_empty_messages_are_a_400(self, client, engine):
+        response = client.post("/v1/chat/completions", json={
+            "model": MODEL, "messages": [], "max_tokens": 4,
+        })
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_request_error"
+        assert "messages" in response.json()["error"]["message"]
+        assert not engine.requests
+
     def test_the_chat_template_builds_the_prompt(self, client, engine):
         body = {"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}
         response = client.post("/v1/chat/completions", json=body)
