@@ -101,20 +101,21 @@ SUITES = {
     "starvation": starvation_suite,
 }
 
-# 256 is the smallest lean-vLLM's config allows (it asserts a multiple of 256),
-# 16 is vLLM's default on CUDA. Both are pinned here, and the sweep pins KV
-# capacity in *tokens* and converts.
-BLOCK_SIZE = {"lean-vllm": 256, "vllm": 16}
+# Upstream flash-attn rejects a paged block size that is not a multiple of 256,
+# so 256 is lean-vLLM's only choice. vLLM ships a fork that relaxes the same
+# check to 16 and defaults there, but it takes any multiple of 16, so 256 is
+# the one size both engines run and neither engine is left on its default.
+BLOCK_SIZE = 256
 
 
 def cache_flags(args) -> dict:
-    """The same KV token capacity on either engine, whatever it calls a block."""
-    if not args.kvcache_tokens:
-        return {}
-    blocks = args.kvcache_tokens // BLOCK_SIZE[args.engine]
-    if args.engine == "lean-vllm":
-        return {"kvcache-block-size": BLOCK_SIZE["lean-vllm"], "num-kvcache-blocks": blocks}
-    return {"block-size": BLOCK_SIZE["vllm"], "num-gpu-blocks-override": blocks}
+    """The same block size and KV capacity on either engine, whatever it calls them."""
+    lean = args.engine == "lean-vllm"
+    flags = {"kvcache-block-size" if lean else "block-size": BLOCK_SIZE}
+    if args.kvcache_tokens:
+        flags["num-kvcache-blocks" if lean else "num-gpu-blocks-override"] = \
+            args.kvcache_tokens // BLOCK_SIZE
+    return flags
 
 
 def server_command(args, arm: Arm) -> list[str]:
@@ -280,8 +281,8 @@ def parse_args(argv: list[str] | None = None):
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.kvcache_tokens:
-        blocks = args.kvcache_tokens // BLOCK_SIZE[args.engine]
-        print(f"kv cache pinned to {blocks * BLOCK_SIZE[args.engine]} tokens ({blocks} blocks)", file=sys.stderr)
+        blocks = args.kvcache_tokens // BLOCK_SIZE
+        print(f"kv cache pinned to {blocks * BLOCK_SIZE} tokens ({blocks} blocks of {BLOCK_SIZE})", file=sys.stderr)
     else:
         print("warning: --kvcache-tokens is unpinned, so the cache size moves with the token budget", file=sys.stderr)
     out = Path(args.out) / args.suite
