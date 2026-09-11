@@ -95,10 +95,12 @@ dropped rather than preempted forever.
 
 | flag | default | |
 | --- | ---: | --- |
-| `--max-num-batched-tokens` | 16384 | tokens one step may schedule |
-| `--max-num-seqs` | 512 | sequences that may run at once |
+| `--max-num-batched-tokens` | 2048 | tokens one step may schedule |
+| `--max-num-seqs` | 256 | sequences that may run at once |
 | `--enable-chunked-prefill` | on | off is whole prompts only, never mixed with decode |
 | `--scheduling-policy` | `fcfs` | or `priority`, which reads the request's `priority` |
+| `--enable-prefix-caching` | on | off recomputes every prompt |
+| `--prefix-caching-hash-algo` | `sha256` | or `xxhash` |
 | `--long-prefill-token-threshold` | 0 | cap on one prompt's share of a step; 0 is none |
 | `--num-kvcache-blocks` | profiled | pin it to hold cache capacity still across runs |
 | `--kvcache-block-size` | 256 | tokens per block |
@@ -109,6 +111,50 @@ the head of the queue.
 
 `--long-prefill-token-threshold` follows vLLM's V1 meaning: a per-step token cap
 on one prompt, applied to every prefill.
+
+## Prefix caching
+
+A prompt is cut into blocks, each block hashed together with the chain of
+blocks before it. A request whose leading blocks are already in the cache
+takes them by reference and prefills only the rest, so the token budget goes
+to work that has not been done.
+
+Three properties make that safe and cheap:
+
+**Blocks are hashed as they arrive.** A full block never takes another token,
+so its hash is final and is computed once, on the request, as the tokens come
+in. Nothing is hashed inside a step. This matters because the cache is queried
+again on every step a request spends at the head of the waiting queue.
+
+**The tail is always recomputed.** Attention needs at least one query token, so
+the last block is never a cache candidate even when the whole prompt is
+resident.
+
+**Eviction spares the prefix.** Freed blocks re-enter the queue deepest first,
+so a shared head outlives the suffixes built on it. A block keeps its contents
+until something claims it.
+
+The queue order itself is untouched: prefix caching changes what a request
+costs, never when it runs.
+
+`--no-enable-prefix-caching` turns all of it off: no hashing, no lookups, every
+prompt computed in full. It is the A/B arm, not an optimisation.
+
+`--prefix-caching-hash-algo` picks how a block is keyed, and follows vLLM:
+`sha256` by default, `xxhash` for speed where every request is trusted. A
+collision serves one tenant another tenant's tokens, which is why the secure
+one is the default and the fast one is opt-in. Both pickle the block before
+hashing, so both survive a restart and reach the tensor-parallel workers
+unchanged, and the tokens behind a hit are compared before a block changes
+hands either way.
+
+vLLM also offers `sha256_cbor` and `xxhash_cbor`, which serialize with
+canonical CBOR instead of pickle so a hash reproduces across languages and
+Python versions. Nothing here reads the cache from another process, so they are
+not implemented.
+
+Hit rate is blocks supplied over blocks looked up, at `/metrics.json`. It reads
+0 with caching off, which is the point of having the arm.
 
 ## Admission control
 
@@ -146,6 +192,11 @@ uv run python benchmarks/bench_serving.py --dataset lognormal --request-rate 8
 uv run python benchmarks/sweep.py --model ~/huggingface/Qwen3-8B \
     --suite rate --rates 1,2,4,8,16 --kvcache-tokens 327680 --out results/8b
 ```
+
+`--suite prefix` runs caching off against each hash algorithm, over
+`--dataset prefix`, where a few shared system prompts sit in front of unique
+questions. Every other dataset draws token ids at random, so no two prompts
+share a block and the cache has nothing to find.
 
 `bench_serving.py` sends Poisson arrivals through the OpenAI SDK and points at
 vLLM unchanged. `sweep.py` runs it across arms, restarting the server per run.

@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+from lean_vllm.engine.sequence import HASH_ALGOS
+
 
 # Which kinds of step may replay a graph. Full covers pure decode, piecewise the
 # prefill and mixed steps that have to leave attention outside the capture.
@@ -28,6 +30,8 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     enable_chunked_prefill: bool = True    # off is the pre-M2 shape, kept for the A/B
+    enable_prefix_caching: bool = True     # off recomputes every prompt, kept for the A/B
+    prefix_caching_hash_algo: str = "sha256"    # or "xxhash", which is faster and not cryptographic
     scheduling_policy: str = "fcfs"    # or "priority"
     max_waiting_requests: int = 0      # 0 is unlimited
     request_timeout: float = 0.0       # seconds a request may wait unscheduled; 0 is none
@@ -37,6 +41,8 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert self.cudagraph_mode in CUDAGRAPH_MODES, f"unknown cudagraph_mode {self.cudagraph_mode!r}"
+        assert self.prefix_caching_hash_algo in HASH_ALGOS, \
+            f"unknown prefix_caching_hash_algo {self.prefix_caching_hash_algo!r}, expected one of {sorted(HASH_ALGOS)}"
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

@@ -78,6 +78,17 @@ class TestTrace:
         assert all(request.prompt_len == 64 and request.priority == 1 for request in long)
         assert all(request.priority == 0 for request in trace if request.label == "short")
 
+    def test_prefix_shares_a_head_and_keeps_the_tails_distinct(self):
+        args = make_args(
+            "--dataset", "prefix", "--num-requests", "50",
+            "--num-prefixes", "4", "--prefix-len", "16", "--input-len", "24",
+        )
+        trace = bench.prefix_trace(bench.random.Random(0), args)
+        heads = {tuple(request.prompt_token_ids[:16]) for request in trace}
+        assert len(heads) == 4
+        assert all(request.prompt_len == 24 for request in trace)
+        assert len({tuple(request.prompt_token_ids) for request in trace}) == 50
+
 
 class TestStatistics:
 

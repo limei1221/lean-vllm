@@ -70,6 +70,19 @@ def policy_suite(args) -> list[Arm]:
     return [Arm(f"policy={policy}", {"scheduling-policy": policy}, client) for policy in ("fcfs", "priority")]
 
 
+def prefix_suite(args) -> list[Arm]:
+    """What prefix caching is worth, and what the slower hash costs to get it.
+
+    Both engines take the same two flags, so the whole suite runs either side.
+    """
+    client = {"dataset": "prefix"}
+    return [
+        Arm("prefix-caching=off", {"enable-prefix-caching": False}, client),
+        Arm("hash=sha256", {"prefix-caching-hash-algo": "sha256"}, client),
+        Arm("hash=xxhash", {"prefix-caching-hash-algo": "xxhash"}, client),
+    ]
+
+
 def starvation_suite(args) -> list[Arm]:
     """The M2 knob: does capping one prompt's share of a step protect short ones?"""
     client = {"dataset": "mixed"}
@@ -84,6 +97,7 @@ SUITES = {
     "chunked": chunked_suite,
     "budget": budget_suite,
     "policy": policy_suite,
+    "prefix": prefix_suite,
     "starvation": starvation_suite,
 }
 

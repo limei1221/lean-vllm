@@ -47,7 +47,9 @@ class Scheduler:
         self.max_waiting_requests = config.max_waiting_requests
         self.request_timeout = config.request_timeout
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks, config.kvcache_block_size, config.enable_prefix_caching
+        )
         self.waiting = SchedulingPolicy.create(config.scheduling_policy)
         self.running: deque[Sequence] = deque()
         self.seqs: dict[str, Sequence] = {}    # live requests, for abort

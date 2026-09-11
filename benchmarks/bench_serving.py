@@ -123,6 +123,24 @@ def mixed_trace(rng: random.Random, args) -> list[Request]:
     return trace
 
 
+def prefix_trace(rng: random.Random, args) -> list[Request]:
+    """A few shared system prompts, a unique question behind each.
+
+    The workload prefix caching exists for, and the only one in this file where
+    it can show anything: every other trace draws ids at random, so no two
+    prompts share so much as a block. `--num-prefixes` sets how much of the
+    cache the shared part wants, and `--prefix-len` how much of each prompt the
+    cache can answer.
+    """
+    prefixes = [_prompt(rng, args.prefix_len, args.vocab_size) for _ in range(args.num_prefixes)]
+    trace = []
+    for _ in range(args.num_requests):
+        suffix_len = max(1, args.input_len - args.prefix_len)
+        prompt = rng.choice(prefixes) + _prompt(rng, suffix_len, args.vocab_size)
+        trace.append(Request(prompt, args.output_len))
+    return trace
+
+
 def sharegpt_trace(rng: random.Random, args) -> list[Request]:
     """Real conversations from a ShareGPT-format JSON, first turn and its answer."""
     from transformers import AutoTokenizer
@@ -158,6 +176,7 @@ TRACES = {
     "fixed": fixed_trace,
     "lognormal": lognormal_trace,
     "mixed": mixed_trace,
+    "prefix": prefix_trace,
     "sharegpt": sharegpt_trace,
 }
 
@@ -445,6 +464,8 @@ def parse_args(argv: list[str] | None = None):
     trace.add_argument("--long-input-len", type=int, default=2048)
     trace.add_argument("--long-output-len", type=int, default=32)
     trace.add_argument("--long-priority", type=int, default=0, help="0 leaves the policy nothing to act on")
+    trace.add_argument("--num-prefixes", type=int, default=8, help="--dataset prefix: distinct shared prefixes")
+    trace.add_argument("--prefix-len", type=int, default=1024, help="--dataset prefix: tokens each one shares")
     trace.add_argument("--max-model-len", type=int, default=4096, help="clamp, so no request is refused for length")
     trace.add_argument("--vocab-size", type=int, default=10000, help="ids are drawn below this")
     trace.add_argument("--seed", type=int, default=0)

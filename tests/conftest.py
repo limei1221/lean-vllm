@@ -26,6 +26,8 @@ class FakeConfig:
     max_model_len: int = 4096
     eos: int = EOS
     enable_chunked_prefill: bool = True
+    enable_prefix_caching: bool = True
+    prefix_caching_hash_algo: str = "sha256"
     scheduling_policy: str = "fcfs"
     max_waiting_requests: int = 0
     request_timeout: float = 0.0
@@ -157,11 +159,12 @@ def asyncio_test(test):
 
 @pytest.fixture(autouse=True)
 def _reset_sequence_globals():
-    """Sequence.block_size and the id counter are class state shared across tests."""
-    block_size, counter = Sequence.block_size, Sequence.counter
+    """What Sequence takes from Config, plus the id counter, is class state."""
+    saved = (Sequence.block_size, Sequence.enable_prefix_caching, Sequence.hash_algo, Sequence.counter)
     Sequence.counter = count()    # so seq ids are deterministic per test
     yield
-    Sequence.block_size, Sequence.counter = block_size, counter
+    (Sequence.block_size, Sequence.enable_prefix_caching,
+     Sequence.hash_algo, Sequence.counter) = saved
 
 
 @pytest.fixture
@@ -169,5 +172,7 @@ def make_engine():
     def _make(eos_after: dict[int, int] | None = None, **overrides) -> FakeEngine:
         config = FakeConfig(**overrides)
         Sequence.block_size = config.kvcache_block_size
+        Sequence.enable_prefix_caching = config.enable_prefix_caching
+        Sequence.hash_algo = config.prefix_caching_hash_algo
         return FakeEngine(config, FakeModelRunner(eos_after))
     return _make

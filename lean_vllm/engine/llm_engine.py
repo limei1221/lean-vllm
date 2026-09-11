@@ -38,6 +38,8 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         self.config = config = Config(model, **config_kwargs)
         Sequence.block_size = config.kvcache_block_size
+        Sequence.enable_prefix_caching = config.enable_prefix_caching
+        Sequence.hash_algo = config.prefix_caching_hash_algo
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")

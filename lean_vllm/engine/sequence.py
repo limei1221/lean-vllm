@@ -1,3 +1,6 @@
+import hashlib
+import pickle
+import xxhash
 from copy import copy
 from enum import Enum, auto
 from itertools import count
@@ -7,6 +10,26 @@ from lean_vllm.engine.output import RequestMetrics
 from lean_vllm.sampling_params import SamplingParams
 
 
+def _serialize(token_ids: tuple[int, ...], prefix: int) -> bytes:
+    """Pickle, as vLLM does. It is stable within a Python version but not
+    promised across them, which is why vLLM also offers CBOR variants."""
+    return pickle.dumps((prefix, token_ids), protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def sha256_hash(token_ids: tuple[int, ...], prefix: int) -> int:
+    """The default, and vLLM's. A collision here serves one tenant another's
+    tokens, so it is ruled out rather than made unlikely."""
+    return int.from_bytes(hashlib.sha256(_serialize(token_ids, prefix)).digest(), "big")
+
+
+def xxhash_hash(token_ids: tuple[int, ...], prefix: int) -> int:
+    """Faster, not cryptographic. Worth it only where every request is trusted."""
+    return int.from_bytes(xxhash.xxh128(_serialize(token_ids, prefix)).digest(), "big")
+
+
+HASH_ALGOS = {"sha256": sha256_hash, "xxhash": xxhash_hash}
+
+
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
@@ -14,7 +37,11 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
+    # Set once from Config, since a Sequence is built in places that carry no
+    # config: the engine, the profiling warmup, and the spawned TP workers.
     block_size = 256
+    enable_prefix_caching = True
+    hash_algo = "sha256"
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams(), request_id: str | None = None):
@@ -29,6 +56,7 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
+        self.block_hashes: list[int] = []    # chained, one per full block, filled on demand
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -41,6 +69,7 @@ class Sequence:
         self.first_scheduled_time: float | None = None
         self.first_token_time: float | None = None
         self.finish_time: float | None = None
+        self._extend_block_hashes()
 
     def metrics(self) -> RequestMetrics:
         return RequestMetrics(
@@ -87,10 +116,26 @@ class Sequence:
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
+    def _extend_block_hashes(self):
+        """Hash every block that has just become full, chaining on the one before.
+
+        A full block never takes another token, so its hash is final and is
+        computed exactly once, here, as the tokens arrive. The scheduler queries
+        the cache again on every step a request spends at the head of the
+        waiting queue, and rehashing the prompt each time is the whole cost.
+        """
+        if not self.enable_prefix_caching:
+            return
+        algo = HASH_ALGOS[self.hash_algo]
+        for i in range(len(self.block_hashes), self.num_tokens // self.block_size):
+            prefix = self.block_hashes[-1] if self.block_hashes else -1
+            self.block_hashes.append(algo(tuple(self.block(i)), prefix))
+
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+        self._extend_block_hashes()
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids

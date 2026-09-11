@@ -4,9 +4,13 @@ TestChunkedPrefillDisabled covers the `enable_chunked_prefill=False` arm, which
 is the pre-mixed-batch shape kept alive so the A/B has a "before".
 """
 
+import os
 import pytest
+import subprocess
+import sys
 from time import sleep
 
+from lean_vllm.engine import sequence
 from lean_vllm.engine.scheduler import DuplicateRequestId, QueueFull
 from lean_vllm.sampling_params import SamplingParams
 
@@ -252,6 +256,71 @@ class TestPrefixCache:
         assert dict(engine.model_runner.batches[1][1])[second.request_id] == 8
         assert second.block_table[0] == first.block_table[0]
         assert engine.scheduler.block_manager.blocks[first.block_table[0]].ref_count == 2
+
+    def test_disabling_it_recomputes_the_whole_prompt(self, make_engine):
+        engine = make_engine(enable_prefix_caching=False)
+        engine.add(prompt(16), FOREVER)
+        engine.step()
+        second = engine.add(prompt(16), FOREVER)
+        engine.step()
+        assert dict(engine.model_runner.batches[1][1])[second.request_id] == 16
+        assert not engine.scheduler.block_manager.hash_to_block_id
+        assert engine.metrics.summary()["prefix_cache_hit_rate"] == 0.0
+
+    def test_a_block_is_hashed_on_arrival_and_never_again(self, make_engine, monkeypatch):
+        """The queue head is re-queried every step, and rehashing it is the whole cost."""
+        calls = []
+        monkeypatch.setitem(sequence.HASH_ALGOS, "sha256", lambda *a: calls.append(1) or 1)
+        engine = make_engine(num_kvcache_blocks=3)
+        engine.add(prompt(16), FOREVER)
+        waiting = engine.add(prompt(24, 100), FOREVER)    # never fits, so it is looked up each step
+        assert len(waiting.block_hashes) == 3    # every full block, before it was ever scheduled
+        hashed = len(calls)
+        for _ in range(4):
+            engine.step()
+        assert waiting in engine.scheduler.waiting
+        assert len(calls) == hashed
+
+    def test_hashes_outlive_the_blocks_they_name(self, make_engine):
+        """A preempted sequence is re-admitted against its own hashes, not a rehash."""
+        engine = make_engine(num_kvcache_blocks=2)
+        engine.add(prompt(8), FOREVER)
+        second = engine.add(prompt(8, 100), FOREVER)    # newest, so it is the victim
+        engine.step()
+        hashes = list(second.block_hashes)
+        engine.step()
+        assert second.num_preemptions == 1
+        assert second.block_table == []
+        assert second.block_hashes == hashes and hashes
+
+    def test_the_hash_chains_so_the_same_block_behind_a_different_head_misses(self, make_engine):
+        engine = make_engine()
+        first = engine.add(prompt(24), FOREVER)
+        shifted = engine.add(prompt(16, 100) + prompt(8, 8), FOREVER)
+        assert first.block_hashes[0] != shifted.block_hashes[0]
+        assert first.block_hashes[1] != shifted.block_hashes[1]
+
+    def test_xxhash_caches_the_same_prefix_as_sha256(self, make_engine):
+        engine = make_engine(prefix_caching_hash_algo="xxhash")
+        engine.add(prompt(16), FOREVER)
+        engine.step()
+        second = engine.add(prompt(16), FOREVER)
+        engine.step()
+        assert dict(engine.model_runner.batches[1][1])[second.request_id] == 8
+
+    @pytest.mark.parametrize("algo", sorted(sequence.HASH_ALGOS))
+    def test_every_hash_holds_across_processes(self, algo):
+        """A block cached before a restart has to still be found after one, and
+        the tensor-parallel workers have to agree with the parent."""
+        code = f"from lean_vllm.engine.sequence import {algo}_hash as h; print(h((1, 2, 3), -1))"
+        seen = {
+            subprocess.run(
+                [sys.executable, "-c", code], capture_output=True, text=True,
+                env={**os.environ, "PYTHONHASHSEED": seed},
+            ).stdout
+            for seed in ("1", "2")
+        }
+        assert len(seen) == 1 and seen != {""}
 
 
 class TestPreemption:

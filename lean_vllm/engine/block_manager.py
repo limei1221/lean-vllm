@@ -1,7 +1,5 @@
 from collections import OrderedDict
 from typing import Iterable
-import xxhash
-import numpy as np
 
 from lean_vllm.engine.sequence import Sequence
 
@@ -53,8 +51,9 @@ class FreeBlockQueue:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, enable_prefix_caching: bool = True):
         self.block_size = block_size
+        self.enable_prefix_caching = enable_prefix_caching
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids = FreeBlockQueue(range(num_blocks))
@@ -63,14 +62,6 @@ class BlockManager:
     @property
     def usage(self) -> float:
         return len(self.used_block_ids) / len(self.blocks) if self.blocks else 0.0
-
-    @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
-        h = xxhash.xxh64()
-        if prefix != -1:
-            h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
-        return h.intdigest()
 
     def _allocate_block(self) -> int:
         block_id = self.free_block_ids.popleft()
@@ -88,29 +79,28 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
-        h = -1
+        """Cached blocks seq would get, or -1 if the rest does not fit.
+
+        The trailing block is never a candidate: attention needs at least one
+        query token, so the tail is recomputed even on a whole-prompt hit.
+        """
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
-        for i in range(seq.num_blocks - 1):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+        for i in range(seq.num_blocks - 1) if self.enable_prefix_caching else ():
+            block_id = self.hash_to_block_id.get(seq.block_hashes[i], -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != seq.block(i):
                 break
             num_cached_blocks += 1
             if block_id in self.used_block_ids:
-                num_new_blocks -= 1
+                num_new_blocks -= 1    # already held, so it costs no free block
         if len(self.free_block_ids) < num_new_blocks:
             return -1
         return num_cached_blocks
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
-        h = -1
         for i in range(num_cached_blocks):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id[h]
+            block_id = self.hash_to_block_id[seq.block_hashes[i]]
             block = self.blocks[block_id]
             if block_id in self.used_block_ids:
                 block.ref_count += 1
@@ -140,13 +130,13 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):
+        """Publish the blocks this step just filled. Chunks need not align: the
+        bounds are token counts, so a block enters the cache once it is whole."""
+        if not self.enable_prefix_caching:
+            return
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
-        if start == end: return
-        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block.update(h, token_ids)
-            self.hash_to_block_id[h] = block.block_id
+            block.update(seq.block_hashes[i], seq.block(i))
+            self.hash_to_block_id[block.hash] = block.block_id
