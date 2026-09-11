@@ -13,8 +13,10 @@ CUDAGRAPH_MODES = ("none",) + FULL_MODES + ("piecewise",)
 @dataclass(slots=True)
 class Config:
     model: str
-    max_num_batched_tokens: int = 16384
-    max_num_seqs: int = 512
+    # vLLM's own defaults for a server on anything below an H100, which is
+    # the tier an A100 lands in. It tiers these up on H100/H200/B200.
+    max_num_batched_tokens: int = 2048
+    max_num_seqs: int = 256
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     kvcache_memory_gb: float = 2.0    # cpu/mps only; cuda uses gpu_memory_utilization
