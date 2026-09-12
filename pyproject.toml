@@ -24,13 +24,13 @@ serve = [
 ]
 cuda = [
     "triton>=3.0.0",
-    # The torch vLLM 0.28.0 pins, so a benchmark compares engines rather than
+    # The torch vLLM 0.26.0 pins, so a benchmark compares engines rather than
     # PyTorch releases. uv resolves all extras into one lock, so this pin holds
     # in every environment, not just this extra.
-    "torch==2.13.0",
-    # Built from git below, since FA3 ships no wheel. Scoped to Linux, the only
-    # platform its source tree targets; the rest of this extra is NVIDIA-only too.
-    "flash-attn-3; sys_platform == 'linux'",
+    "torch==2.11.0",
+    # A prebuilt wheel, pinned by URL below. Scoped to the one platform that
+    # wheel is built for, so nothing else can resolve the squatted PyPI name.
+    "flash-attn-3; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [project.scripts]
@@ -61,39 +61,14 @@ filterwarnings = [
 ]
 
 [tool.uv]
-required-version = ">=0.12"    # the floor extra-build-variables below was verified against
+required-version = ">=0.12"    # what wrote the committed lock
 
+# Dao-AILab publishes no FA3 wheel, and its source build wants nvcc and tens of
+# minutes. This is a third-party build of their hopper tree at git e2743ab,
+# against CUDA 13.0 and torch 2.11, which is the torch pinned above. The lock
+# carries the file's hash. Anything built for another torch minor will not load.
 [tool.uv.sources]
-# Pinned to a commit: FA3 is released from main, so an unpinned branch would
-# rebuild a different kernel set on every lock.
-flash-attn-3 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "hopper", rev = "98eb7998a0eba4047c7a30375522569d4b8efb20" }
-
-# Static metadata, so resolution never runs hopper/setup.py. That script asks
-# nvcc what to build before it will report its own dependencies, which fails on
-# any machine without CUDA and would leave `uv lock` runnable on the GPU box
-# alone. Matches __version__ and install_requires at the commit above.
-[[tool.uv.dependency-metadata]]
-name = "flash-attn-3"
-version = "3.0.0"
-requires-dist = ["torch", "einops", "packaging", "ninja"]
-
-# The build wants the torch it will run against, and setup.py imports the rest.
-[tool.uv.extra-build-dependencies]
-flash-attn-3 = [
-    { requirement = "torch", match-runtime = true },
-    "psutil",
-    "setuptools",
-    "wheel",
-    "packaging",
-    "einops",
-    "ninja",
-]
-
-# Kernels an inference engine never reaches. Compiling them is most of a long
-# build. MAX_JOBS from the calling shell still applies, and is worth setting on
-# a host that cannot feed one nvcc per core.
-[tool.uv.extra-build-variables]
-flash-attn-3 = { FLASH_ATTENTION_DISABLE_BACKWARD = "TRUE", FLASH_ATTENTION_DISABLE_FP8 = "TRUE" }
+flash-attn-3 = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn_3-3.0.0%2Bcu130torch2.11gite2743ab-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl" }
 
 [tool.setuptools.packages.find]
 where = ["."]

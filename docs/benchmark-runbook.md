@@ -19,27 +19,27 @@ Clone once; for an existing checkout, start with `cd`:
 git clone git@github.com:limei1221/lean-vllm.git /workspace/lean-vllm
 cd /workspace/lean-vllm
 git checkout feature/online-serving
-MAX_JOBS=16 uv sync --extra cuda
+uv sync --extra cuda
 uv run hf download Qwen/Qwen3-8B --local-dir /workspace/huggingface/Qwen3-8B
 uv run python -c 'from lean_vllm.attention import get_attention_backend; print(get_attention_backend().get_name())'
 ```
 
-The sync compiles FlashAttention-3 from the commit pinned in `pyproject.toml`,
-which is the long part of the setup and wants nvcc on `PATH`. `MAX_JOBS` caps
-the parallel compiles; leave it out on a host with memory to spare, lower it if
-the build is killed.
+The sync pulls a prebuilt FlashAttention-3, about 400 MB, pinned by URL and
+hash in `pyproject.toml`. Nothing is compiled, so the box needs no CUDA
+toolkit.
 
 The check must print `flash_attn_3`. Anything else means the sweep would measure
 the Torch backend, which is about fifty times slower.
 
 Keep vLLM in a separate environment because it manages its own PyTorch
-dependencies. Version `0.28.0` matches the previous comparison and pins torch
-`2.13.0`, the same version the `cuda` extra pins, so the curves compare engines
-rather than PyTorch releases:
+dependencies. Version `0.26.0` is the last one that pins torch `2.11.0`, what
+the `cuda` extra pins, so the curves compare engines rather than PyTorch
+releases. That is two releases behind the `0.28.0` of the previous comparison,
+so read the two together only for the shape of the curve:
 
 ```bash
 uv venv /workspace/vllm-env --python 3.12
-uv pip install --python /workspace/vllm-env/bin/python vllm==0.28.0
+uv pip install --python /workspace/vllm-env/bin/python vllm==0.26.0
 ```
 
 ## 2. Set the shared workload and server limits

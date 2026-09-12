@@ -29,10 +29,10 @@ uv sync --extra cuda     # add FlashAttention-3, Triton and the torch vLLM pins 
 uv sync --extra serve    # the server deps alone, for installing without the dev group
 ```
 
-FlashAttention-3 publishes no wheel, so the `cuda` extra builds it from a pinned
-commit. That needs the CUDA toolkit on the machine running the sync and takes
-tens of minutes; `MAX_JOBS` caps the parallel compiles. The kernels are Hopper's,
-so the backend reports itself unavailable on anything but an H100 or H200.
+Dao-AILab publishes no FlashAttention-3 wheel, so the `cuda` extra installs a
+third-party build of it, pinned by URL and hash. That build covers Linux on
+x86_64, against the torch pinned beside it. The kernels are Hopper's, so the
+backend reports itself unavailable on anything but an H100 or H200.
 
 Without it, and without Triton, the engine runs on CPU and Apple Silicon via the
 `torch` attention backend, at laptop speed — enough to develop and test the

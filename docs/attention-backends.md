@@ -98,9 +98,9 @@ non-default setting. FA3 walks a page table of any size.
 
 `is_available()` requires compute capability 9 rather than any CUDA device:
 FA3's kernels are Hopper's. On anything else selection falls through to
-`TorchAttention`, or raises if FA3 was named explicitly. FA3 publishes no wheel,
-so `uv sync --extra cuda` compiles it from a pinned commit, under the build
-settings in `pyproject.toml`.
+`TorchAttention`, or raises if FA3 was named explicitly. Dao-AILab publishes no
+FA3 wheel, so `uv sync --extra cuda` installs a third-party build of it, pinned
+by URL and hash in `pyproject.toml`.
 
 ### Causal masking is bottom-right aligned
 
