@@ -2,6 +2,7 @@ import logging
 import pickle
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -290,9 +291,12 @@ class ModelRunner:
         return buffers["output"][:num_tokens]
 
     def run(self, seqs: list[Sequence]) -> list[int]:
-        input_ids, positions, temperatures, is_prefill = self.prepare_batch(seqs)
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        with record_function("prepare_batch"):
+            input_ids, positions, temperatures, is_prefill = self.prepare_batch(seqs)
+        with record_function("run_model"):
+            logits = self.run_model(input_ids, positions, is_prefill)
+        with record_function("sample"):
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 

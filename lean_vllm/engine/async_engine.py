@@ -164,6 +164,11 @@ class AsyncLLMEngine:
                     self._dispatch(output)
         except BaseException as error:
             self._die(error)
+        finally:
+            # Flush the profiler here, on the engine thread that started it; the
+            # atexit path runs on the main thread and cannot stop it cleanly.
+            if self.engine.profiler is not None:
+                self.engine.profiler.close()
 
     def _drain_intake(self):
         while True:

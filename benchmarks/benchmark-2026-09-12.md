@@ -237,6 +237,74 @@ stops short of the plateau. The trend it shows — a widening idle fraction and 
 rising eager share — points the same way as the 25% plateau gap, but the
 attribution at the plateau itself is not measured.
 
+### What the idle host time is: input prep and detokenization
+
+To name the host work behind the idle, the step loop was profiled in process
+with `torch.profiler`. `record_function` ranges label six phases — `schedule`,
+`prepare_batch`, `run_model`, `sample`, `postprocess`, `detokenize` — and a
+window of steps is captured after warmup and the load ramp have passed. nsys is
+unavailable on this box, which carries no CUDA toolkit by design, so this
+replaces the Nsight Systems run the previous batch called for.
+
+Two traces were taken. The first is the plateau itself: a load-48 online run,
+600 steps of steady-state decode at 10.0 ms/step. It is CPU-side only — the
+engine steps on a worker thread while CUDA was initialised on the main thread,
+and kineto refuses to collect device activity across that boundary. The host
+phases still read cleanly:
+
+| Phase | Share of step | Per step (µs) |
+| :--- | ---: | ---: |
+| `sample` (the `.tolist()` device→host sync) | 79.8% | 7,989 |
+| `prepare_batch` | 5.5% | 548 |
+| `run_model` (kernel launch only) | 5.5% | 547 |
+| inter-step loop overhead (untraced) | 5.5% | 545 |
+| `detokenize` | 2.5% | 246 |
+| `postprocess` | 0.6% | 61 |
+| `schedule` | 0.3% | 34 |
+
+The `sample` phase is misleadingly large. Drilling in, 99.3% of it is
+`aten::copy_` under the `.tolist()` that pulls sampled tokens back to the host.
+That call is a full device sync: `run_model` only launches the forward kernels
+asynchronously and returns, so the CPU blocks in `sample` until the GPU drains.
+On a CPU-only trace the entire forward-pass GPU time is therefore absorbed into
+`sample`, and busy cannot be split from idle here. What the trace does measure is
+the genuinely host-serial work — everything except `sample` — and it is spread
+thin: `prepare_batch`, `run_model`'s launch overhead, and the async-engine loop
+glue between steps each take about 0.55 ms, `detokenize` half that. No single
+host phase dominates.
+
+The second trace recovers the busy/idle split the online run could not. It is an
+offline `generate` run (256 sequences, 200 steps at 13.1 ms/step), which steps on
+the main thread, so CUPTI collects device activity. Taking the union of all
+kernel and copy intervals as GPU-busy time:
+
+| | Time (ms) | Share of step window |
+| :--- | ---: | ---: |
+| GPU busy | 1,713 | 65.6% |
+| GPU idle | 898 | **34.4%** |
+
+Even in a saturated big-batch throughput run the GPU is idle 34% of the wall
+window, at the top of the 9–33% range the utilization log implied for the online
+loads. The device work itself is unremarkable: FlashAttention is 79% of the busy
+time, the sampler and the GEMMs the rest, nothing pathological. The idle is host
+work that does not overlap the forward pass, and on this workload the two largest
+host phases are `detokenize` (1.72 ms/step, 13.2% of the window) and
+`prepare_batch` (1.23 ms/step, 9.4%) — both scale with batch size, which is why
+they read larger here than on the smaller online decode batches. Together they
+account for roughly 3 ms of the 13 ms step, serial, with the GPU stalled.
+
+Two conclusions follow, both consistent with section 3's utilization data.
+Overlapping `prepare_batch` and `detokenize` with the forward pass — preparing
+the next step's batch and draining detokenization off the critical path — is the
+larger lever, targeting the 34% idle directly. CUDA graphs would remove
+`run_model`'s launch bubbles (about 0.55 ms/step) but is second-order. The
+attention kernels are already FA3 and are not the bottleneck.
+
+The offline split is a different workload from the online plateau, and the online
+trace cannot confirm the busy fraction directly, so the 34% figure is corroborating
+rather than measured at load 48. But both traces agree on the attribution: the
+plateau's idle is `detokenize` and input preparation, not slow kernels.
+
 ## 4. Clock conditions: matched, and not the explanation
 
 The GPU log this time carries UTC timestamps that agree with the recorded
@@ -299,11 +367,14 @@ explain any part of the deficit.
 
 ## Next experiments, in priority order
 
-1. **Profile the host side of lean-vLLM's step loop at the plateau.** The GPU is
-   idle 9–33% of the time the engine calls itself busy, and the plateau gap is
-   25%. Nsight Systems on one load-48 run would show whether the gaps are input
-   preparation, sampling, or scheduler work that could overlap with the forward
-   pass.
+1. **Overlap `detokenize` and `prepare_batch` with the forward pass.** The
+   host-side profiling in section 3 (done — see "What the idle host time is")
+   found the 34% GPU idle is these two phases running serially, about 3 ms of a
+   13 ms step with the GPU stalled, not slow kernels. Moving next-step batch
+   preparation and detokenization off the critical path is the largest lever on
+   the plateau gap. A confirming online GPU timeline is still owed: CUPTI cannot
+   collect device activity from the engine thread, so the busy/idle split was
+   measured on an offline run and only corroborated at load 48.
 2. **Collect the extension sweep's result files and GPU log.** Loads 32 to 64
    are the loads that matter now, and they are the only ones with no server
    counters, no clock check, and no step accounting.

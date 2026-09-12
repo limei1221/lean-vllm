@@ -1,9 +1,11 @@
 import atexit
+import os
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
+from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 from lean_vllm.config import Config
 from lean_vllm.sampling_params import SamplingParams
@@ -31,6 +33,81 @@ def validate_request(prompt: list[int], sampling_params: SamplingParams, vocab_s
         )
 
 
+class _StepProfiler:
+    """torch.profiler over a window of engine steps, enabled by environment.
+
+    nsys is unavailable on the benchmark box, which has no CUDA toolkit, so the
+    host side of the step loop is profiled in process instead. Set
+    ``LEAN_PROFILE_DIR`` to enable it; ``LEAN_PROFILE_SKIP`` steps pass before
+    capture starts, to clear warmup and the load ramp, and ``LEAN_PROFILE_STEPS``
+    steps are captured. The ``record_function`` ranges in the step loop label the
+    host phases -- schedule, prepare_batch, run_model, sample, postprocess,
+    detokenize -- so their wall-clock share is read straight off the trace.
+
+    CPU activity only by default: online, ``step()`` runs on the engine thread
+    while CUDA was initialised on the main thread, and kineto refuses to collect
+    CUDA activity across that boundary ("External init callback must run in same
+    thread as registerClient"). Set ``LEAN_PROFILE_CUDA=1`` to add it anyway,
+    which is clean only when stepping on the main thread, i.e. offline generate.
+
+    The window need not fit the run: ``close()`` stops the profiler from the same
+    thread that started it and flushes whatever was captured, full window or not.
+    """
+
+    def __init__(self, out_dir: str, skip: int, steps: int, cuda: bool):
+        self.out_dir = out_dir
+        os.makedirs(out_dir, exist_ok=True)
+        activities = [ProfilerActivity.CPU]
+        if cuda:
+            activities.append(ProfilerActivity.CUDA)
+        self.profile = profile(
+            activities=activities,
+            schedule=schedule(skip_first=skip, wait=0, warmup=1, active=steps, repeat=1),
+            on_trace_ready=self._export,
+        )
+        self.started = False
+        self.exported = False
+        self.closed = False
+
+    @classmethod
+    def from_env(cls) -> "_StepProfiler | None":
+        out_dir = os.environ.get("LEAN_PROFILE_DIR")
+        if not out_dir:
+            return None
+        skip = int(os.environ.get("LEAN_PROFILE_SKIP", "200"))
+        steps = int(os.environ.get("LEAN_PROFILE_STEPS", "200"))
+        cuda = os.environ.get("LEAN_PROFILE_CUDA", "0") not in ("", "0", "false", "False")
+        return cls(out_dir, skip, steps, cuda)
+
+    def step(self):
+        if self.started is False:
+            self.profile.start()    # lazy, so kineto skips model load and warmup
+            self.started = True
+        self.profile.step()
+
+    def _export(self, prof):
+        path = os.path.join(self.out_dir, f"step-loop-{os.getpid()}.json")
+        prof.export_chrome_trace(path)
+        self.exported = True
+        print(f"wrote step-loop profile to {path}", flush=True)
+
+    def close(self):
+        """Flush from the calling thread; must be the thread that ran step()."""
+        if not self.started or self.closed:
+            return
+        self.closed = True
+        try:
+            self.profile.stop()    # flushes the window, partial or complete
+        except RuntimeError:
+            pass    # the window already completed and saved mid-run
+        if not self.exported:
+            print(
+                f"warning: step-loop profile captured nothing in {self.out_dir}; "
+                f"lower LEAN_PROFILE_SKIP below the run's step count",
+                flush=True,
+            )
+
+
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
@@ -55,9 +132,12 @@ class LLMEngine:
         self.scheduler = Scheduler(config)
         self.metrics = Metrics()
         self.detokenizers: dict[str, IncrementalDetokenizer] = {}
+        self.profiler = _StepProfiler.from_env()
         atexit.register(self.exit)
 
     def exit(self):
+        if self.profiler is not None:
+            self.profiler.close()
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -87,15 +167,21 @@ class LLMEngine:
 
     def step(self) -> tuple[list[RequestOutput], int, int]:
         started = perf_counter()
-        output = self.scheduler.schedule()
+        with record_function("schedule"):
+            output = self.scheduler.schedule()
         stepped = []
         if output:
-            token_ids = self.model_runner.call("run", output.scheduled)
-            stepped = self.scheduler.postprocess(output.scheduled, token_ids)
-        outputs = [self._output(seq) for seq in stepped] + [self._dropped(seq) for seq in output.dropped]
+            with record_function("forward"):
+                token_ids = self.model_runner.call("run", output.scheduled)
+            with record_function("postprocess"):
+                stepped = self.scheduler.postprocess(output.scheduled, token_ids)
+        with record_function("detokenize"):
+            outputs = [self._output(seq) for seq in stepped] + [self._dropped(seq) for seq in output.dropped]
         self.metrics.record_step(
             self.scheduler, output, outputs, perf_counter() - started, self.model_runner.step_kind
         )
+        if self.profiler is not None:
+            self.profiler.step()
         return outputs, output.num_prefill_tokens, output.num_decode_tokens
 
     def _output(self, seq: Sequence) -> RequestOutput:

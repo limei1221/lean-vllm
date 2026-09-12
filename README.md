@@ -46,7 +46,7 @@ cache from, so it comes from `kvcache_memory_gb` (default 2.0) instead of
 ## Quick start
 
 ```bash
-uv run hf download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B
+uv run hf download Qwen/Qwen3-0.6B --local-dir ~/workspace/huggingface/Qwen3-0.6B
 uv run python example.py
 ```
 
