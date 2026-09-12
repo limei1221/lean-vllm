@@ -76,6 +76,7 @@ class FakeEngine:
         self.model_runner = runner
         self.metrics = Metrics()
         self.last_output = None
+        self.profiler = None    # real LLMEngine exposes one; the async loop reads it
 
     def add(self, prompt: list[int], sampling_params: SamplingParams | None = None, request_id: str | None = None) -> Sequence:
         seq = Sequence(prompt, sampling_params or SamplingParams(), request_id)

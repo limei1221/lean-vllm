@@ -58,6 +58,9 @@ Upstream="https://github.com/GeeeekExplorer/nano-vllm"
 filterwarnings = [
     # starlette 1.6.0 imports a deprecated anyio alias; drop this when it stops.
     'ignore:The anyio\.abc\.BlockingPortal alias is deprecated:DeprecationWarning',
+    # torch.utils.mkldnn, pulled in by @torch.compile's inductor import, still uses
+    # torch.jit.script_method internally. torch warning about its own API; drop on upgrade.
+    'ignore:`torch\.jit\.script_method` is deprecated:DeprecationWarning',
 ]
 
 [tool.uv]

@@ -75,10 +75,13 @@ class FlashAttention3Backend(AttentionBackend):
             )
         # Some row reads keys it computed on an earlier step. FA3's varlen entry
         # point takes no page table, unlike FA2's, so those go through the kvcache
-        # one: queries packed as cu_seqlens_q says, one key length per row.
+        # one: queries packed as cu_seqlens_q says, one key length per row. The
+        # per-row key length is cu_seqlens_k's stride, matching the torch backend;
+        # context_lens is not part of the prefill contract (see test_prefill_*).
+        cache_seqlens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
         return flash_attn_with_kvcache(
             q, k_cache, v_cache,
-            cache_seqlens=context.context_lens, page_table=context.block_tables,
+            cache_seqlens=cache_seqlens, page_table=context.block_tables,
             cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
             softmax_scale=self.scale, causal=True,
         )
