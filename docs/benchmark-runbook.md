@@ -98,11 +98,12 @@ git diff HEAD > "$RUN_RESULTS/working-tree.patch"
 
 Save any untracked source files separately; they are not included in the patch.
 
-If the host allows it, enable persistence mode and lock the clock:
+If the host allows it, enable persistence mode and lock the clock. Both need
+root, which the shell in a rented GPU container usually already has:
 
 ```bash
-sudo nvidia-smi -pm 1
-sudo nvidia-smi -lgc "$(nvidia-smi --query-gpu=clocks.max.sm --format=csv,noheader,nounits | head -1)"
+nvidia-smi -pm 1
+nvidia-smi -lgc "$(nvidia-smi --query-gpu=clocks.max.sm --format=csv,noheader,nounits | head -1)"
 ```
 
 If the container refuses, continue with monitoring. Record settings and keep a
