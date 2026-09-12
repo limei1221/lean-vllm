@@ -131,6 +131,43 @@ def test_prefill_without_cache(backend, device, dtype, tol):
     torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
 
 
+def test_prefill_of_a_cold_batch_with_pages(backend, device, block_size, dtype, tol):
+    """The shape a fresh prompt takes while serving: pages allocated, nothing cached in them.
+
+    Every key is in k and v, so a backend may answer from either place, and this
+    checks that both agree with the oracle.
+    """
+    seqlens = [5, block_size + 3]
+    block_tables_list = [[0, 1, -1], [2, 3, 4]]
+    k_cache, v_cache = make_cache(6, device, block_size, dtype)
+
+    qs = [randn(n, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens]
+    ks = [randn(n, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens]
+    vs = [randn(n, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens]
+
+    slot_mapping = []
+    for table, n in zip(block_tables_list, seqlens):
+        slot_mapping += slots_for(table, block_size, 0, n)
+    k_new, v_new = torch.cat(ks), torch.cat(vs)
+    backend.store_kvcache(
+        k_new, v_new, k_cache, v_cache,
+        torch.tensor(slot_mapping, dtype=torch.int32, device=device),
+    )
+
+    cu = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device=device)
+    context = Context(
+        is_prefill=True, cu_seqlens_q=cu, cu_seqlens_k=cu,
+        max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
+        keys_are_new=True,
+        context_lens=torch.tensor(seqlens, dtype=torch.int32, device=device),
+        block_tables=torch.tensor(block_tables_list, dtype=torch.int32, device=device),
+    )
+    out = backend.prefill(torch.cat(qs), k_new, v_new, k_cache, v_cache, context)
+
+    expected = torch.cat([dense_attention(q, k, v) for q, k, v in zip(qs, ks, vs)])
+    torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+
+
 def test_prefill_with_prefix_cache(backend, device, block_size, dtype, tol):
     """Chunked prefill: seq 0 resumes mid-page after cached prefix, seq 1 starts cold."""
     num_cached = [2 * block_size + 2, 0]

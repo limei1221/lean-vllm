@@ -195,6 +195,9 @@ class ModelRunner:
             cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, self.device),
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            # Equal cumulative lengths mean no row started from cached tokens, which
+            # is the batch a backend can attend without reading the cache back.
+            keys_are_new=cu_seqlens_k == cu_seqlens_q,
             slot_mapping=dev.make_tensor(slot_mapping, torch.int32, self.device),
             context_lens=dev.make_tensor(context_lens, torch.int32, self.device),
             block_tables=block_tables,

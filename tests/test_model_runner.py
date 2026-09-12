@@ -63,6 +63,19 @@ def test_an_all_greedy_batch_sends_no_temperatures(runner):
     assert temperatures is None
 
 
+def test_keys_are_new_follows_the_cached_tokens(runner):
+    """It decides which entry point a flash prefill takes, so it must not lag the batch."""
+    cold = Sequence([10, 11, 12], SamplingParams())
+    cold.num_scheduled_tokens = 3
+    runner.prepare_batch([cold])
+    assert get_context().keys_are_new
+
+    resumed = Sequence([20, 21, 22, 23], SamplingParams())
+    resumed.num_cached_tokens, resumed.num_scheduled_tokens = 2, 2
+    runner.prepare_batch([cold, resumed])
+    assert not get_context().keys_are_new
+
+
 class TestPiecewiseBuckets:
 
     def buckets(self, budget):

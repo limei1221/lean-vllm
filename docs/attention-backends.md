@@ -63,18 +63,33 @@ abstraction.
 
 ### Which FlashAttention-3 entry point runs a prefill
 
-FA3 has two, and the choice is not about prefill versus decode:
+FA3 has two, and serving reaches both. The question each step asks is where its
+keys are, not whether it is a prefill:
 
-| context | call |
+| step | call |
 |---|---|
-| `block_tables is None` | `flash_attn_varlen_func` on the new k/v |
-| paged, any query length | `flash_attn_with_kvcache` with `page_table` |
+| no row carries cached keys | `flash_attn_varlen_func` on this step's k/v |
+| some row resumes | `flash_attn_with_kvcache` with `page_table` |
 
 FA2's varlen entry point took a `block_table`, so one call covered both. FA3's
-does not, so a prefill that reads pages goes through the kvcache entry point
-instead, which accepts packed queries through `cu_seqlens_q` and one key length
-per row through `cache_seqlens`. Serving always takes that path; the varlen one
-is left for warmup and the tests, where no pages exist yet.
+does not, so a step that has to read keys back goes through the kvcache entry
+point instead, which accepts packed queries through `cu_seqlens_q` and one key
+length per row through `cache_seqlens`.
+
+`keys_are_new` on the context is that question answered on the host, where the
+runner already knows it: cumulative query and key lengths are equal exactly when
+no row started from cached tokens. Reading it off the tensors instead would cost
+a sync per layer. Cold prompts and the first chunk of a long one take the varlen
+path and read k and v straight, with no page walk; a prefix-cache hit, a resumed
+chunk, or a decode row mixed into the batch sends the whole step through the
+pages.
+
+Which one a run actually exercises is worth knowing before reading any number
+from it. Chunked prefill admits new prompts into the same step as the running
+decodes, so a loaded server reaches the varlen path rarely: it belongs to steps
+with nothing running, to `bench_offline.py`, and to the chunked-prefill-off arm,
+whose steps are whole prompts and nothing else. Whether it is faster there is
+unmeasured.
 
 The move to FA3 is also what makes the 16-token page the default. FA2 rejected
 any paged block size that was not a multiple of 256, which forced a 256-token

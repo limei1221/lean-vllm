@@ -64,16 +64,18 @@ class FlashAttention3Backend(AttentionBackend):
         )
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
-        if context.block_tables is None:    # no pages yet: warmup, and the tests
+        if context.keys_are_new or context.block_tables is None:
+            # k and v already hold every key this batch attends, so skip the page
+            # walk. Cold prompts and the first chunk of a long one land here.
             return flash_attn_varlen_func(
                 q, k, v,
                 cu_seqlens_q=context.cu_seqlens_q, cu_seqlens_k=context.cu_seqlens_k,
                 max_seqlen_q=context.max_seqlen_q, max_seqlen_k=context.max_seqlen_k,
                 softmax_scale=self.scale, causal=True,
             )
-        # FA3's varlen entry point takes no page table, so a paged prefill goes
-        # through the kvcache one: queries packed as cu_seqlens_q says, keys
-        # walked from the pages, one key length per row.
+        # Some row reads keys it computed on an earlier step. FA3's varlen entry
+        # point takes no page table, unlike FA2's, so those go through the kvcache
+        # one: queries packed as cu_seqlens_q says, one key length per row.
         return flash_attn_with_kvcache(
             q, k_cache, v_cache,
             cache_seqlens=context.context_lens, page_table=context.block_tables,
