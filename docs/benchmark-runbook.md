@@ -16,11 +16,11 @@ Use the same Bash session for the commands below.
 Clone once; for an existing checkout, start with `cd`:
 
 ```bash
-git clone git@github.com:limei1221/lean-vllm.git /workspace/lean-vllm
-cd /workspace/lean-vllm
+git clone git@github.com:limei1221/lean-vllm.git ~/workspace/lean-vllm
+cd ~/workspace/lean-vllm
 git checkout feature/online-serving
 uv sync --extra cuda
-uv run hf download Qwen/Qwen3-8B --local-dir /workspace/huggingface/Qwen3-8B
+uv run hf download Qwen/Qwen3-8B --local-dir ~/workspace/huggingface/Qwen3-8B
 uv run python -c 'from lean_vllm.attention import get_attention_backend; print(get_attention_backend().get_name())'
 ```
 
@@ -38,14 +38,14 @@ releases. That is two releases behind the `0.28.0` of the previous comparison,
 so read the two together only for the shape of the curve:
 
 ```bash
-uv venv /workspace/vllm-env --python 3.12
-uv pip install --python /workspace/vllm-env/bin/python vllm==0.26.0
+uv venv ~/workspace/vllm-env --python 3.12
+uv pip install --python ~/workspace/vllm-env/bin/python vllm==0.26.0
 ```
 
 ## 2. Set the shared workload and server limits
 
 ```bash
-export MODEL=/workspace/huggingface/Qwen3-8B
+export MODEL=~/workspace/huggingface/Qwen3-8B
 export RUN_RESULTS="results/$(date -u +%Y%m%dT%H%M%SZ)"
 export RATES="1,4,8,12,16,24"
 export KVTOKENS=327680
@@ -88,8 +88,8 @@ Record the build and environment with the results:
   uname -r
   uv run python --version
   uv run python -c 'import torch; print("lean-vLLM torch:", torch.__version__)'
-  /workspace/vllm-env/bin/vllm --version
-  /workspace/vllm-env/bin/python -c 'import torch; print("vLLM torch:", torch.__version__)'
+  ~/workspace/vllm-env/bin/vllm --version
+  ~/workspace/vllm-env/bin/python -c 'import torch; print("vLLM torch:", torch.__version__)'
   date -u '+%Y-%m-%dT%H:%M:%SZ'
   date '+%Y-%m-%dT%H:%M:%S%z'
 } | tee "$RUN_RESULTS/environment.txt"
@@ -137,7 +137,7 @@ uv run python benchmarks/sweep.py \
 ### vLLM
 
 ```bash
-PATH="/workspace/vllm-env/bin:$PATH" uv run python benchmarks/sweep.py \
+PATH="$HOME/workspace/vllm-env/bin:$PATH" uv run python benchmarks/sweep.py \
   --model "$MODEL" --engine vllm --suite rate \
   --rates "$RATES" --num-requests 1000 --seed 0 \
   --max-model-len 4096 --kvcache-tokens "$KVTOKENS" \
