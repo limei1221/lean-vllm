@@ -39,7 +39,7 @@ class SequenceStatus(Enum):
 class Sequence:
     # Set once from Config, since a Sequence is built in places that carry no
     # config: the engine, the profiling warmup, and the spawned TP workers.
-    block_size = 256
+    block_size = 16
     enable_prefix_caching = True
     hash_algo = "sha256"
     counter = count()

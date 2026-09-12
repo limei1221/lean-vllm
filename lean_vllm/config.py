@@ -15,10 +15,10 @@ CUDAGRAPH_MODES = ("none",) + FULL_MODES + ("piecewise",)
 @dataclass(slots=True)
 class Config:
     model: str
-    # vLLM's own defaults for a server on anything below an H100, which is
-    # the tier an A100 lands in. It tiers these up on H100/H200/B200.
-    max_num_batched_tokens: int = 2048
-    max_num_seqs: int = 256
+    # vLLM's own defaults for a server on an H100: it reads the device name and
+    # memory and tiers these up from 2048/256 once past an A100.
+    max_num_batched_tokens: int = 8192
+    max_num_seqs: int = 1024
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     kvcache_memory_gb: float = 2.0    # cpu/mps only; cuda uses gpu_memory_utilization
@@ -27,7 +27,7 @@ class Config:
     cudagraph_mode: str = "full_and_piecewise"    # none | full | piecewise | full_and_piecewise
     hf_config: AutoConfig | None = None
     eos: int = -1
-    kvcache_block_size: int = 256
+    kvcache_block_size: int = 16
     num_kvcache_blocks: int = -1
     enable_chunked_prefill: bool = True    # off is the pre-M2 shape, kept for the A/B
     enable_prefix_caching: bool = True     # off recomputes every prompt, kept for the A/B
@@ -39,7 +39,7 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        assert self.kvcache_block_size % 256 == 0
+        assert self.kvcache_block_size % 16 == 0
         assert self.cudagraph_mode in CUDAGRAPH_MODES, f"unknown cudagraph_mode {self.cudagraph_mode!r}"
         assert self.prefix_caching_hash_algo in HASH_ALGOS, \
             f"unknown prefix_caching_hash_algo {self.prefix_caching_hash_algo!r}, expected one of {sorted(HASH_ALGOS)}"

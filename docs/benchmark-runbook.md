@@ -1,6 +1,6 @@
 # Benchmark runbook: lean-vLLM versus vLLM
 
-Compare Qwen3-8B on one NVIDIA A100-SXM4-80GB using the same workload and resource
+Compare Qwen3-8B on one NVIDIA H100-SXM5-80GB using the same workload and resource
 limits. Run **one rate curve per engine**, with **chunked prefill enabled** and
 **full + piecewise CUDA graphs** on both engines.
 
@@ -19,12 +19,23 @@ Clone once; for an existing checkout, start with `cd`:
 git clone git@github.com:limei1221/lean-vllm.git /workspace/lean-vllm
 cd /workspace/lean-vllm
 git checkout feature/online-serving
-uv sync --extra cuda
+MAX_JOBS=16 uv sync --extra cuda
 uv run hf download Qwen/Qwen3-8B --local-dir /workspace/huggingface/Qwen3-8B
+uv run python -c 'from lean_vllm.attention import get_attention_backend; print(get_attention_backend().get_name())'
 ```
 
+The sync compiles FlashAttention-3 from the commit pinned in `pyproject.toml`,
+which is the long part of the setup and wants nvcc on `PATH`. `MAX_JOBS` caps
+the parallel compiles; leave it out on a host with memory to spare, lower it if
+the build is killed.
+
+The check must print `flash_attn_3`. Anything else means the sweep would measure
+the Torch backend, which is about fifty times slower.
+
 Keep vLLM in a separate environment because it manages its own PyTorch
-dependencies. Version `0.28.0` matches the previous comparison:
+dependencies. Version `0.28.0` matches the previous comparison and pins torch
+`2.13.0`, the same version the `cuda` extra pins, so the curves compare engines
+rather than PyTorch releases:
 
 ```bash
 uv venv /workspace/vllm-env --python 3.12
@@ -91,7 +102,7 @@ If the host allows it, enable persistence mode and lock the clock:
 
 ```bash
 sudo nvidia-smi -pm 1
-sudo nvidia-smi -lgc 1410
+sudo nvidia-smi -lgc "$(nvidia-smi --query-gpu=clocks.max.sm --format=csv,noheader,nounits | head -1)"
 ```
 
 If the container refuses, continue with monitoring. Record settings and keep a

@@ -13,10 +13,9 @@ NUM_KV_HEADS = 2  # exercises GQA head broadcasting
 HEAD_DIM = 32
 SCALE = 0.137    # not head_dim**-0.5, so a dropped scale argument is detectable
 
-# flash-attn's paged kernels require 256 and torch works at any size, so both
-# backends run the same page layout.
-BLOCK_SIZE = 256
-DTYPE = {"torch": torch.float32, "flash_attn": torch.float16}    # flash kernels are fp16/bf16 only
+# The engine's default page size, which FA3 and torch both take.
+BLOCK_SIZE = 16
+DTYPE = {"torch": torch.float32, "flash_attn_3": torch.float16}    # flash kernels are fp16/bf16 only
 
 # Tolerances per dtype for comparison against the fp32 oracle. bf16 is not checked
 # against a fixed tolerance; see test_low_precision_no_worse_than_naive.

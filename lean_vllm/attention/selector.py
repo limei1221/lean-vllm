@@ -1,14 +1,14 @@
 import os
 
 from lean_vllm.attention.abstract import AttentionBackend
-from lean_vllm.attention.flash_backend import FlashAttentionBackend
+from lean_vllm.attention.flash_backend import FlashAttention3Backend
 from lean_vllm.attention.torch_backend import TorchAttention
 
 ENV_VAR = "LEAN_VLLM_ATTENTION_BACKEND"
 
 # TorchAttention is last and always available, so resolution cannot fail.
 BACKENDS: tuple[type[AttentionBackend], ...] = (
-    FlashAttentionBackend,
+    FlashAttention3Backend,
     TorchAttention,
 )
 

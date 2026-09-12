@@ -95,15 +95,15 @@ dropped rather than preempted forever.
 
 | flag | default | |
 | --- | ---: | --- |
-| `--max-num-batched-tokens` | 2048 | tokens one step may schedule |
-| `--max-num-seqs` | 256 | sequences that may run at once |
+| `--max-num-batched-tokens` | 8192 | tokens one step may schedule |
+| `--max-num-seqs` | 1024 | sequences that may run at once |
 | `--enable-chunked-prefill` | on | off is whole prompts only, never mixed with decode |
 | `--scheduling-policy` | `fcfs` | or `priority`, which reads the request's `priority` |
 | `--enable-prefix-caching` | on | off recomputes every prompt |
 | `--prefix-caching-hash-algo` | `sha256` | or `xxhash` |
 | `--long-prefill-token-threshold` | 0 | cap on one prompt's share of a step; 0 is none |
 | `--num-kvcache-blocks` | profiled | pin it to hold cache capacity still across runs |
-| `--kvcache-block-size` | 256 | tokens per block |
+| `--kvcache-block-size` | 16 | tokens per block |
 | `--enforce-eager` | off | on disables CUDA graphs |
 
 Preemption recomputes rather than swaps, and a preempted sequence goes back to

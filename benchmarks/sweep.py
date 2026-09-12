@@ -101,11 +101,10 @@ SUITES = {
     "starvation": starvation_suite,
 }
 
-# Upstream flash-attn rejects a paged block size that is not a multiple of 256,
-# so 256 is lean-vLLM's only choice. vLLM ships a fork that relaxes the same
-# check to 16 and defaults there, but it takes any multiple of 16, so 256 is
-# the one size both engines run and neither engine is left on its default.
-BLOCK_SIZE = 256
+# FA3 pages at any size, so lean-vLLM can meet vLLM on its own default of 16.
+# Pinned rather than left to each engine's default, because the two configure
+# capacity in blocks and the arithmetic below has to mean the same thing twice.
+BLOCK_SIZE = 16
 
 
 def cache_flags(args) -> dict:

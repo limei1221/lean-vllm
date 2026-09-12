@@ -7,8 +7,8 @@ _IMPORT_ERROR: ImportError | None = None
 try:
     import triton
     import triton.language as tl
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-except ImportError as e:    # CUDA only
+    from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+except ImportError as e:    # Hopper only, and built by the cuda extra
     _IMPORT_ERROR = e
 else:
 
@@ -35,16 +35,18 @@ else:
         tl.store(v_cache_ptr + cache_offsets, value)
 
 
-class FlashAttentionBackend(AttentionBackend):
-    """FlashAttention kernels with a Triton KV-cache scatter. CUDA only."""
+class FlashAttention3Backend(AttentionBackend):
+    """FlashAttention-3 kernels with a Triton KV-cache scatter. Hopper only."""
 
     @staticmethod
     def get_name() -> str:
-        return "flash_attn"
+        return "flash_attn_3"
 
     @staticmethod
     def is_available() -> bool:
-        return _IMPORT_ERROR is None and torch.cuda.is_available()
+        # FA3 is built for sm90 alone: Ampere has no wgmma and Blackwell is FA4's.
+        return (_IMPORT_ERROR is None and torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] == 9)
 
     @staticmethod
     def supports_cuda_graph() -> bool:
@@ -62,19 +64,27 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
-        if context.block_tables is not None:    # prefix cache
-            k, v = k_cache, v_cache
-        return flash_attn_varlen_func(
-            q, k, v,
-            max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-            max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-            softmax_scale=self.scale, causal=True, block_table=context.block_tables,
+        if context.block_tables is None:    # no pages yet: warmup, and the tests
+            return flash_attn_varlen_func(
+                q, k, v,
+                cu_seqlens_q=context.cu_seqlens_q, cu_seqlens_k=context.cu_seqlens_k,
+                max_seqlen_q=context.max_seqlen_q, max_seqlen_k=context.max_seqlen_k,
+                softmax_scale=self.scale, causal=True,
+            )
+        # FA3's varlen entry point takes no page table, so a paged prefill goes
+        # through the kvcache one: queries packed as cu_seqlens_q says, keys
+        # walked from the pages, one key length per row.
+        return flash_attn_with_kvcache(
+            q, k_cache, v_cache,
+            cache_seqlens=context.context_lens, page_table=context.block_tables,
+            cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
+            softmax_scale=self.scale, causal=True,
         )
 
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
         o = flash_attn_with_kvcache(
             q.unsqueeze(1), k_cache, v_cache,
-            cache_seqlens=context.context_lens, block_table=context.block_tables,
+            cache_seqlens=context.context_lens, page_table=context.block_tables,
             softmax_scale=self.scale, causal=True,
         )
         return o.squeeze(1)    # match the [batch, heads, dim] contract

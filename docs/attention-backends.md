@@ -1,6 +1,6 @@
 # Attention Backend Abstraction
 
-Status: interface + `TorchAttention` + `FlashAttentionBackend` landed, and
+Status: interface + `TorchAttention` + `FlashAttention3Backend` landed, and
 CUDA-graph capture is gated on `supports_cuda_graph()`.
 Not yet done: FlashInfer / FlashMLA.
 
@@ -32,7 +32,7 @@ AttentionBackend                  # store_kvcache / prefill / decode
       |
       +-- TorchAttention          # SDPA, any device, reference oracle
       |
-      +-- FlashAttentionBackend   # flash-attn + Triton scatter, CUDA only
+      +-- FlashAttention3Backend  # flash-attn 3 + Triton scatter, Hopper only
 ```
 
 `Attention.__init__` resolves a backend class once and instantiates it per
@@ -56,9 +56,36 @@ Identical across backends; sequences are packed, not padded.
 | `decode` q | `[batch_size, num_heads, head_dim]` |
 | `decode` returns | `[batch_size, num_heads, head_dim]` |
 
-`flash_attn_with_kvcache` returns a singleton query axis; the flash backend
-squeezes it so both backends return the same rank. An abstraction whose
-implementations return different shapes is not an abstraction.
+`flash_attn_with_kvcache` returns a singleton query axis in the decode shape;
+the flash backend squeezes it so both backends return the same rank. An
+abstraction whose implementations return different shapes is not an
+abstraction.
+
+### Which FlashAttention-3 entry point runs a prefill
+
+FA3 has two, and the choice is not about prefill versus decode:
+
+| context | call |
+|---|---|
+| `block_tables is None` | `flash_attn_varlen_func` on the new k/v |
+| paged, any query length | `flash_attn_with_kvcache` with `page_table` |
+
+FA2's varlen entry point took a `block_table`, so one call covered both. FA3's
+does not, so a prefill that reads pages goes through the kvcache entry point
+instead, which accepts packed queries through `cu_seqlens_q` and one key length
+per row through `cache_seqlens`. Serving always takes that path; the varlen one
+is left for warmup and the tests, where no pages exist yet.
+
+The move to FA3 is also what makes the 16-token page the default. FA2 rejected
+any paged block size that was not a multiple of 256, which forced a 256-token
+block and made the KV-cache comparison against vLLM a comparison at vLLM's
+non-default setting. FA3 walks a page table of any size.
+
+`is_available()` requires compute capability 9 rather than any CUDA device:
+FA3's kernels are Hopper's. On anything else selection falls through to
+`TorchAttention`, or raises if FA3 was named explicitly. FA3 publishes no wheel,
+so `uv sync --extra cuda` compiles it from a pinned commit, under the build
+settings in `pyproject.toml`.
 
 ### Causal masking is bottom-right aligned
 
@@ -90,12 +117,11 @@ decode row, resumed chunk, cold prefill — against the dense oracle, and
 `test_mixed_batch_matches_running_the_rows_separately` checks that one mixed
 call equals the separate `prefill` and `decode` calls it replaces.
 
-`decode` survives as the pure-decode fast path, because it reaches
-`flash_attn_with_kvcache` and is the only shape a CUDA graph can capture. The
-runner selects it only when **no** row is a prompt chunk. "Every query length is
-1" would be the wrong test: a prompt whose last chunk happens to be one token
-long also has query length 1, and it must take the varlen path so that
-`logits_indices` decides whether it samples.
+`decode` survives as the pure-decode fast path, because it is the only shape a
+CUDA graph can capture. The runner selects it only when **no** row is a prompt
+chunk. "Every query length is 1" would be the wrong test: a prompt whose last
+chunk happens to be one token long also has query length 1, and it must take the
+varlen path so that `logits_indices` decides whether it samples.
 
 ## Backend selection
 
@@ -117,8 +143,8 @@ Agreement with it is evidence rather than tautology.
 
 Tests are parametrized over `(backend, device)` pairs filtered by
 `is_available()`, so the same file runs on a CPU-only laptop and, on a GPU box,
-additionally compares `TorchAttention` and `FlashAttentionBackend` on identical
-hardware.
+additionally compares `TorchAttention` and `FlashAttention3Backend` on
+identical hardware.
 
 The suite was validated by mutation testing — deliberately breaking the backend
 and confirming tests fail. Two mutations initially survived and both indicated

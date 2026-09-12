@@ -25,13 +25,18 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                  # deps, dev tools, the server and the package, into .venv
-uv sync --extra cuda     # add FlashAttention and Triton (NVIDIA only)
+uv sync --extra cuda     # add FlashAttention-3, Triton and the torch vLLM pins (NVIDIA only)
 uv sync --extra serve    # the server deps alone, for installing without the dev group
 ```
 
-FlashAttention and Triton are optional. Without them the engine runs on CPU and
-Apple Silicon via the `torch` attention backend, at laptop speed — enough to
-develop and test the scheduler and cache against a small model.
+FlashAttention-3 publishes no wheel, so the `cuda` extra builds it from a pinned
+commit. That needs the CUDA toolkit on the machine running the sync and takes
+tens of minutes; `MAX_JOBS` caps the parallel compiles. The kernels are Hopper's,
+so the backend reports itself unavailable on anything but an H100 or H200.
+
+Without it, and without Triton, the engine runs on CPU and Apple Silicon via the
+`torch` attention backend, at laptop speed — enough to develop and test the
+scheduler and cache against a small model.
 
 The device is picked automatically (cuda, then mps, then cpu) and can be forced
 with `LEAN_VLLM_DEVICE`. Off CUDA there is no `mem_get_info` to size the KV
@@ -119,11 +124,12 @@ uv run python benchmarks/sweep.py --model ~/huggingface/Qwen3-8B \
     --suite rate --rates 1,2,4,8,16 --num-kvcache-blocks 8192 --out results/8b
 ```
 
-No benchmark numbers are published yet. The attention backends have been
-verified for numerical correctness against a dense reference on an A100, but
-throughput has not been measured on a GPU since the fork.
+No benchmark numbers are published yet. The backends were verified for
+numerical correctness against a dense reference on an A100 back when the CUDA
+one was FlashAttention-2; the FlashAttention-3 backend that replaced it awaits
+its first H100.
 [docs/benchmark-runbook.md](docs/benchmark-runbook.md) is the step-by-step for
-producing them on a rented A100.
+producing numbers on a rented H100.
 
 ## Tests
 

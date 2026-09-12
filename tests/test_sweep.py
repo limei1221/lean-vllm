@@ -30,12 +30,12 @@ class TestCacheFlags:
         assert lean["num-kvcache-blocks"] == vllm["num-gpu-blocks-override"]
 
     def test_the_block_size_is_pinned_too_so_the_arithmetic_holds(self):
-        assert sweep.cache_flags(args("--kvcache-tokens", "1024"))["kvcache-block-size"] == 256
-        assert sweep.cache_flags(args("--engine", "vllm", "--kvcache-tokens", "1024"))["block-size"] == 256
+        assert sweep.cache_flags(args("--kvcache-tokens", "1024"))["kvcache-block-size"] == 16
+        assert sweep.cache_flags(args("--engine", "vllm", "--kvcache-tokens", "1024"))["block-size"] == 16
 
     def test_unpinned_capacity_still_pins_the_block_size(self):
-        assert sweep.cache_flags(args()) == {"kvcache-block-size": 256}
-        assert sweep.cache_flags(args("--engine", "vllm")) == {"block-size": 256}
+        assert sweep.cache_flags(args()) == {"kvcache-block-size": 16}
+        assert sweep.cache_flags(args("--engine", "vllm")) == {"block-size": 16}
 
 
 class TestServerCommand:
