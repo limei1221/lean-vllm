@@ -280,7 +280,7 @@ already overlap the GPU.
 1. **Cut the cost of steps above 512 tokens.** They are half the engine time at
    the plateau. Either extend capture to larger token buckets, weighing the
    padding tax recorded in
-   [`docs/piecewise-cuda-graphs.md`](../docs/piecewise-cuda-graphs.md), or
+   [`docs/online-serving.md`](../docs/online-serving.md#cuda-graphs), or
    compile the non-attention pieces for fusion. Then rerun loads 48 and 64.
 2. **Repeat load 32, and repeat every plateau point.** This confirms or
    dismisses the load-32 TTFT and paired-token anomaly, and puts error bars on
