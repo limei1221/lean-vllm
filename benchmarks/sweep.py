@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -92,8 +93,14 @@ def starvation_suite(args) -> list[Arm]:
     ]
 
 
+def async_suite(args) -> list[Arm]:
+    """Launching the next step before draining the last. vLLM takes the same flag."""
+    return [Arm(f"async-scheduling={on}", {"async-scheduling": on}) for on in (False, True)]
+
+
 SUITES = {
     "rate": rate_suite,
+    "async": async_suite,
     "chunked": chunked_suite,
     "budget": budget_suite,
     "policy": policy_suite,
@@ -190,6 +197,10 @@ def client_args(args, arm: Arm, rate: float):
     return bench.parse_args(argv + args.client_args)    # the operator's flags win
 
 
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def row(arm: Arm, rate: float, result: dict) -> dict:
     summary = result["summary"]
     server = result["server"]["after"] or {}
@@ -213,6 +224,8 @@ def row(arm: Arm, rate: float, result: dict) -> dict:
         "model_busy_fraction": server.get("model_busy_fraction"),
         "mean_batch_tokens": server.get("mean_batch_tokens"),
         "preemptions": server.get("preemptions"),
+        "started_at": result.get("started_at"),
+        "finished_at": result.get("finished_at"),
     }
 
 
@@ -295,7 +308,9 @@ def main(argv: list[str] | None = None) -> int:
         for rate in args.rates:
             stem = f"{arm.name}-rate{rate:g}"
             with Server(args, arm, out / f"{stem}.server.log"):
+                started_at = utc_now()    # the client run's wall-clock bounds, for the GPU log
                 result = bench.run(client_args(args, arm, rate))
+                result["started_at"], result["finished_at"] = started_at, utc_now()
             (out / f"{stem}.json").write_text(json.dumps(result, indent=2))
             entry = row(arm, rate, result)
             rows.append(entry)

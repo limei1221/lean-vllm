@@ -54,3 +54,13 @@ class TestServerCommand:
     def test_vllm_is_served_by_its_own_binary(self):
         command = sweep.server_command(args("--engine", "vllm"), sweep.Arm("a"))
         assert command[:2] == ["vllm", "serve"]
+
+
+class TestAsyncSuite:
+
+    def test_both_arms_reach_either_engine_as_the_paired_flag(self):
+        arms = sweep.async_suite(args())
+        for engine in ("lean-vllm", "vllm"):
+            off, on = (sweep.server_command(args("--engine", engine), arm) for arm in arms)
+            assert "--no-async-scheduling" in off
+            assert "--async-scheduling" in on
