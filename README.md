@@ -65,7 +65,7 @@ The attention backend is picked automatically and can be forced with
 ## Serving
 
 ```bash
-uv run lean-vllm serve ~/huggingface/Qwen3-0.6B --port 8000 --served-model-name qwen
+uv run lean-vllm serve ~/workspace/huggingface/Qwen3-0.6B --port 8000 --served-model-name qwen
 ```
 
 An OpenAI-compatible server: `/v1/completions`, `/v1/chat/completions` (both
@@ -122,7 +122,7 @@ uv run python benchmarks/bench_serving.py --dataset lognormal --request-rate 8
 and stopping the server for each.
 
 ```bash
-uv run python benchmarks/sweep.py --model ~/huggingface/Qwen3-8B \
+uv run python benchmarks/sweep.py --model ~/workspace/huggingface/Qwen3-8B \
     --suite rate --rates 1,2,4,8,16 --num-kvcache-blocks 8192 --out results/8b
 ```
 

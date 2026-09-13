@@ -1,6 +1,6 @@
 r"""Runs `bench_serving` across arms and rates, restarting the server per arm.
 
-    uv run python benchmarks/sweep.py --model ~/huggingface/Qwen3-8B \
+    uv run python benchmarks/sweep.py --model ~/workspace/huggingface/Qwen3-8B \
         --suite rate --rates 1,2,4,8,16 --num-kvcache-blocks 8192 --out results/8b
 
 One arm is one server configuration; a rate sweep across it draws the

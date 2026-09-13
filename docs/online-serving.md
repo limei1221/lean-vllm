@@ -9,7 +9,7 @@ together, with preemption and an optional fairness policy.
 
 ```bash
 uv sync --extra serve
-uv run lean-vllm serve ~/huggingface/Qwen3-8B --port 8000 --served-model-name qwen
+uv run lean-vllm serve ~/workspace/huggingface/Qwen3-8B --port 8000 --served-model-name qwen
 ```
 
 `--served-model-name` is the id the server answers to. Without it, the model
@@ -190,7 +190,7 @@ batch is one row wide. It is there to be compared, not believed.
 
 ```bash
 uv run python benchmarks/bench_serving.py --dataset lognormal --request-rate 8
-uv run python benchmarks/sweep.py --model ~/huggingface/Qwen3-8B \
+uv run python benchmarks/sweep.py --model ~/workspace/huggingface/Qwen3-8B \
     --suite rate --rates 1,2,4,8,16 --kvcache-tokens 327680 --out results/8b
 ```
 

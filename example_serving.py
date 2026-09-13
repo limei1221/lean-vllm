@@ -1,6 +1,6 @@
 """example.py's two prompts, over HTTP with the official OpenAI SDK.
 
-    uv run lean-vllm serve ~/huggingface/Qwen3-0.6B --served-model-name qwen
+    uv run lean-vllm serve ~/workspace/huggingface/Qwen3-0.6B --served-model-name qwen
     uv run python example_serving.py
 """
 

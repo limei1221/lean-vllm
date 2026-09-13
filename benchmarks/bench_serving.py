@@ -1,6 +1,6 @@
 r"""Open-loop serving benchmark: Poisson arrivals against lean-vLLM or vLLM.
 
-    uv run python benchmarks/bench_serving.py --model ~/huggingface/Qwen3-8B \
+    uv run python benchmarks/bench_serving.py --model ~/workspace/huggingface/Qwen3-8B \
         --dataset lognormal --num-requests 500 --request-rate 8
 
 Arrivals are **open loop**: request *i* is sent on schedule whatever is still

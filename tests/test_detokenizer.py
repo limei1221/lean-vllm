@@ -6,7 +6,7 @@ import pytest
 
 from lean_vllm.utils.detokenizer import IncrementalDetokenizer
 
-MODEL = os.path.expanduser(os.getenv("LEAN_VLLM_TEST_MODEL", "~/huggingface/Qwen3-0.6B"))
+MODEL = os.path.expanduser(os.getenv("LEAN_VLLM_TEST_MODEL", "~/workspace/huggingface/Qwen3-0.6B"))
 SPECIAL = 256
 
 
