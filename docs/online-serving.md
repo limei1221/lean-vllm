@@ -105,7 +105,7 @@ dropped rather than preempted forever.
 | `--num-kvcache-blocks` | profiled | pin it to hold cache capacity still across runs |
 | `--kvcache-block-size` | 16 | tokens per block |
 | `--enforce-eager` | off | on disables CUDA graphs |
-| `--async-scheduling` | off | on overlaps scheduling and batch prep with the forward pass; see [pipelined-steps.md](pipelined-steps.md) |
+| `--async-scheduling` | on | overlaps scheduling and batch prep with the forward pass; off under tensor parallelism; see [pipelined-steps.md](pipelined-steps.md) |
 
 Preemption recomputes rather than swaps, and a preempted sequence goes back to
 the head of the queue.

@@ -48,9 +48,9 @@ unaffected — but the compute for it is spent. A request ending by hitting
 its reserved tokens already reach the limit. EOS and client stop sequences
 still cost the one extra step.
 
-`async_scheduling` defaults to off and asserts `tensor_parallel_size == 1`:
-ranks above zero never see the sampled tokens, so turning it on without a
-broadcast of them would silently desync the workers.
+`async_scheduling` is on by default, as it is in vLLM. With
+`tensor_parallel_size` above 1 it turns itself off with a warning: ranks above
+zero never see the sampled tokens, so they could not follow.
 
 ## Why awaiting a step doesn't wait for the next one
 

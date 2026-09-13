@@ -1,8 +1,11 @@
+import logging
 import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
 from lean_vllm.engine.sequence import HASH_ALGOS
+
+logger = logging.getLogger(__name__)
 
 
 # Which kinds of step may replay a graph. Full covers pure decode, piecewise the
@@ -31,7 +34,7 @@ class Config:
     num_kvcache_blocks: int = -1
     enable_chunked_prefill: bool = True    # off is the pre-M2 shape, kept for the A/B
     enable_prefix_caching: bool = True     # off recomputes every prompt, kept for the A/B
-    async_scheduling: bool = False    # schedule the next step before awaiting the last
+    async_scheduling: bool = True    # schedule the next step before awaiting the last, as vLLM does
     prefix_caching_hash_algo: str = "sha256"    # or "xxhash", which is faster and not cryptographic
     scheduling_policy: str = "fcfs"    # or "priority"
     max_waiting_requests: int = 0      # 0 is unlimited
@@ -45,7 +48,9 @@ class Config:
         assert self.prefix_caching_hash_algo in HASH_ALGOS, \
             f"unknown prefix_caching_hash_algo {self.prefix_caching_hash_algo!r}, expected one of {sorted(HASH_ALGOS)}"
         assert 1 <= self.tensor_parallel_size <= 8
-        assert not (self.async_scheduling and self.tensor_parallel_size > 1), \
-            "async_scheduling needs the sampled tokens on the scheduling rank; tp>1 is unsupported"
+        if self.async_scheduling and self.tensor_parallel_size > 1:
+            # Ranks above zero never see the sampled tokens, so they could not follow.
+            logger.warning("async_scheduling is off: tensor_parallel_size > 1 does not support it")
+            self.async_scheduling = False
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

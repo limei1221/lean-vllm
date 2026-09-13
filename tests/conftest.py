@@ -32,7 +32,7 @@ class FakeConfig:
     max_waiting_requests: int = 0
     request_timeout: float = 0.0
     long_prefill_token_threshold: int = 0
-    async_scheduling: bool = False
+    async_scheduling: bool = False    # off, unlike Config: most tests count steps in sync order
 
 
 class FakeSampledTokens:
