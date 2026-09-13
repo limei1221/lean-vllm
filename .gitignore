@@ -201,3 +201,7 @@ results-*.tar.gz
 
 # Personal notes, not part of the project
 docs/llm_inference_engineering_projects.md
+
+# Subagent-driven development workspaces, specs and plans
+.superpowers/
+docs/superpowers/
