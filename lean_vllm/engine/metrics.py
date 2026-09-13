@@ -1,0 +1,278 @@
+"""Server-side metrics, as Prometheus text and as a JSON summary.
+
+Names mirror vLLM's under a `lean_vllm:` prefix, so one dashboard reads both.
+Hand-rolled, as that is less code than `prometheus_client`. One lock keeps a
+render from catching a histogram mid-update.
+"""
+
+import threading
+from time import perf_counter
+
+INF = float("inf")
+
+# Step kinds that replayed a graph; the rest name why the step ran eager.
+GRAPH_KINDS = ("graph", "piecewise")
+
+LATENCY_BUCKETS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0, INF)
+TPOT_BUCKETS = (0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, INF)
+STEP_BUCKETS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, INF)
+TOKEN_BUCKETS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, INF)
+BATCH_BUCKETS = (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, INF)
+
+
+def _number(value: float) -> str:
+    if value == INF:
+        return "+Inf"
+    return str(int(value)) if float(value).is_integer() else repr(value)
+
+
+class _Metric:
+    kind = ""
+
+    def __init__(self, name: str, documentation: str):
+        self.name = name
+        self.documentation = documentation
+
+    def _header(self) -> list[str]:
+        return [f"# HELP {self.name} {self.documentation}", f"# TYPE {self.name} {self.kind}"]
+
+
+class Counter(_Metric):
+    """A monotonic total, optionally broken out by one label."""
+
+    kind = "counter"
+
+    def __init__(self, name: str, documentation: str, label: str | None = None):
+        super().__init__(name, documentation)
+        self.label = label
+        # Ints, so a count stays a count in the JSON summary; only seconds go float.
+        self.values: dict[str | None, float] = {} if label else {None: 0}
+
+    def inc(self, amount: float = 1, label_value: str | None = None):
+        self.values[label_value] = self.values.get(label_value, 0) + amount
+
+    @property
+    def total(self) -> float:
+        return sum(self.values.values())
+
+    def render(self) -> list[str]:
+        lines = self._header()
+        for label_value, value in sorted(self.values.items(), key=lambda kv: kv[0] or ""):
+            suffix = f'{{{self.label}="{label_value}"}}' if label_value is not None else ""
+            lines.append(f"{self.name}{suffix} {_number(value)}")
+        return lines
+
+
+class Gauge(_Metric):
+    kind = "gauge"
+
+    def __init__(self, name: str, documentation: str):
+        super().__init__(name, documentation)
+        self.value: float = 0.0
+        self.peak: float = 0.0
+
+    def set(self, value: float):
+        self.value = value
+        self.peak = max(self.peak, value)
+
+    def render(self) -> list[str]:
+        return self._header() + [f"{self.name} {_number(self.value)}"]
+
+
+class Histogram(_Metric):
+    kind = "histogram"
+
+    def __init__(self, name: str, documentation: str, buckets: tuple[float, ...]):
+        super().__init__(name, documentation)
+        self.buckets = buckets
+        self.counts = [0] * len(buckets)
+        self.sum = 0.0
+        self.count = 0
+
+    def observe(self, value: float):
+        self.sum += value
+        self.count += 1
+        for i, bound in enumerate(self.buckets):
+            if value <= bound:
+                self.counts[i] += 1
+
+    @property
+    def mean(self) -> float | None:
+        return self.sum / self.count if self.count else None
+
+    def render(self) -> list[str]:
+        lines = self._header()
+        for bound, count in zip(self.buckets, self.counts):
+            lines.append(f'{self.name}_bucket{{le="{_number(bound)}"}} {count}')
+        lines.append(f"{self.name}_sum {self.sum!r}")
+        lines.append(f"{self.name}_count {self.count}")
+        return lines
+
+    def summary(self) -> dict:
+        return {"count": self.count, "sum": self.sum, "mean": self.mean}
+
+
+def _rate(numerator: float, denominator: float) -> float | None:
+    return numerator / denominator if denominator else None
+
+
+def gpu_utilization() -> float | None:
+    """GPU utilization as nvidia-smi reports it, for comparison only."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return float(torch.cuda.utilization())
+    except Exception:
+        return None    # no NVML, no CUDA, or a driver that will not answer
+
+
+class Metrics:
+
+    def __init__(self):
+        self.start_time = perf_counter()
+        self.lock = threading.Lock()
+
+        self.running = Gauge("lean_vllm:num_requests_running", "Requests in the running set.")
+        self.waiting = Gauge("lean_vllm:num_requests_waiting", "Requests in the waiting queue.")
+        self.kv_usage = Gauge("lean_vllm:gpu_cache_usage_perc", "Fraction of KV blocks in use.")
+
+        self.requests_received = Counter("lean_vllm:num_requests_received_total", "Requests admitted.")
+        self.requests_rejected = Counter("lean_vllm:num_requests_rejected_total", "Requests refused by admission control.")
+        self.requests_aborted = Counter("lean_vllm:num_requests_aborted_total", "Requests cancelled by their client.")
+        self.requests_finished = Counter(
+            "lean_vllm:request_success_total", "Requests that ran to a finish.", label="finish_reason"
+        )
+        self.preemptions = Counter("lean_vllm:num_preemptions_total", "Sequences preempted to free blocks.")
+
+        self.prompt_tokens = Counter("lean_vllm:prompt_tokens_total", "Prompt tokens of finished requests.")
+        self.generation_tokens = Counter("lean_vllm:generation_tokens_total", "Tokens generated by finished requests.")
+        self.prefill_tokens = Counter("lean_vllm:prefill_tokens_total", "Prompt tokens run through the model.")
+        self.decode_tokens = Counter("lean_vllm:decode_tokens_total", "Decode rows run through the model.")
+
+        self.prefix_cache_queries = Counter("lean_vllm:prefix_cache_queries_total", "Blocks looked up at admission.")
+        self.prefix_cache_hits = Counter("lean_vllm:prefix_cache_hits_total", "Blocks the prefix cache supplied.")
+
+        self.steps = Counter("lean_vllm:num_steps_total", "Forward passes.")
+        self.graph_steps = Counter("lean_vllm:num_graph_steps_total", "Forward passes replayed from a CUDA graph.")
+        self.eager_steps = Counter("lean_vllm:num_eager_steps_total", "Forward passes that ran eager.", label="reason")
+        # Share of the clock, not the count: eager steps take longer each.
+        self.step_seconds = Counter("lean_vllm:step_seconds_total", "Time in forward passes.", label="kind")
+        self.model_busy = Counter("lean_vllm:model_busy_seconds_total", "Wall seconds spent inside a step.")
+
+        self.ttft = Histogram("lean_vllm:time_to_first_token_seconds", "Arrival to first token.", LATENCY_BUCKETS)
+        self.tpot = Histogram("lean_vllm:time_per_output_token_seconds", "Mean seconds per token after the first.", TPOT_BUCKETS)
+        self.queue_time = Histogram("lean_vllm:request_queue_time_seconds", "Arrival to first schedule.", LATENCY_BUCKETS)
+        self.e2e = Histogram("lean_vllm:e2e_request_latency_seconds", "Arrival to finish.", LATENCY_BUCKETS)
+        self.request_prompt_tokens = Histogram("lean_vllm:request_prompt_tokens", "Prompt length.", TOKEN_BUCKETS)
+        self.request_generation_tokens = Histogram("lean_vllm:request_generation_tokens", "Completion length.", TOKEN_BUCKETS)
+        self.step_duration = Histogram("lean_vllm:step_duration_seconds", "Wall time of one step.", STEP_BUCKETS)
+        self.iteration_tokens = Histogram("lean_vllm:iteration_tokens_total", "Tokens in one step's batch.", BATCH_BUCKETS)
+
+    def record_received(self):
+        with self.lock:
+            self.requests_received.inc()
+
+    def record_rejected(self):
+        with self.lock:
+            self.requests_rejected.inc()
+
+    def record_aborted(self):
+        with self.lock:
+            self.requests_aborted.inc()
+
+    def record_step(self, scheduler, output, outputs, duration: float, step_kind: str):
+        with self.lock:
+            if output:    # a step that scheduled nothing ran no model
+                self.steps.inc()
+                if step_kind in GRAPH_KINDS:
+                    self.graph_steps.inc()
+                else:
+                    self.eager_steps.inc(label_value=step_kind)
+                self.step_seconds.inc(duration, label_value=step_kind)
+                self.model_busy.inc(duration)
+                self.step_duration.observe(duration)
+                self.iteration_tokens.observe(output.num_prefill_tokens + output.num_decode_tokens)
+                self.prefill_tokens.inc(output.num_prefill_tokens)
+                self.decode_tokens.inc(output.num_decode_tokens)
+            self.preemptions.inc(len(output.preempted))
+            self.prefix_cache_queries.inc(output.num_queried_blocks)
+            self.prefix_cache_hits.inc(output.num_cached_blocks)
+            self.running.set(len(scheduler.running))
+            self.waiting.set(len(scheduler.waiting))
+            self.kv_usage.set(scheduler.block_manager.usage)
+            for request_output in outputs:
+                if request_output.finished:
+                    self._record_finished(request_output)
+
+    def _record_finished(self, request_output):
+        self.requests_finished.inc(label_value=request_output.finish_reason)
+        metrics = request_output.metrics
+        if metrics is None:
+            return
+        self.prompt_tokens.inc(metrics.num_prompt_tokens)
+        self.generation_tokens.inc(metrics.num_completion_tokens)
+        self.request_prompt_tokens.observe(metrics.num_prompt_tokens)
+        self.request_generation_tokens.observe(metrics.num_completion_tokens)
+        for histogram, value in (
+            (self.ttft, metrics.ttft),
+            (self.tpot, metrics.tpot),
+            (self.queue_time, metrics.queue_time),
+            (self.e2e, metrics.e2e),
+        ):
+            if value is not None:
+                histogram.observe(value)
+
+    def render(self) -> str:
+        """Prometheus text exposition format."""
+        with self.lock:
+            lines = []
+            for metric in vars(self).values():
+                if isinstance(metric, _Metric):
+                    lines += metric.render()
+            return "\n".join(lines) + "\n"
+
+    def summary(self) -> dict:
+        """What the benchmark records beside its own client-side numbers."""
+        with self.lock:
+            uptime = perf_counter() - self.start_time
+            return {
+                "uptime_seconds": uptime,
+                # Fraction of wall clock in a forward pass. nvidia-smi counts any
+                # kernel as busy, so it reads high; it is only for comparison.
+                "model_busy_fraction": _rate(self.model_busy.total, uptime),
+                "gpu_utilization_percent_nvidia_smi": gpu_utilization(),
+                "steps": self.steps.total,
+                "graph_step_fraction": _rate(self.graph_steps.total, self.steps.total),
+                "eager_steps": dict(sorted(self.eager_steps.values.items())),
+                "step_seconds": dict(sorted(self.step_seconds.values.items())),
+                "mean_step_seconds": self.step_duration.mean,
+                "mean_batch_tokens": self.iteration_tokens.mean,
+                "prefix_cache_hit_rate": _rate(self.prefix_cache_hits.total, self.prefix_cache_queries.total),
+                "requests": {
+                    "received": self.requests_received.total,
+                    "rejected": self.requests_rejected.total,
+                    "aborted": self.requests_aborted.total,
+                    "finished": dict(sorted(self.requests_finished.values.items())),
+                    "running": self.running.value,
+                    "waiting": self.waiting.value,
+                    "waiting_peak": self.waiting.peak,
+                },
+                "tokens": {
+                    "prompt": self.prompt_tokens.total,
+                    "generation": self.generation_tokens.total,
+                    "prefill": self.prefill_tokens.total,
+                    "decode": self.decode_tokens.total,
+                },
+                "kv_cache_usage": self.kv_usage.value,
+                "kv_cache_usage_peak": self.kv_usage.peak,
+                "preemptions": self.preemptions.total,
+                # Percentiles are the client's job; these buckets are too coarse.
+                "latency": {
+                    "ttft": self.ttft.summary(),
+                    "tpot": self.tpot.summary(),
+                    "queue": self.queue_time.summary(),
+                    "e2e": self.e2e.summary(),
+                },
+            }

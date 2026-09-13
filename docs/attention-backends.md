@@ -1,6 +1,6 @@
 # Attention Backend Abstraction
 
-Status: interface + `TorchAttention` + `FlashAttentionBackend` landed, and
+Status: interface + `TorchAttention` + `FlashAttention3Backend` landed, and
 CUDA-graph capture is gated on `supports_cuda_graph()`.
 Not yet done: FlashInfer / FlashMLA.
 
@@ -32,7 +32,7 @@ AttentionBackend                  # store_kvcache / prefill / decode
       |
       +-- TorchAttention          # SDPA, any device, reference oracle
       |
-      +-- FlashAttentionBackend   # flash-attn + Triton scatter, CUDA only
+      +-- FlashAttention3Backend  # flash-attn 3 + Triton scatter, Hopper only
 ```
 
 `Attention.__init__` resolves a backend class once and instantiates it per
@@ -56,9 +56,51 @@ Identical across backends; sequences are packed, not padded.
 | `decode` q | `[batch_size, num_heads, head_dim]` |
 | `decode` returns | `[batch_size, num_heads, head_dim]` |
 
-`flash_attn_with_kvcache` returns a singleton query axis; the flash backend
-squeezes it so both backends return the same rank. An abstraction whose
-implementations return different shapes is not an abstraction.
+`flash_attn_with_kvcache` returns a singleton query axis in the decode shape;
+the flash backend squeezes it so both backends return the same rank. An
+abstraction whose implementations return different shapes is not an
+abstraction.
+
+### Which FlashAttention-3 entry point runs a prefill
+
+FA3 has two, and serving reaches both. The question each step asks is where its
+keys are, not whether it is a prefill:
+
+| step | call |
+|---|---|
+| no row carries cached keys | `flash_attn_varlen_func` on this step's k/v |
+| some row resumes | `flash_attn_with_kvcache` with `page_table` |
+
+FA2's varlen entry point took a `block_table`, so one call covered both. FA3's
+does not, so a step that has to read keys back goes through the kvcache entry
+point instead, which accepts packed queries through `cu_seqlens_q` and one key
+length per row through `cache_seqlens`.
+
+`keys_are_new` on the context is that question answered on the host, where the
+runner already knows it: cumulative query and key lengths are equal exactly when
+no row started from cached tokens. Reading it off the tensors instead would cost
+a sync per layer. Cold prompts and the first chunk of a long one take the varlen
+path and read k and v straight, with no page walk; a prefix-cache hit, a resumed
+chunk, or a decode row mixed into the batch sends the whole step through the
+pages.
+
+Which one a run actually exercises is worth knowing before reading any number
+from it. Chunked prefill admits new prompts into the same step as the running
+decodes, so a loaded server reaches the varlen path rarely: it belongs to steps
+with nothing running, to `bench_offline.py`, and to the chunked-prefill-off arm,
+whose steps are whole prompts and nothing else. Whether it is faster there is
+unmeasured.
+
+The move to FA3 is also what makes the 16-token page the default. FA2 rejected
+any paged block size that was not a multiple of 256, which forced a 256-token
+block and made the KV-cache comparison against vLLM a comparison at vLLM's
+non-default setting. FA3 walks a page table of any size.
+
+`is_available()` requires compute capability 9 rather than any CUDA device:
+FA3's kernels are Hopper's. On anything else selection falls through to
+`TorchAttention`, or raises if FA3 was named explicitly. Dao-AILab publishes no
+FA3 wheel, so `uv sync --extra cuda` installs a third-party build of it, pinned
+by URL and hash in `pyproject.toml`.
 
 ### Causal masking is bottom-right aligned
 
@@ -79,10 +121,27 @@ the two agree.
 matches the oracle *and* that the top-left result differs, so the test fails if
 it ever stops discriminating.
 
+## Mixed batches
+
+A step may hold prompt chunks and decode rows together. No backend change was
+needed for that: `prefill` already takes packed varlen sequences with
+`num_query_tokens < num_key_tokens` per row, so a decode row is simply a row
+whose query length is 1, and the bottom-right mask is already the right one.
+`test_mixed_batch_of_chunks_and_decodes` checks a batch of all three shapes —
+decode row, resumed chunk, cold prefill — against the dense oracle, and
+`test_mixed_batch_matches_running_the_rows_separately` checks that one mixed
+call equals the separate `prefill` and `decode` calls it replaces.
+
+`decode` survives as the pure-decode fast path, because it is the only shape a
+CUDA graph can capture. The runner selects it only when **no** row is a prompt
+chunk. "Every query length is 1" would be the wrong test: a prompt whose last
+chunk happens to be one token long also has query length 1, and it must take the
+varlen path so that `logits_indices` decides whether it samples.
+
 ## Backend selection
 
 `get_attention_backend()` resolves in order: explicit argument,
-`$INFERWEAVE_ATTENTION_BACKEND`, then the first available entry of `BACKENDS`.
+`$LEAN_VLLM_ATTENTION_BACKEND`, then the first available entry of `BACKENDS`.
 `TorchAttention.is_available()` is unconditionally true and sits last, so
 resolution cannot fail. Requesting an unavailable backend by name raises rather
 than silently falling back — a silent downgrade to a 50x slower backend during a
@@ -99,8 +158,8 @@ Agreement with it is evidence rather than tautology.
 
 Tests are parametrized over `(backend, device)` pairs filtered by
 `is_available()`, so the same file runs on a CPU-only laptop and, on a GPU box,
-additionally compares `TorchAttention` and `FlashAttentionBackend` on identical
-hardware.
+additionally compares `TorchAttention` and `FlashAttention3Backend` on
+identical hardware.
 
 The suite was validated by mutation testing — deliberately breaking the backend
 and confirming tests fail. Two mutations initially survived and both indicated

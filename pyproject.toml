@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "inferweave"
+name = "lean-vllm"
 version = "0.2.0"
 authors = [{ name = "Mei Li" }]
 license = "MIT"
@@ -18,44 +18,61 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+serve = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
 cuda = [
     "triton>=3.0.0",
-    # flash-attn wheels are built against a specific torch minor + CUDA major; pin torch to match.
-    # uv resolves all extras into one lock, so this pin holds in every environment, not just this extra.
-    "torch>=2.9,<2.10",
-    # exact version, so the source-build fallback below matches the pinned wheel
-    "flash-attn==2.8.3",
+    # The torch vLLM 0.26.0 pins, so a benchmark compares engines rather than
+    # PyTorch releases. uv resolves all extras into one lock, so this pin holds
+    # in every environment, not just this extra.
+    "torch==2.11.0",
+    # A prebuilt wheel, pinned by URL below. Scoped to the one platform that
+    # wheel is built for, so nothing else can resolve the squatted PyPI name.
+    "flash-attn-3; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
+
+[project.scripts]
+lean-vllm = "lean_vllm.entrypoints.cli:main"
 
 # a group, not an extra: uv installs it on a bare `uv sync`
 [dependency-groups]
-dev = ["pytest"]
+dev = [
+    "pytest",
+    "httpx",       # what the openai SDK speaks: the benchmark client and the ASGI tests
+    "httpx2",      # starlette's testclient prefers it and warns when it falls back to httpx
+    # the server itself, so `uv run pytest tests/` runs the whole suite rather than
+    # skipping the two modules that importorskip fastapi
+    "lean-vllm[serve]",
+    # example_serving.py. Pinned below 3: openai 3.x streams over httpx2, which
+    # prints a cosmetic teardown traceback that makes a working example look broken.
+    "openai>=2.0.0,<3",
+]
 
 [project.urls]
-Homepage="https://github.com/limei1221/inferweave"
+Homepage="https://github.com/limei1221/lean-vllm"
 Upstream="https://github.com/GeeeekExplorer/nano-vllm"
 
+[tool.pytest.ini_options]
+filterwarnings = [
+    # starlette 1.6.0 imports a deprecated anyio alias; drop this when it stops.
+    'ignore:The anyio\.abc\.BlockingPortal alias is deprecated:DeprecationWarning',
+    # torch.utils.mkldnn, pulled in by @torch.compile's inductor import, still uses
+    # torch.jit.script_method internally. torch warning about its own API; drop on upgrade.
+    'ignore:`torch\.jit\.script_method` is deprecated:DeprecationWarning',
+]
+
 [tool.uv]
-required-version = ">=0.10"    # extra-build-dependencies is stable from 0.10
+required-version = ">=0.12"    # what wrote the committed lock
 
-# flash-attn provides prebuilt wheels on GitHub with encoded torch minor, CUDA major, and ABI. Use these to avoid local CUDA compilation.
+# Dao-AILab publishes no FA3 wheel, and its source build wants nvcc and tens of
+# minutes. This is a third-party build of their hopper tree at git e2743ab,
+# against CUDA 13.0 and torch 2.11, which is the torch pinned above. The lock
+# carries the file's hash. Anything built for another torch minor will not load.
 [tool.uv.sources]
-flash-attn = [
-    { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version >= '3.12'" },
-]
-
-# Fallback when no wheel above matches — notably Linux on Python 3.10/3.11 and
-# aarch64 (the aarch64 wheel is unverified, so it resolves from PyPI instead):
-[tool.uv.extra-build-dependencies]
-flash-attn = [
-    { requirement = "torch", match-runtime = true },
-    "psutil",
-    "setuptools",
-    "wheel",
-    "packaging",
-    "einops",
-]
+flash-attn-3 = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn_3-3.0.0%2Bcu130torch2.11gite2743ab-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl" }
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["inferweave*"]
+include = ["lean_vllm*"]

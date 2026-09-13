@@ -1,0 +1,144 @@
+from collections import OrderedDict
+from typing import Iterable
+
+from lean_vllm.engine.sequence import Sequence
+
+
+class Block:
+
+    def __init__(self, block_id):
+        self.block_id = block_id
+        self.ref_count = 0
+        self.hash = -1
+        self.token_ids = []
+
+    def update(self, hash: int, token_ids: list[int]):
+        self.hash = hash
+        self.token_ids = token_ids
+
+    def reset(self):
+        self.ref_count = 1
+        self.hash = -1
+        self.token_ids = []
+
+
+class FreeBlockQueue:
+    """Free blocks in eviction order, least recently released first.
+
+    Free blocks keep their contents, so a prefix hit removes one from the middle:
+    hence an OrderedDict, not a deque.
+    """
+
+    def __init__(self, block_ids: Iterable[int]):
+        self._ids: OrderedDict[int, None] = OrderedDict.fromkeys(block_ids)
+
+    def popleft(self) -> int:
+        return self._ids.popitem(last=False)[0]
+
+    def append(self, block_id: int):
+        self._ids[block_id] = None
+
+    def remove(self, block_id: int):
+        del self._ids[block_id]
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def __iter__(self):
+        return iter(self._ids)
+
+
+class BlockManager:
+
+    def __init__(self, num_blocks: int, block_size: int, enable_prefix_caching: bool = True):
+        self.block_size = block_size
+        self.enable_prefix_caching = enable_prefix_caching
+        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+        self.hash_to_block_id: dict[int, int] = dict()
+        self.free_block_ids = FreeBlockQueue(range(num_blocks))
+        self.used_block_ids: set[int] = set()
+
+    @property
+    def usage(self) -> float:
+        return len(self.used_block_ids) / len(self.blocks) if self.blocks else 0.0
+
+    def _allocate_block(self) -> int:
+        block_id = self.free_block_ids.popleft()
+        block = self.blocks[block_id]
+        assert block.ref_count == 0
+        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
+            del self.hash_to_block_id[block.hash]
+        block.reset()
+        self.used_block_ids.add(block_id)
+        return block_id
+
+    def _deallocate_block(self, block_id: int):
+        assert self.blocks[block_id].ref_count == 0
+        self.used_block_ids.remove(block_id)
+        self.free_block_ids.append(block_id)
+
+    def can_allocate(self, seq: Sequence) -> int:
+        """Cached blocks seq would get, or -1 if the rest does not fit.
+
+        The trailing block is always recomputed: attention needs at least one query token.
+        """
+        num_cached_blocks = 0
+        num_new_blocks = seq.num_blocks
+        for i in range(seq.num_blocks - 1) if self.enable_prefix_caching else ():
+            block_id = self.hash_to_block_id.get(seq.block_hashes[i], -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != seq.block(i):
+                break
+            num_cached_blocks += 1
+            if block_id in self.used_block_ids:
+                num_new_blocks -= 1    # already held, so it costs no free block
+        if len(self.free_block_ids) < num_new_blocks:
+            return -1
+        return num_cached_blocks
+
+    def allocate(self, seq: Sequence, num_cached_blocks: int):
+        assert not seq.block_table
+        for i in range(num_cached_blocks):
+            block_id = self.hash_to_block_id[seq.block_hashes[i]]
+            block = self.blocks[block_id]
+            if block_id in self.used_block_ids:
+                block.ref_count += 1
+            else:
+                block.ref_count = 1
+                self.free_block_ids.remove(block_id)
+                self.used_block_ids.add(block_id)
+            seq.block_table.append(block_id)
+        for i in range(num_cached_blocks, seq.num_blocks):
+            seq.block_table.append(self._allocate_block())
+        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        seq.num_published_blocks = num_cached_blocks
+
+    def deallocate(self, seq: Sequence):
+        for block_id in reversed(seq.block_table):
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+        seq.num_cached_tokens = 0
+        seq.num_published_blocks = 0    # the new block table has published nothing
+        seq.block_table.clear()
+
+    def can_append(self, seq: Sequence) -> bool:
+        return len(self.free_block_ids) >= (seq.num_planned_tokens % self.block_size == 1)
+
+    def may_append(self, seq: Sequence):
+        if seq.num_planned_tokens % self.block_size == 1:
+            seq.block_table.append(self._allocate_block())
+
+    def hash_blocks(self, seq: Sequence, num_computed_tokens: int):
+        """Publish each full block once its KV is computed and its tokens are known.
+
+        These differ only when steps overlap and a reserved token runs the computed count ahead.
+        """
+        if not self.enable_prefix_caching:
+            return
+        end = min(num_computed_tokens, seq.num_tokens) // self.block_size
+        for i in range(seq.num_published_blocks, end):
+            block = self.blocks[seq.block_table[i]]
+            block.update(seq.block_hashes[i], seq.block(i))
+            self.hash_to_block_id[block.hash] = block.block_id
+        seq.num_published_blocks = max(seq.num_published_blocks, end)
