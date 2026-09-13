@@ -214,6 +214,9 @@ class Scheduler:
             elif still_running or output.scheduled:
                 self._preempt(seq, output)
                 return False
+            elif seq.num_pending_tokens:
+                still_running.append(seq)    # its in-flight token may stop it; decide after reconcile
+                return False
             else:
                 # Alone in the cache and still short of a block: it can never fit.
                 self.block_manager.deallocate(seq)
@@ -258,8 +261,6 @@ class Scheduler:
             if seq.num_cached_tokens < seq.num_planned_tokens:
                 continue    # prefill or recomputation unfinished, so this row samples nothing
             seq.is_prefill = False
-            if seq.first_token_time is None:
-                seq.first_token_time = perf_counter()
             seq.reserve_token()
             rows.append(LaunchedRow(seq, seq.num_preemptions))
         return rows
@@ -272,6 +273,8 @@ class Scheduler:
             if seq.is_finished or seq.num_preemptions != row.num_preemptions:
                 continue    # aborted, finished or requeued since the launch; the token is void
             seq.commit_token(token_id)
+            if seq.first_token_time is None:
+                seq.first_token_time = perf_counter()    # when the token reaches the host, not at launch
             stepped.append(seq)
             if (token_id == self.eos and not seq.ignore_eos) or token_id in seq.stop_token_ids:
                 reason = "stop"    # ignore_eos covers the eos token only, not client stop tokens

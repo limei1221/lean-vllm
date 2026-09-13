@@ -196,7 +196,8 @@ class LLMEngine:
             output = self._launch()
         with record_function("detokenize"):
             outputs = [self._output(seq) for seq in stepped]
-        outputs += [self._dropped(seq) for seq in output.dropped]
+        # A request dropped right after its token was reconciled already has its final output.
+        outputs += [self._dropped(seq) for seq in output.dropped if seq not in stepped]
         # output is this call's own launch, attributed once, here, at launch time.
         self.metrics.record_step(
             self.scheduler, output, outputs, perf_counter() - started, self.model_runner.step_kind,

@@ -112,3 +112,35 @@ class TestAsyncScheduling:
                 engine.run_to_completion()
             rates.append(engine.metrics.summary()["prefix_cache_hit_rate"])
         assert rates[0] == rates[1]
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_an_eos_that_fills_the_cache_still_stops(make_engine, async_scheduling):
+    """A launch must not drop a request for capacity while its token is in flight."""
+    engine = make_engine(eos_after={"r": 0}, num_kvcache_blocks=1, async_scheduling=async_scheduling)
+    seq = engine.add(list(range(8)), SamplingParams(max_tokens=4), request_id="r")
+    engine.run_to_completion()
+    assert seq.finish_reason == "stop"
+    assert seq.num_completion_tokens == 1
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_a_capacity_drop_after_a_token_finishes_once(make_engine, async_scheduling):
+    engine = make_engine(num_kvcache_blocks=1, async_scheduling=async_scheduling)
+    seq = engine.add(list(range(7)), FOREVER, request_id="r")
+    finals = []
+    while not engine.is_finished():
+        finals += [output for output in engine.step() if output.finished]
+    assert [output.finish_reason for output in finals] == ["capacity"]
+    assert engine.metrics.summary()["requests"]["finished"] == {"capacity": 1}
+    assert seq.num_completion_tokens == 2
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_the_first_token_is_timed_when_it_is_read_back(make_engine, async_scheduling):
+    engine = make_engine(async_scheduling=async_scheduling)
+    seq = engine.add([10, 11, 12], FOREVER)
+    engine.step()
+    assert seq.first_token_time is None    # sampled, not yet read back
+    engine.step()
+    assert seq.first_token_time is not None

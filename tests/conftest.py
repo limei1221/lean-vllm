@@ -139,7 +139,7 @@ class FakeEngine:
                 finish_reason=seq.finish_reason,
                 metrics=seq.metrics(),
             )
-            for seq in output.dropped
+            for seq in output.dropped if seq not in stepped
         ]
         # output is this call's own launch, attributed once, here, at launch time.
         self.metrics.record_step(self.scheduler, output, outputs, perf_counter() - started, "enforced")
