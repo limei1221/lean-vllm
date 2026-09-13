@@ -32,6 +32,17 @@ class FakeConfig:
     max_waiting_requests: int = 0
     request_timeout: float = 0.0
     long_prefill_token_threshold: int = 0
+    async_scheduling: bool = False
+
+
+class FakeSampledTokens:
+    """What ModelRunner.run returns, without torch."""
+
+    def __init__(self, token_ids: list[int]):
+        self._token_ids = token_ids
+
+    def tolist(self) -> list[int]:
+        return self._token_ids
 
 
 class FakeModelRunner:
@@ -48,20 +59,31 @@ class FakeModelRunner:
     def call(self, method_name, *args):
         return getattr(self, method_name)(*args)
 
-    def run(self, seqs: list[Sequence]) -> list[int]:
+    def run(self, seqs: list[Sequence]) -> "FakeSampledTokens":
         is_prefill = any(seq.is_prefill for seq in seqs)
         self.batches.append((is_prefill, [(seq.request_id, seq.num_scheduled_tokens) for seq in seqs]))
-        return [self._token(seq) for seq in seqs if self._samples(seq)]
+        return FakeSampledTokens([self._token(seq) for seq in seqs if self._samples(seq)])
 
     @staticmethod
     def _samples(seq: Sequence) -> bool:
-        return seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens
+        return seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_planned_tokens
+
+    @staticmethod
+    def _completion_index(seq: Sequence) -> int:
+        """Which completion token this row is about to produce.
+
+        Read off the batch rather than off committed tokens: a step's token is
+        not committed until the step after it, and a recomputed suffix must
+        reproduce the same ids it produced the first time.
+        """
+        return seq.num_cached_tokens + seq.num_scheduled_tokens - seq.num_prompt_tokens
 
     def _token(self, seq: Sequence) -> int:
         limit = self.eos_after.get(seq.request_id)
-        if limit is not None and seq.num_completion_tokens >= limit:
+        index = self._completion_index(seq)
+        if limit is not None and index >= limit:
             return EOS
-        return 1000 + seq.seq_id * 100 + seq.num_completion_tokens
+        return 1000 + seq.seq_id * 100 + index
 
     def exit(self):
         pass
@@ -70,12 +92,14 @@ class FakeModelRunner:
 class FakeEngine:
     """LLMEngine.step without the model. Mirrors it deliberately: change both together."""
 
+
     def __init__(self, config: FakeConfig, runner: FakeModelRunner):
         self.config = config
         self.scheduler = Scheduler(config)
         self.model_runner = runner
         self.metrics = Metrics()
         self.last_output = None
+        self.in_flight = None
         self.profiler = None    # real LLMEngine exposes one; the async loop reads it
 
     def add(self, prompt: list[int], sampling_params: SamplingParams | None = None, request_id: str | None = None) -> Sequence:
@@ -90,11 +114,13 @@ class FakeEngine:
 
     def step(self) -> list[RequestOutput]:
         started = perf_counter()
-        output = self.last_output = self.scheduler.schedule()
-        stepped = []
-        if output:
-            token_ids = self.model_runner.call("run", output.scheduled)
-            stepped = self.scheduler.postprocess(output.scheduled, token_ids)
+        draining, self.in_flight = self.in_flight, None
+        if self.config.async_scheduling:
+            output = self._launch()
+            stepped = self._reconcile(draining)
+        else:
+            stepped = self._reconcile(draining)
+            output = self._launch()
         outputs = [
             RequestOutput(
                 request_id=seq.request_id,
@@ -104,7 +130,8 @@ class FakeEngine:
                 metrics=seq.metrics() if seq.is_finished else None,
             )
             for seq in stepped
-        ] + [
+        ]
+        outputs += [
             RequestOutput(
                 request_id=seq.request_id,
                 token_ids=[],
@@ -114,11 +141,26 @@ class FakeEngine:
             )
             for seq in output.dropped
         ]
-        self.metrics.record_step(self.scheduler, output, outputs, perf_counter() - started, step_kind="enforced")
+        # output is this call's own launch, attributed once, here, at launch time.
+        self.metrics.record_step(self.scheduler, output, outputs, perf_counter() - started, "enforced")
         return outputs
 
+    def _launch(self):
+        output = self.last_output = self.scheduler.schedule()
+        if output:
+            pending = self.model_runner.call("run", output.scheduled)
+            rows = self.scheduler.advance(output.scheduled)
+            self.in_flight = (output, rows, pending)
+        return output
+
+    def _reconcile(self, draining) -> list[Sequence]:
+        if draining is None:
+            return []
+        _, rows, pending = draining
+        return self.scheduler.reconcile(rows, pending.tolist())
+
     def is_finished(self):
-        return self.scheduler.is_finished()
+        return self.in_flight is None and self.scheduler.is_finished()
 
     def run_to_completion(self, max_steps: int = 500) -> dict[str, list[int]]:
         """Completion token ids per request, as generate() would accumulate them."""
@@ -172,6 +214,7 @@ def _reset_sequence_globals():
 def make_engine():
     def _make(eos_after: dict[int, int] | None = None, **overrides) -> FakeEngine:
         config = FakeConfig(**overrides)
+        Sequence.counter = count()    # each engine gets its own seq ids, so two engines compare like-for-like
         Sequence.block_size = config.kvcache_block_size
         Sequence.enable_prefix_caching = config.enable_prefix_caching
         Sequence.hash_algo = config.prefix_caching_hash_algo

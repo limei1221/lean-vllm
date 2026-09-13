@@ -14,7 +14,7 @@ class SchedulerOutput:
     scheduled: list[Sequence] = field(default_factory=list)
     preempted: list[Sequence] = field(default_factory=list)
     dropped: list[Sequence] = field(default_factory=list)    # finished without ever sampling
-    # Counted while scheduling: postprocess() clears num_scheduled_tokens.
+    # Counted while scheduling: advance() clears num_scheduled_tokens.
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
     num_queried_blocks: int = 0    # prefix cache, counted at admission
@@ -22,6 +22,17 @@ class SchedulerOutput:
 
     def __bool__(self):
         return bool(self.scheduled)
+
+
+@dataclass(slots=True)
+class LaunchedRow:
+    """One sampling row of a launched step, and what reconciling it needs.
+
+    The preemption count is taken at launch: a row can be requeued between the
+    launch and its tokens arriving, and then its token is void.
+    """
+    seq: Sequence
+    num_preemptions: int
 
 
 class QueueFull(Exception):
@@ -72,6 +83,7 @@ class Scheduler:
             return False
         queue = self.waiting if seq.status == SequenceStatus.WAITING else self.running
         queue.remove(seq)    # both queues expose remove()
+        seq.drop_pending()
         self.block_manager.deallocate(seq)
         self._finish(seq, "abort")
         return True
@@ -93,6 +105,9 @@ class Scheduler:
             seq = self.running.popleft()
             if budget <= 0 or len(output.scheduled) >= self.max_num_seqs:
                 still_running.append(seq)    # left untouched this step
+                continue
+            if seq.num_planned_tokens - seq.num_prompt_tokens >= seq.max_tokens:
+                still_running.append(seq)    # its reserved tokens already reach the limit
                 continue
             if not seq.is_prefill:    # decoding, so the cache grows
                 if not self._make_room(seq, still_running, output):
@@ -210,6 +225,7 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         seq.num_preemptions += 1
+        seq.drop_pending()    # the in-flight token is discarded and recomputed
         self.block_manager.deallocate(seq)
         self.waiting.requeue(seq)
         output.preempted.append(seq)
@@ -221,25 +237,41 @@ class Scheduler:
 
     def _drop(self, seq: Sequence, reason: str, output: SchedulerOutput | None = None):
         self._finish(seq, reason)
+        seq.drop_pending()
         del self.seqs[seq.request_id]
         if output is not None:
             output.dropped.append(seq)    # the caller is still owed a final output
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[Sequence]:
-        """Returns the sequences that produced a token; a partial prefill produces none."""
-        stepped = []
-        tokens = iter(token_ids)    # only the rows that sampled produced one
+    def advance(self, seqs: list[Sequence]) -> list[LaunchedRow]:
+        """Move bookkeeping forward with no token values. Returns the sampling rows.
+
+        The order matches the sampler's, which is the order prepare_batch built
+        logits_indices in, so reconcile() can zip rows against token ids.
+        """
+        rows = []
         for seq in seqs:
-            self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            if seq.num_cached_tokens < seq.num_tokens:
-                continue    # prefill/recomputation not finished, so no logits for this sequence
-            token_id = next(tokens)
-            seq.append_token(token_id)
+            # Every scheduled row, before the skip below, exactly as postprocess
+            # did: a chunked prefill publishes each block as the chunk lands.
+            self.block_manager.hash_blocks(seq, seq.num_cached_tokens)
+            if seq.num_cached_tokens < seq.num_planned_tokens:
+                continue    # prefill or recomputation unfinished, so this row samples nothing
             seq.is_prefill = False
             if seq.first_token_time is None:
                 seq.first_token_time = perf_counter()
+            seq.reserve_token()
+            rows.append(LaunchedRow(seq, seq.num_preemptions))
+        return rows
+
+    def reconcile(self, rows: list[LaunchedRow], token_ids: list[int]) -> list[Sequence]:
+        """Commit the sampled tokens and run the stop checks. Returns the rows that produced one."""
+        stepped = []
+        for row, token_id in zip(rows, token_ids):
+            seq = row.seq
+            if seq.is_finished or seq.num_preemptions != row.num_preemptions:
+                continue    # aborted, finished or requeued since the launch; the token is void
+            seq.commit_token(token_id)
             stepped.append(seq)
             if (token_id == self.eos and not seq.ignore_eos) or token_id in seq.stop_token_ids:
                 reason = "stop"    # ignore_eos covers the eos token only, not client stop tokens
@@ -247,6 +279,7 @@ class Scheduler:
                 reason = "length"
             else:
                 continue
+            seq.drop_pending()    # a later step may already have reserved one
             self.block_manager.deallocate(seq)
             self.running.remove(seq)
             self._drop(seq, reason)

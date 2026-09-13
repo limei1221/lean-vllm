@@ -12,3 +12,4 @@ class SamplingParams:
 
     def __post_init__(self):
         assert self.temperature >= 0
+        assert self.max_tokens >= 1

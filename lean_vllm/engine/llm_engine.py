@@ -1,6 +1,6 @@
 import atexit
 import os
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -12,7 +12,8 @@ from lean_vllm.sampling_params import SamplingParams
 from lean_vllm.engine.output import RequestOutput
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.engine.metrics import Metrics
-from lean_vllm.engine.scheduler import InvalidRequest, QueueFull, Scheduler
+from lean_vllm.engine.sampled_tokens import SampledTokens
+from lean_vllm.engine.scheduler import InvalidRequest, LaunchedRow, QueueFull, Scheduler, SchedulerOutput
 from lean_vllm.engine.model_runner import ModelRunner
 from lean_vllm.utils.detokenizer import IncrementalDetokenizer
 
@@ -41,8 +42,11 @@ class _StepProfiler:
     ``LEAN_PROFILE_DIR`` to enable it; ``LEAN_PROFILE_SKIP`` steps pass before
     capture starts, to clear warmup and the load ramp, and ``LEAN_PROFILE_STEPS``
     steps are captured. The ``record_function`` ranges in the step loop label the
-    host phases -- schedule, prepare_batch, run_model, sample, postprocess,
-    detokenize -- so their wall-clock share is read straight off the trace.
+    host phases -- schedule, prepare_batch, run_model, sample, launch,
+    await_tokens, reconcile, detokenize -- so their wall-clock share is read
+    straight off the trace. ``await_tokens`` is where the host blocks on the
+    device, so idle no longer hides inside ``sample`` the way it did in the
+    12 September trace.
 
     CPU activity only by default: online, ``step()`` runs on the engine thread
     while CUDA was initialised on the main thread, and kineto refuses to collect
@@ -108,6 +112,14 @@ class _StepProfiler:
             )
 
 
+@dataclass(slots=True)
+class _InFlight:
+    """A launched step, waiting for its tokens."""
+    output: SchedulerOutput
+    rows: list[LaunchedRow]
+    pending: SampledTokens
+
+
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
@@ -132,6 +144,7 @@ class LLMEngine:
         self.scheduler = Scheduler(config)
         self.metrics = Metrics()
         self.detokenizers: dict[str, IncrementalDetokenizer] = {}
+        self.in_flight: _InFlight | None = None
         self.profiler = _StepProfiler.from_env()
         atexit.register(self.exit)
 
@@ -166,23 +179,49 @@ class LLMEngine:
         return aborted
 
     def step(self) -> tuple[list[RequestOutput], int, int]:
+        """Launch one step and drain the one launched before it.
+
+        With async_scheduling the launch goes first, so the GPU has this step
+        queued while the host reconciles and detokenizes the last one. Without
+        it, the last step's tokens are awaited before this one is scheduled, and
+        only detokenization overlaps.
+        """
         started = perf_counter()
-        with record_function("schedule"):
-            output = self.scheduler.schedule()
-        stepped = []
-        if output:
-            with record_function("forward"):
-                token_ids = self.model_runner.call("run", output.scheduled)
-            with record_function("postprocess"):
-                stepped = self.scheduler.postprocess(output.scheduled, token_ids)
+        draining, self.in_flight = self.in_flight, None
+        if self.config.async_scheduling:
+            output = self._launch()
+            stepped = self._reconcile(draining)
+        else:
+            stepped = self._reconcile(draining)
+            output = self._launch()
         with record_function("detokenize"):
-            outputs = [self._output(seq) for seq in stepped] + [self._dropped(seq) for seq in output.dropped]
+            outputs = [self._output(seq) for seq in stepped]
+        outputs += [self._dropped(seq) for seq in output.dropped]
+        # output is this call's own launch, attributed once, here, at launch time.
         self.metrics.record_step(
-            self.scheduler, output, outputs, perf_counter() - started, self.model_runner.step_kind
+            self.scheduler, output, outputs, perf_counter() - started, self.model_runner.step_kind,
         )
         if self.profiler is not None:
             self.profiler.step()
         return outputs, output.num_prefill_tokens, output.num_decode_tokens
+
+    def _launch(self) -> SchedulerOutput:
+        with record_function("schedule"):
+            output = self.scheduler.schedule()
+        if output:
+            with record_function("launch"):
+                pending = self.model_runner.call("run", output.scheduled)
+                rows = self.scheduler.advance(output.scheduled)
+            self.in_flight = _InFlight(output, rows, pending)
+        return output
+
+    def _reconcile(self, draining: "_InFlight | None") -> list[Sequence]:
+        if draining is None:
+            return []
+        with record_function("await_tokens"):
+            token_ids = draining.pending.tolist()
+        with record_function("reconcile"):
+            return self.scheduler.reconcile(draining.rows, token_ids)
 
     def _output(self, seq: Sequence) -> RequestOutput:
         token_id = seq.last_token
@@ -211,7 +250,7 @@ class LLMEngine:
         )
 
     def is_finished(self):
-        return self.scheduler.is_finished()
+        return self.in_flight is None and self.scheduler.is_finished()
 
     def generate(
         self,

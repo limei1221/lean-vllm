@@ -8,6 +8,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from lean_vllm.attention import get_attention_backend
 from lean_vllm.config import Config, FULL_MODES, PIECEWISE_MODES
+from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.models.qwen3 import Qwen3ForCausalLM
 from lean_vllm.layers.attention import register_layers
@@ -38,6 +39,8 @@ class ModelRunner:
         if rank == 0:
             logger.info("attention backend: %s", attention_backend.get_name())
         self.step_kind = "enforced"    # how the last step ran: see _step_kind
+        self._prev_tokens: SampledTokens | None = None    # the step still in flight, if any
+        self._prev_rows: dict[int, int] | None = None       # seq_id -> its row in those tokens
         self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
                               or not attention_backend.supports_cuda_graph())
         self.cudagraph_mode = "none" if self.enforce_eager else config.cudagraph_mode
@@ -159,20 +162,30 @@ class ModelRunner:
         cu_seqlens_q, cu_seqlens_k = [0], [0]
         max_seqlen_q = max_seqlen_k = 0
         context_lens, logits_indices, temperatures = [], [], []
+        pending_dst, pending_src, sampling_rows = [], [], []
         is_prefill = any(seq.is_prefill for seq in seqs)
 
         for seq in seqs:
             start = seq.num_cached_tokens
             end = start + seq.num_scheduled_tokens
-            input_ids.extend(seq[start:end] if seq.is_prefill else [seq.last_token])
+            if seq.is_prefill:
+                assert not seq.num_pending_tokens, "a prefill row carries a pending token"
+                input_ids.extend(seq[start:end])
+            else:
+                if seq.num_pending_tokens:
+                    # Sampled by a step still in flight; the device copy fixes it below.
+                    pending_dst.append(len(input_ids))
+                    pending_src.append(self._prev_row(seq))
+                input_ids.append(seq.last_token)
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seq.num_scheduled_tokens)
             cu_seqlens_k.append(cu_seqlens_k[-1] + end)
             max_seqlen_q = max(seq.num_scheduled_tokens, max_seqlen_q)
             max_seqlen_k = max(end, max_seqlen_k)
             context_lens.append(end)
-            if end == seq.num_tokens:    # the prompt is complete, so this row samples
+            if end == seq.num_planned_tokens:    # nothing left to prefill, so this row samples
                 logits_indices.append(cu_seqlens_q[-1] - 1)
+                sampling_rows.append(seq)
                 if self.rank == 0:    # only the sampling rank owns sampling parameters
                     temperatures.append(seq.temperature)
             if not seq.block_table:    # warmup
@@ -206,10 +219,29 @@ class ModelRunner:
             logits_indices=dev.make_tensor(logits_indices, torch.int64, self.device) if is_prefill else None,
         )
         input_ids = dev.make_tensor(input_ids, torch.int64, self.device)
+        if pending_dst:
+            prev = self._prev_tokens.device_tokens()
+            num_pending = len(pending_dst)
+            if pending_dst == list(range(num_pending)) == pending_src:
+                # The pending rows are the first n of both, so one slice does it.
+                # Slice prev too: the previous step may have sampled more rows
+                # than this one, whenever a request finished in between.
+                input_ids[:num_pending] = prev[:num_pending]
+            else:
+                dst = dev.make_tensor(pending_dst, torch.int64, self.device)
+                src = dev.make_tensor(pending_src, torch.int64, self.device)
+                input_ids.index_copy_(0, dst, prev.index_select(0, src))
         positions = dev.make_tensor(positions, torch.int64, self.device)
         all_greedy = all(temperature == 0 for temperature in temperatures)
         temperatures = None if all_greedy else dev.make_tensor(temperatures, torch.float32, self.device)
+        self._sampling_rows = sampling_rows
         return input_ids, positions, temperatures, is_prefill
+
+    def _prev_row(self, seq: Sequence) -> int:
+        """Where this sequence sampled in the step still in flight."""
+        row = self._prev_rows.get(seq.seq_id) if self._prev_rows else None
+        assert row is not None, "a pending token but no row in the launched step"
+        return row
 
     def _step_kind(self, is_prefill: bool, num_tokens: int) -> str:
         """How this step runs: "graph", "piecewise", or why it must run eager.
@@ -290,15 +322,21 @@ class ModelRunner:
         graphs["tail"].replay()
         return buffers["output"][:num_tokens]
 
-    def run(self, seqs: list[Sequence]) -> list[int]:
+    def run(self, seqs: list[Sequence]) -> SampledTokens | None:
+        """Prepare, launch and sample. The tokens are not fetched here; the engine awaits them."""
         with record_function("prepare_batch"):
             input_ids, positions, temperatures, is_prefill = self.prepare_batch(seqs)
         with record_function("run_model"):
             logits = self.run_model(input_ids, positions, is_prefill)
         with record_function("sample"):
-            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
         reset_context()
-        return token_ids
+        if tokens is None:
+            return None
+        pending = SampledTokens(tokens, self.device)
+        self._prev_tokens = pending
+        self._prev_rows = {seq.seq_id: i for i, seq in enumerate(self._sampling_rows)}
+        return pending
 
     def _piecewise_buckets(self) -> list[int]:
         """Token counts to capture at: small steps only, none padded past a quarter.

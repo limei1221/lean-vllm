@@ -112,6 +112,7 @@ class BlockManager:
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
+        seq.num_published_blocks = num_cached_blocks
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -120,23 +121,28 @@ class BlockManager:
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
+        seq.num_published_blocks = 0    # the new block table has published nothing
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        return len(self.free_block_ids) >= (seq.num_planned_tokens % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
+        if seq.num_planned_tokens % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
-    def hash_blocks(self, seq: Sequence):
-        """Publish the blocks this step just filled. Chunks need not align: the
-        bounds are token counts, so a block enters the cache once it is whole."""
+    def hash_blocks(self, seq: Sequence, num_computed_tokens: int):
+        """Publish every full block that is finished, and publish each one once.
+
+        A block is publishable only once its KV is computed and its token values
+        are known here. Those two limits are the same until steps overlap, when a
+        reserved token puts the computed count ahead of the real one.
+        """
         if not self.enable_prefix_caching:
             return
-        start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
-        for i in range(start, end):
+        end = min(num_computed_tokens, seq.num_tokens) // self.block_size
+        for i in range(seq.num_published_blocks, end):
             block = self.blocks[seq.block_table[i]]
             block.update(seq.block_hashes[i], seq.block(i))
             self.hash_to_block_id[block.hash] = block.block_id
+        seq.num_published_blocks = max(seq.num_published_blocks, end)

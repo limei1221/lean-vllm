@@ -53,6 +53,8 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
+        self.num_pending_tokens = 0    # reserved by a launched step, not yet sampled here
+        self.num_published_blocks = 0    # blocks already in the prefix cache
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
@@ -97,6 +99,11 @@ class Sequence:
         return self.num_tokens - self.num_prompt_tokens
 
     @property
+    def num_planned_tokens(self):
+        """Length once every reserved token lands. What allocation must cover."""
+        return self.num_tokens + self.num_pending_tokens
+
+    @property
     def prompt_token_ids(self):
         return self.token_ids[:self.num_prompt_tokens]
 
@@ -106,11 +113,7 @@ class Sequence:
 
     @property
     def num_blocks(self):
-        return (self.num_tokens + self.block_size - 1) // self.block_size
-
-    @property
-    def last_block_num_tokens(self):
-        return self.num_tokens - (self.num_blocks - 1) * self.block_size
+        return (self.num_planned_tokens + self.block_size - 1) // self.block_size
 
     def block(self, i):
         assert 0 <= i < self.num_blocks
@@ -131,18 +134,32 @@ class Sequence:
             prefix = self.block_hashes[-1] if self.block_hashes else -1
             self.block_hashes.append(algo(tuple(self.block(i)), prefix))
 
-    def append_token(self, token_id: int):
+    def reserve_token(self):
+        """A launched step will sample here; the value is not known yet."""
+        self.num_pending_tokens += 1
+
+    def commit_token(self, token_id: int):
+        assert self.num_pending_tokens, "commit_token without a reservation"
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+        self.num_pending_tokens -= 1
         self._extend_block_hashes()
+
+    def append_token(self, token_id: int):
+        self.reserve_token()
+        self.commit_token(token_id)
+
+    def drop_pending(self):
+        """Give up reserved tokens, on preemption, abort or finish."""
+        self.num_pending_tokens = 0
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.is_prefill, self.block_table, last_state)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_pending_tokens, self.is_prefill, self.block_table, last_state)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.is_prefill, self.block_table, last_state = state
+        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_pending_tokens, self.is_prefill, self.block_table, last_state) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

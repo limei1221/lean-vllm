@@ -94,6 +94,8 @@ the server does not serve is a 404 — `/v1/models` lists the name it answers to
 Every engine flag is a `Config` field; `lean-vllm serve --help` lists them.
 [docs/online-serving.md](docs/online-serving.md) covers the endpoints, the
 scheduling flags and admission control.
+[docs/pipelined-steps.md](docs/pipelined-steps.md) covers how `step` overlaps
+detokenization and batch preparation with the forward pass.
 
 ## Benchmarks
 

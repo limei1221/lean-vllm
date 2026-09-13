@@ -11,7 +11,7 @@ import sys
 from time import sleep
 
 from lean_vllm.engine import sequence
-from lean_vllm.engine.scheduler import DuplicateRequestId, QueueFull
+from lean_vllm.engine.scheduler import DuplicateRequestId, QueueFull, SchedulerOutput
 from lean_vllm.sampling_params import SamplingParams
 
 FOREVER = SamplingParams(max_tokens=64, ignore_eos=True)
@@ -57,7 +57,8 @@ class TestStreaming:
     def test_a_token_is_reported_every_step(self, make_engine):
         engine = make_engine()
         engine.add(prompt(8), SamplingParams(max_tokens=3, ignore_eos=True))
-        engine.step()    # prefill also samples the first token
+        engine.step()    # prefill launched; its token is still in flight
+        assert [(o.token_ids, o.finished) for o in engine.step()] == [([1000], False)]
         assert [(o.token_ids, o.finished) for o in engine.step()] == [([1001], False)]
         assert engine.step()[0].finished
 
@@ -66,7 +67,8 @@ class TestStreaming:
         engine.add(prompt(40), FOREVER)
         assert engine.step() == []
         assert engine.step() == []
-        assert len(engine.step()) == 1    # third chunk completes the prompt
+        assert engine.step() == []
+        assert len(engine.step()) == 1    # fourth call drains the chunk that completed the prompt
 
 
 class TestFinishReason:
@@ -138,6 +140,7 @@ class TestAbort:
         assert seq.block_table == []
         block_manager = engine.scheduler.block_manager
         assert not block_manager.used_block_ids.intersection(blocks)
+        engine.step()    # drains the in-flight step launched before the abort
         assert engine.is_finished()
 
     def test_aborting_an_unknown_request_is_a_no_op(self, make_engine):
@@ -232,8 +235,8 @@ class TestChunkedPrefill:
         engine.step()
         engine.step()
         assert [n for _, n in engine.model_runner.batches[2][1]] == [8]
+        engine.step()    # drains the chunk that completed the prompt
         assert seq.num_completion_tokens == 1    # only the final chunk samples
-        engine.step()
         assert engine.model_runner.batches[3] == (False, [(seq.request_id, 1)])
 
     def test_leftover_budget_partly_prefills_the_next_sequence(self, make_engine):
@@ -406,13 +409,14 @@ class TestAdmissionControl:
         oversized = engine.add(prompt(9), FOREVER)
         small = engine.add(prompt(8, 100), SamplingParams(max_tokens=1))
 
-        outputs = {output.request_id: output for output in engine.step()}
+        dropped = {output.request_id: output for output in engine.step()}
+        assert oversized.request_id in dropped
+        assert dropped[oversized.request_id].finish_reason == "capacity"
+        assert dropped[oversized.request_id].token_ids == []
 
-        assert oversized.request_id in outputs
-        assert outputs[oversized.request_id].finish_reason == "capacity"
-        assert outputs[oversized.request_id].token_ids == []
-        assert outputs[small.request_id].finish_reason == "length"
-        assert len(outputs[small.request_id].token_ids) == 1
+        finished = {output.request_id: output for output in engine.step()}    # drains small's only step
+        assert finished[small.request_id].finish_reason == "length"
+        assert len(finished[small.request_id].token_ids) == 1
         assert engine.is_finished()
         assert not engine.scheduler.seqs
         assert not engine.scheduler.block_manager.used_block_ids
@@ -513,15 +517,77 @@ class TestLongPrompts:
         assert engine.model_runner.batches[0] == (True, [(first.request_id, 8), (second.request_id, 8)])
 
 
-class TestBatchCounts:
-    """postprocess() clears num_scheduled_tokens, so the counts must be taken at schedule time."""
+class TestAdvanceAndReconcile:
 
-    def test_counts_survive_postprocess(self, make_engine):
+    def test_together_they_do_what_one_pass_did(self, make_engine):
+        engine = make_engine()
+        seq = engine.add(prompt(8), FOREVER)
+        scheduled = engine.scheduler.schedule().scheduled
+        rows = engine.scheduler.advance(scheduled)
+        assert [row.seq for row in rows] == [seq]
+        assert seq.num_pending_tokens == 1
+        assert seq.num_cached_tokens == 8
+        stepped = engine.scheduler.reconcile(rows, [1234])
+        assert stepped == [seq]
+        assert seq.last_token == 1234
+        assert seq.num_pending_tokens == 0
+
+    def test_a_partial_prefill_reserves_nothing(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=4)
+        seq = engine.add(prompt(8), FOREVER)
+        rows = engine.scheduler.advance(engine.scheduler.schedule().scheduled)
+        assert rows == []
+        assert seq.num_pending_tokens == 0
+        assert seq.is_prefill
+
+    def test_a_chunk_publishes_its_blocks_before_the_prefill_finishes(self, make_engine):
+        """Otherwise a concurrent request sharing the prefix gets no cache hit until the end."""
+        engine = make_engine(max_num_batched_tokens=8)
+        seq = engine.add(prompt(24), FOREVER)
+        rows = engine.scheduler.advance(engine.scheduler.schedule().scheduled)
+        assert rows == []    # first chunk only, nothing samples yet
+        assert seq.num_published_blocks == 1
+        assert engine.scheduler.block_manager.hash_to_block_id
+
+    def test_a_row_preempted_since_the_launch_discards_its_token(self, make_engine):
+        """Its token is recomputed after requeueing, so accepting it would double-count."""
+        engine = make_engine()
+        seq = engine.add(prompt(8), FOREVER)
+        rows = engine.scheduler.advance(engine.scheduler.schedule().scheduled)
+        engine.scheduler.running.remove(seq)    # as _make_room does before preempting
+        engine.scheduler._preempt(seq, SchedulerOutput())
+        assert seq.num_pending_tokens == 0
+        assert engine.scheduler.reconcile(rows, [1234]) == []
+        assert seq.last_token == 7    # prompt(8) is range(8), so the token never landed
+
+    def test_a_row_aborted_since_the_launch_discards_its_token(self, make_engine):
+        engine = make_engine()
+        seq = engine.add(prompt(8), FOREVER)
+        rows = engine.scheduler.advance(engine.scheduler.schedule().scheduled)
+        assert engine.scheduler.abort(seq.request_id)
+        assert engine.scheduler.reconcile(rows, [1234]) == []
+        assert seq.finish_reason == "abort"
+
+    def test_a_finished_row_gives_up_its_reservation(self, make_engine):
+        """Otherwise the reserved token would be counted as a completion token."""
+        engine = make_engine()
+        seq = engine.add(prompt(8), SamplingParams(max_tokens=1))
+        rows = engine.scheduler.advance(engine.scheduler.schedule().scheduled)
+        engine.scheduler.reconcile(rows, [1234])
+        assert seq.finish_reason == "length"
+        assert seq.num_completion_tokens == 1
+        assert seq.num_pending_tokens == 0
+
+
+class TestBatchCounts:
+    """advance() clears num_scheduled_tokens, so the counts must be taken at schedule time."""
+
+    def test_counts_survive_advance(self, make_engine):
         engine = make_engine()
         engine.add(prompt(8), FOREVER)
         output = engine.scheduler.schedule()
         assert (output.num_prefill_tokens, output.num_decode_tokens) == (8, 0)
-        engine.scheduler.postprocess(output.scheduled, [1234])
+        engine.scheduler.reconcile(engine.scheduler.advance(output.scheduled), [1234])
         assert (output.num_prefill_tokens, output.num_decode_tokens) == (8, 0)
 
     def test_a_mixed_step_counts_both_kinds(self, make_engine):
@@ -557,3 +623,37 @@ class TestChunkedPrefillDisabled:
         seq = engine.add(prompt(40), FOREVER)
         engine.step()
         assert seq.finish_reason == "capacity"
+
+
+class TestTokenLimitGuard:
+
+    def test_a_row_at_its_limit_is_not_scheduled_again(self, make_engine):
+        """Its reserved tokens are already the last ones, so another step is wasted.
+
+        Every schedule() call sets num_scheduled_tokens, so each one is paired
+        with an advance() and the asserts read the result rather than calling it.
+        """
+        engine = make_engine()
+        seq = engine.add(prompt(8), SamplingParams(max_tokens=2))
+        engine.scheduler.advance(engine.scheduler.schedule().scheduled)    # prefill; reserves token 1
+        engine.scheduler.advance(engine.scheduler.schedule().scheduled)    # decode; reserves token 2
+        assert seq.num_pending_tokens == 2
+        assert engine.scheduler.schedule().scheduled == []
+        assert seq in engine.scheduler.running
+
+    def test_the_guard_is_inert_without_reservations(self, make_engine):
+        """With the flag off a finished row is dropped before the next schedule."""
+        engine = make_engine()
+        engine.add(prompt(8), SamplingParams(max_tokens=2))
+        assert engine.run_to_completion()
+        assert not engine.scheduler.running
+
+    def test_the_guard_works_with_chunked_prefill_disabled(self, make_engine):
+        """Decode steps reach the guard even without chunked prefill."""
+        engine = make_engine(enable_chunked_prefill=False)
+        seq = engine.add(prompt(8), SamplingParams(max_tokens=2))
+        engine.scheduler.advance(engine.scheduler.schedule().scheduled)    # prefill; reserves token 1
+        engine.scheduler.advance(engine.scheduler.schedule().scheduled)    # decode; reserves token 2
+        assert seq.num_pending_tokens == 2
+        assert engine.scheduler.schedule().scheduled == []
+        assert seq in engine.scheduler.running

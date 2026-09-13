@@ -19,6 +19,7 @@ def runner():
     runner.rank = 0
     runner.device = torch.device("cpu")
     runner.block_size = 8
+    runner._prev_tokens = runner._prev_rows = None
     yield runner
     reset_context()
 
@@ -50,6 +51,90 @@ def test_batch_preparation_on_tensor_parallel_ranks(runner, rank, decode):
         assert temperatures is None
     else:
         assert temperatures.tolist() == [0.5]
+
+
+def test_run_returns_tokens_that_are_not_yet_fetched(runner, make_engine):
+    """The engine awaits them later, so run() must not block on the device."""
+    from lean_vllm.engine.sampled_tokens import SampledTokens
+    engine = make_engine()
+    engine.add([10, 11, 12], SamplingParams(temperature=0.0))
+    scheduled = engine.scheduler.schedule().scheduled
+    runner.sampler = lambda logits, temperatures: torch.tensor([42], dtype=torch.int64)
+    runner.run_model = lambda ids, positions, is_prefill: torch.zeros(len(ids), 8)
+    runner.step_kind = "enforced"
+
+    pending = runner.run(scheduled)
+
+    assert isinstance(pending, SampledTokens)
+    assert pending.tolist() == [42]
+
+
+def test_a_pending_row_takes_its_input_from_the_previous_tokens(runner):
+    """Its token was sampled by a step still in flight, so the host value is stale."""
+    from lean_vllm.engine.sampled_tokens import SampledTokens
+    seq = Sequence([10, 11, 12], SamplingParams(temperature=0.0))
+    seq.num_cached_tokens, seq.num_scheduled_tokens, seq.is_prefill = 3, 1, False
+    seq.reserve_token()
+    runner._prev_tokens = SampledTokens(torch.tensor([77], dtype=torch.int64), torch.device("cpu"))
+    runner._prev_rows = {seq.seq_id: 0}
+
+    ids, positions, temperatures, is_prefill = runner.prepare_batch([seq])
+
+    assert ids.tolist() == [77]
+    assert positions.tolist() == [3]
+
+
+def test_the_fast_path_slices_a_previous_tensor_with_extra_rows(runner):
+    """A request can finish between steps, so the previous tensor may outgrow this one."""
+    from lean_vllm.engine.sampled_tokens import SampledTokens
+    seq1 = Sequence([10, 11, 12], SamplingParams(temperature=0.0))
+    seq1.num_cached_tokens, seq1.num_scheduled_tokens, seq1.is_prefill = 3, 1, False
+    seq1.reserve_token()
+    seq2 = Sequence([20, 21, 22], SamplingParams(temperature=0.0))
+    seq2.num_cached_tokens, seq2.num_scheduled_tokens, seq2.is_prefill = 3, 1, False
+    seq2.reserve_token()
+    runner._prev_tokens = SampledTokens(torch.tensor([77, 88, 99], dtype=torch.int64), torch.device("cpu"))
+    runner._prev_rows = {seq1.seq_id: 0, seq2.seq_id: 1}
+
+    ids, positions, temperatures, is_prefill = runner.prepare_batch([seq1, seq2])
+
+    assert ids.tolist() == [77, 88]
+
+
+def test_a_reordered_mapping_takes_the_general_path(runner):
+    """Rows need not line up with the previous tensor, so each looks up its own index."""
+    from lean_vllm.engine.sampled_tokens import SampledTokens
+    seq1 = Sequence([10, 11, 12], SamplingParams(temperature=0.0))
+    seq1.num_cached_tokens, seq1.num_scheduled_tokens, seq1.is_prefill = 3, 1, False
+    seq1.reserve_token()
+    seq2 = Sequence([20, 21, 22], SamplingParams(temperature=0.0))
+    seq2.num_cached_tokens, seq2.num_scheduled_tokens, seq2.is_prefill = 3, 1, False
+    seq2.reserve_token()
+    runner._prev_tokens = SampledTokens(torch.tensor([77, 88], dtype=torch.int64), torch.device("cpu"))
+    runner._prev_rows = {seq1.seq_id: 1, seq2.seq_id: 0}
+
+    ids, positions, temperatures, is_prefill = runner.prepare_batch([seq1, seq2])
+
+    assert ids.tolist() == [88, 77]
+
+
+def test_a_prefill_row_with_a_pending_token_is_refused(runner):
+    """It would slice token_ids for a value that has not been sampled."""
+    seq = Sequence([10, 11, 12], SamplingParams())
+    seq.num_scheduled_tokens = 3
+    seq.reserve_token()
+    with pytest.raises(AssertionError, match="pending"):
+        runner.prepare_batch([seq])
+
+
+def test_a_pending_row_with_no_previous_row_is_refused(runner):
+    """Every reserved token must be covered, or the batch silently uses a stale id."""
+    seq = Sequence([10, 11, 12], SamplingParams())
+    seq.num_cached_tokens, seq.num_scheduled_tokens, seq.is_prefill = 3, 1, False
+    seq.reserve_token()
+    runner._prev_tokens = runner._prev_rows = None
+    with pytest.raises(AssertionError, match="pending"):
+        runner.prepare_batch([seq])
 
 
 def test_an_all_greedy_batch_sends_no_temperatures(runner):
@@ -161,6 +246,12 @@ def test_preemption_recomputes_the_generated_suffix(runner, make_engine, chunked
     # The first request needs another block while the second is mid-block.
     for _ in range(16):
         engine.step()
+    # Drain the trailing in-flight step (first's last token) without launching
+    # another, so schedule() below sees fresh state instead of the fake
+    # runner's own already-launched recompute.
+    _, rows, pending = engine.in_flight
+    engine.scheduler.reconcile(rows, pending.tolist())
+    engine.in_flight = None
     assert first.is_finished
     assert second.num_preemptions == 1
     assert second.num_tokens == 20
@@ -173,7 +264,8 @@ def test_preemption_recomputes_the_generated_suffix(runner, make_engine, chunked
     assert positions.tolist() == [16, 17, 18, 19]
     assert get_context().logits_indices.tolist() == [3]
     assert temperatures.tolist() == [1.0]
-    stepped = engine.scheduler.postprocess(scheduled, [1112])
+    rows = engine.scheduler.advance(scheduled)
+    stepped = engine.scheduler.reconcile(rows, [1112])
     assert stepped == [second]
     assert second.num_completion_tokens == 13
     assert second.num_cached_tokens == 20
@@ -208,7 +300,8 @@ def test_recomputed_suffix_stays_prefill_across_chunks(runner, make_engine):
         # None until the chunk that samples: no row asks for a temperature before it.
         assert (temperatures.tolist() if last else temperatures) == ([1.0] if last else None)
         assert get_context().logits_indices.tolist() == ([0] if last else [])
-        stepped = engine.scheduler.postprocess(scheduled, [27] if last else [])
+        rows = engine.scheduler.advance(scheduled)
+        stepped = engine.scheduler.reconcile(rows, [27] if last else [])
         assert stepped == ([seq] if last else [])
 
     assert seq.completion_token_ids == [20, 21, 22, 23, 24, 25, 26, 27]

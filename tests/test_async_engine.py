@@ -95,6 +95,15 @@ class TestStreaming:
         await asyncio.sleep(0.05)
         assert engine.engine.model_runner.batches == []
 
+    @asyncio_test
+    async def test_the_last_token_of_a_request_is_not_lost(self, make_async_engine):
+        """The pipeline holds a step past the queues emptying, so the loop must drain it."""
+        engine = make_async_engine()
+        stream = await engine.add_request([10, 11, 12], SamplingParams(max_tokens=3, ignore_eos=True))
+        collected = [output async for output in stream]
+        assert sum(len(output.token_ids) for output in collected) == 3
+        assert collected[-1].finished
+
 
 class TestAbort:
 
@@ -150,7 +159,7 @@ class TestAbort:
         free_before = len(blocks.free_block_ids)
 
         outputs = await engine.add_request(prompt(8), FOREVER)
-        runner_of(engine).release()
+        runner_of(engine).release(2)    # the launch that emits nothing, then the one that drains it
         await outputs.__anext__()
         assert len(blocks.free_block_ids) < free_before
 
@@ -233,7 +242,7 @@ class TestEngineDeath:
     async def test_a_live_stream_gets_the_error(self, make_async_engine):
         engine = make_async_engine(gated=True)
         outputs = await engine.add_request(prompt(8), FOREVER)
-        runner_of(engine).release()
+        runner_of(engine).release(2)    # the launch that emits nothing, then the one that drains it
         await outputs.__anext__()
 
         kill(engine)
