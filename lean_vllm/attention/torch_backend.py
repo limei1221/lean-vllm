@@ -86,8 +86,7 @@ class TorchAttention(AttentionBackend):
 
     @staticmethod
     def _causal_mask(seqlen_q: int, seqlen_k: int, device: torch.device) -> torch.Tensor | None:
-        # Bottom-right aligned: query j sits at absolute position seqlen_k - seqlen_q + j.
-        # Not the same as SDPA is_causal=True, which aligns top-left and is wrong here.
+        # Bottom-right aligned, unlike SDPA's is_causal=True: query j sits at seqlen_k - seqlen_q + j.
         if seqlen_q == 1:
             return None
         q_pos = torch.arange(seqlen_k - seqlen_q, seqlen_k, device=device).unsqueeze(1)

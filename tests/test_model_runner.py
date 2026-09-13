@@ -246,9 +246,7 @@ def test_preemption_recomputes_the_generated_suffix(runner, make_engine, chunked
     # The first request needs another block while the second is mid-block.
     for _ in range(16):
         engine.step()
-    # Drain the trailing in-flight step (first's last token) without launching
-    # another, so schedule() below sees fresh state instead of the fake
-    # runner's own already-launched recompute.
+    # Drain the in-flight step without launching another, so schedule() below sees fresh state.
     _, rows, pending = engine.in_flight
     engine.scheduler.reconcile(rows, pending.tolist())
     engine.in_flight = None

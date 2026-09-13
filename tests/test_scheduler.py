@@ -1,7 +1,6 @@
 """The scheduler, against the fake runner in conftest: no model, no GPU.
 
-TestChunkedPrefillDisabled covers the `enable_chunked_prefill=False` arm, which
-is the pre-mixed-batch shape kept alive so the A/B has a "before".
+TestChunkedPrefillDisabled covers `enable_chunked_prefill=False`, kept as the A/B baseline.
 """
 
 import os
@@ -630,8 +629,7 @@ class TestTokenLimitGuard:
     def test_a_row_at_its_limit_is_not_scheduled_again(self, make_engine):
         """Its reserved tokens are already the last ones, so another step is wasted.
 
-        Every schedule() call sets num_scheduled_tokens, so each one is paired
-        with an advance() and the asserts read the result rather than calling it.
+        Each schedule() is paired with an advance(), so the asserts read its result.
         """
         engine = make_engine()
         seq = engine.add(prompt(8), SamplingParams(max_tokens=2))

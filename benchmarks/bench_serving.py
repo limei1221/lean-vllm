@@ -3,19 +3,12 @@ r"""Open-loop serving benchmark: Poisson arrivals against lean-vLLM or vLLM.
     uv run python benchmarks/bench_serving.py --model ~/workspace/huggingface/Qwen3-8B \
         --dataset lognormal --num-requests 500 --request-rate 8
 
-Arrivals are **open loop**: request *i* is sent on schedule whatever is still
-outstanding, so the offered load is the lambda it claims to be. A 429 is never
-retried, because a retry converts a rejection into an invisible queue. The
-percentiles cover completed requests only, so every table prints the rejection
-rate beside them -- an engine shedding 90% of its load would otherwise show an
-excellent p99. Non-429 failures are counted apart and abort the run past a
-threshold; they are bugs, not admission control.
+Open loop: requests go out on schedule whatever is outstanding. A 429 is never
+retried, and percentiles cover completed requests only, so every table shows the
+rejection rate beside them. Other failures are bugs and abort the run past a threshold.
 
-`/v1/completions` with token ids as the prompt, so the token counts in a trace
-are the token counts the engine sees, with no chat template varying by model.
-The same script points at vLLM: it drives the official OpenAI SDK and sends
-nothing outside its schema except `ignore_eos` and `priority`, which both
-engines accept.
+Prompts are token ids on `/v1/completions`, so no chat template skews the counts.
+Only `ignore_eos` and `priority` go outside the OpenAI schema; both engines accept them.
 """
 
 import argparse
@@ -73,11 +66,7 @@ class Result:
 
 
 def _prompt(rng: random.Random, num_tokens: int, vocab_size: int) -> list[int]:
-    """Random ids, so no two prompts share a prefix and the cache cannot flatter.
-
-    Drawn below `--vocab-size` to stay clear of the special tokens most
-    tokenizers put at the top of the vocabulary.
-    """
+    """Random ids below `--vocab-size`, so no prompts share a prefix or hit special tokens."""
     return [rng.randrange(vocab_size) for _ in range(num_tokens)]
 
 
@@ -104,11 +93,9 @@ def lognormal_trace(rng: random.Random, args) -> list[Request]:
 
 
 def mixed_trace(rng: random.Random, args) -> list[Request]:
-    """Short prompts sharing the engine with long ones: the starvation story.
+    """Short prompts beside long ones; read the `short` label's TTFT.
 
-    Read it off the `short` label's TTFT. `--long-priority 1` additionally makes
-    it the policy story, since only `--scheduling-policy priority` reads that
-    field.
+    `--long-priority 1` takes effect only under `--scheduling-policy priority`.
     """
     trace = []
     for _ in range(args.num_requests):
@@ -124,14 +111,7 @@ def mixed_trace(rng: random.Random, args) -> list[Request]:
 
 
 def prefix_trace(rng: random.Random, args) -> list[Request]:
-    """A few shared system prompts, a unique question behind each.
-
-    The workload prefix caching exists for, and the only one in this file where
-    it can show anything: every other trace draws ids at random, so no two
-    prompts share so much as a block. `--num-prefixes` sets how much of the
-    cache the shared part wants, and `--prefix-len` how much of each prompt the
-    cache can answer.
-    """
+    """A few shared system prompts, a unique question behind each: the only trace prefix caching helps."""
     prefixes = [_prompt(rng, args.prefix_len, args.vocab_size) for _ in range(args.num_prefixes)]
     trace = []
     for _ in range(args.num_requests):
@@ -160,8 +140,7 @@ def sharegpt_trace(rng: random.Random, args) -> list[Request]:
     for prompt, answer in pairs:
         prompt_token_ids = tokenizer(prompt).input_ids
         output_len = len(tokenizer(answer).input_ids)
-        # Degenerate turns say nothing about scheduling, and an over-long pair
-        # would be refused with a 400 rather than measured.
+        # Skip degenerate turns, and over-long pairs that would be a 400.
         if len(prompt_token_ids) < 4 or output_len < 4:
             continue
         if len(prompt_token_ids) + output_len > args.max_model_len:
@@ -263,15 +242,13 @@ async def one_request(api: AsyncOpenAI, args, index: int, request: Request, t0: 
         result.error = str(error)
         return run.finish(result)
     except Exception as error:
-        # Everything else is a failure, including an error the engine put in the
-        # stream after its 200 — the SDK raises APIError for those too.
+        # Anything else fails, including an error sent in the stream after a 200.
         result.error = f"{type(error).__name__}: {error}"
         return run.finish(result)
     if result.ttft is None:
         result.error = "the stream carried no tokens"
         return run.finish(result)
-    # A chunk is not a token -- detokenization holds bytes back -- so the usage
-    # count is the real one, and chunks are only the fallback.
+    # Detokenization holds bytes back, so chunks are not tokens: prefer the usage count.
     result.output_len = result.output_len or 1 + len(result.itls)
     result.status = "ok"
     return run.finish(result)
@@ -311,11 +288,7 @@ async def warmup(api: AsyncOpenAI, args):
 
 
 async def resolve_model_name(api: AsyncOpenAI, args) -> str:
-    """Whatever this server calls the model.
-
-    Both engines answer 404 to a name they do not serve, so a hardcoded default
-    is wrong somewhere. `/v1/models` is the one place to ask.
-    """
+    """Whatever this server calls the model; both engines 404 any other name."""
     if args.model_name:
         return args.model_name
     try:
@@ -325,10 +298,7 @@ async def resolve_model_name(api: AsyncOpenAI, args) -> str:
 
 
 async def server_summary(http: httpx.AsyncClient, base_url: str) -> dict | None:
-    """lean-vLLM's `/metrics.json`, which sits outside the OpenAI namespace.
-
-    vLLM serves no such endpoint, hence the None.
-    """
+    """lean-vLLM's `/metrics.json`, or None on vLLM, which has no such endpoint."""
     url = base_url.rstrip("/").removesuffix("/v1") + "/metrics.json"
     try:
         response = await http.get(url)
@@ -372,8 +342,7 @@ def summarize(results: list[Result], duration: float, split_labels: bool = True)
         "completed": len(completed),
         "rejected": rejected,
         "failed": failed,
-        # The percentiles below cover completed requests only; they mean nothing
-        # without these two beside them.
+        # Percentiles cover completed requests only, so show these beside them.
         "rejection_rate": rejected / total if total else None,
         "failure_rate": failed / total if total else None,
         "duration_seconds": duration,
@@ -485,18 +454,14 @@ def run(args) -> dict:
     """One trace against one server. `sweep.py` calls this, not the CLI."""
 
     async def go():
-        # A pool smaller than the offered load would queue inside the client and
-        # quietly turn the open loop into a closed one. The SDK's own default is
-        # 1000, which a high-rate sweep reaches.
+        # A pool smaller than the offered load would queue in the client and close the loop.
         limits = httpx.Limits(max_connections=args.max_connections, max_keepalive_connections=args.max_connections)
         async with httpx.AsyncClient(limits=limits, timeout=args.timeout) as http:
             api = AsyncOpenAI(
                 base_url=args.base_url,
                 api_key=args.api_key,
                 timeout=args.timeout,
-                # The rule the whole benchmark rests on: the SDK retries a 429
-                # twice by default, which would turn every rejection into an
-                # invisible queue and make the offered load a lie.
+                # The SDK retries a 429 twice by default, hiding rejections as a queue.
                 max_retries=0,
                 http_client=http,
             )

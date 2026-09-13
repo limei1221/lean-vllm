@@ -4,17 +4,12 @@ from torch import nn
 from lean_vllm.attention import AttentionBackend, get_attention_backend
 from lean_vllm.utils.context import get_context
 
-# A custom op takes tensors and primitives, not modules, so layers are addressed
-# by name through this registry. One per process; each TP worker has its own.
+# A custom op cannot take modules, so layers are looked up by name. One per process.
 _LAYERS: dict[str, "Attention"] = {}
 
 
 def register_layers(model: nn.Module):
-    """Name every attention layer, so `torch.ops.lean_vllm.attention` can find it.
-
-    Called once the model exists and before it runs, since the op resolves the
-    name on every forward.
-    """
+    """Name every attention layer, so `torch.ops.lean_vllm.attention` can find it. Call before forward."""
     for name, module in model.named_modules():
         if isinstance(module, Attention):
             module.layer_name = name
@@ -56,10 +51,7 @@ class Attention(nn.Module):
         self.layer_name = ""
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        # Through the op rather than straight to attend(): a custom op is opaque
-        # to torch.compile, so the graph splits here. That is what piecewise CUDA
-        # graph capture cuts on, and it keeps the context read and the is_prefill
-        # branch out of anything traced.
+        # Through the opaque op, so torch.compile splits the graph here for piecewise capture.
         return torch.ops.lean_vllm.attention(q, k, v, self.layer_name)
 
     def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):

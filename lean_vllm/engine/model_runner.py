@@ -19,8 +19,7 @@ from lean_vllm.utils import device as dev
 
 logger = logging.getLogger(__name__)
 
-# Piecewise buckets: the range of step sizes worth capturing, the smallest gap
-# between buckets, and the most padding a replay may add over the step it serves.
+# Piecewise buckets: step sizes worth capturing, minimum gap, and maximum replay padding.
 PIECEWISE_MIN_TOKENS = 64
 PIECEWISE_MAX_TOKENS = 512
 PIECEWISE_MIN_GAP = 16
@@ -209,8 +208,7 @@ class ModelRunner:
             cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, self.device),
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            # Equal cumulative lengths mean no row started from cached tokens, which
-            # is the batch a backend can attend without reading the cache back.
+            # Equal cumulative lengths: no row reads cached keys, so the cache can be skipped.
             keys_are_new=cu_seqlens_k == cu_seqlens_q,
             slot_mapping=dev.make_tensor(slot_mapping, torch.int32, self.device),
             context_lens=dev.make_tensor(context_lens, torch.int32, self.device),
@@ -223,9 +221,7 @@ class ModelRunner:
             prev = self._prev_tokens.device_tokens()
             num_pending = len(pending_dst)
             if pending_dst == list(range(num_pending)) == pending_src:
-                # The pending rows are the first n of both, so one slice does it.
-                # Slice prev too: the previous step may have sampled more rows
-                # than this one, whenever a request finished in between.
+                # Pending rows are the first n of both; prev may have more if a request finished.
                 input_ids[:num_pending] = prev[:num_pending]
             else:
                 dst = dev.make_tensor(pending_dst, torch.int64, self.device)
@@ -246,9 +242,7 @@ class ModelRunner:
     def _step_kind(self, is_prefill: bool, num_tokens: int) -> str:
         """How this step runs: "graph", "piecewise", or why it must run eager.
 
-        A pure-decode batch has one token per row, so num_tokens is its batch
-        size too. Each branch needs the graphs to exist, not just the mode: a
-        mode naming a capture that never happened falls through to eager.
+        For pure decode num_tokens is the batch size. A mode whose graphs were never captured runs eager.
         """
         if self.cudagraph_mode == "none":
             return "enforced"
@@ -257,8 +251,7 @@ class ModelRunner:
                 return "graph"
         if self.cudagraph_mode in PIECEWISE_MODES and self._piecewise_bucket(num_tokens):
             return "piecewise"
-        # "prefill" covers the large steps the piecewise grid deliberately leaves
-        # eager; "oversized" is a decode batch past the full-graph buckets.
+        # "prefill" is a step past the piecewise grid; "oversized" a decode batch past the full-graph buckets.
         return "prefill" if is_prefill else "oversized"
 
     @torch.inference_mode()
@@ -287,21 +280,14 @@ class ModelRunner:
         return graph_vars["outputs"][:bs]
 
     def _piecewise_bucket(self, num_tokens: int) -> int | None:
-        """The bucket a step of this size replays in, or None if there is none.
-
-        Shared by the dispatch and the replay so they cannot disagree about which
-        bucket -- or whether there is one -- for the same step.
-        """
+        """The bucket a step of this size replays in, or None. Shared so dispatch and replay agree."""
         bucket = next((size for size in self.piecewise_bs if size >= num_tokens), None)
         return None if bucket is None or num_tokens < self.piecewise_bs[0] else bucket
 
     def _replay_piecewise(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """A graph per piece, with attention run eager between them.
 
-        Pad rows compute alongside the real ones and are dropped. Nothing in a
-        piece mixes rows -- every op is per token -- so whatever the pad region
-        holds cannot reach a real one, and attention is handed the real rows
-        only, so no pad reaches the KV cache either.
+        Pieces are per token, so pad rows never touch real ones; attention sees only real rows.
         """
         num_tokens = input_ids.size(0)
         bucket = self._piecewise_bucket(num_tokens)
@@ -312,8 +298,7 @@ class ModelRunner:
         graphs["head"].replay()
         for layer, pre, post in zip(self.model.model.layers, graphs["pre"], graphs["post"]):
             pre.replay()
-            # The real rows only: attention reads this step's sequence layout,
-            # which is exactly what cannot go in a graph.
+            # Real rows only: attention reads this step's sequence layout, which no graph can hold.
             attn_out = layer.self_attn.attn(
                 buffers["q"][:num_tokens], buffers["k"][:num_tokens], buffers["v"][:num_tokens]
             )
@@ -341,8 +326,7 @@ class ModelRunner:
     def _piecewise_buckets(self) -> list[int]:
         """Token counts to capture at: small steps only, none padded past a quarter.
 
-        Capture pays where launching the pieces costs as much as running them,
-        which is small steps. Above the top bucket a step stays eager, as in vLLM.
+        Capture pays off only where launch overhead rivals compute; larger steps run eager, as in vLLM.
         """
         top = min(PIECEWISE_MAX_TOKENS, self.config.max_num_batched_tokens)
         sizes, size = [], PIECEWISE_MIN_TOKENS
@@ -356,9 +340,7 @@ class ModelRunner:
     def capture_piecewise(self):
         """Capture the model either side of attention, one graph per piece per bucket.
 
-        The pieces read and write fixed buffers, so a replay always finds its
-        inputs where the capture left them. They touch no context and no KV
-        cache -- that is what makes them capturable while attention is not.
+        Pieces use fixed buffers and touch no context or KV cache, which makes them capturable.
         """
         hf_config = self.config.hf_config
         layers = self.model.model.layers

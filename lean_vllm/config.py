@@ -8,8 +8,7 @@ from lean_vllm.engine.sequence import HASH_ALGOS
 logger = logging.getLogger(__name__)
 
 
-# Which kinds of step may replay a graph. Full covers pure decode, piecewise the
-# prefill and mixed steps that have to leave attention outside the capture.
+# Which steps may replay a graph: full for pure decode, piecewise for prefill and mixed.
 FULL_MODES = ("full", "full_and_piecewise")
 PIECEWISE_MODES = ("piecewise", "full_and_piecewise")
 CUDAGRAPH_MODES = ("none",) + FULL_MODES + ("piecewise",)
@@ -18,8 +17,7 @@ CUDAGRAPH_MODES = ("none",) + FULL_MODES + ("piecewise",)
 @dataclass(slots=True)
 class Config:
     model: str
-    # vLLM's own defaults for a server on an H100: it reads the device name and
-    # memory and tiers these up from 2048/256 once past an A100.
+    # vLLM's server defaults on an H100 (tiered up from 2048/256 past an A100).
     max_num_batched_tokens: int = 8192
     max_num_seqs: int = 1024
     max_model_len: int = 4096
@@ -32,7 +30,7 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 16
     num_kvcache_blocks: int = -1
-    enable_chunked_prefill: bool = True    # off is the pre-M2 shape, kept for the A/B
+    enable_chunked_prefill: bool = True    # off never mixes prefill and decode, kept for the A/B
     enable_prefix_caching: bool = True     # off recomputes every prompt, kept for the A/B
     async_scheduling: bool = True    # schedule the next step before awaiting the last, as vLLM does
     prefix_caching_hash_algo: str = "sha256"    # or "xxhash", which is faster and not cryptographic

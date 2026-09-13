@@ -1,9 +1,7 @@
 """The synchronous engine on a dedicated thread, with an async front door.
 
-`step()` blocks in C for a whole forward pass. Running it on the event loop
-would starve the HTTP handlers between steps and show up as TTFT jitter, so the
-loop owns a thread and talks to it through two queues: a thread-safe intake
-queue in, a per-request `asyncio.Queue` out.
+`step()` blocks for a whole forward pass, which would starve the HTTP handlers on
+the event loop. Requests go in on a thread-safe queue; outputs come back per request.
 """
 
 import asyncio
@@ -17,9 +15,7 @@ from lean_vllm.engine.llm_engine import LLMEngine
 from lean_vllm.engine.output import RequestOutput
 from lean_vllm.sampling_params import SamplingParams
 
-# The scheduler can hand back an empty step (a prompt that no longer fits the
-# cache, say). Nothing but intake can change that, but poll rather than block
-# forever so a wedged request cannot deadlock the loop.
+# Wait on intake after an empty step, but poll so a wedged request cannot deadlock the loop.
 IDLE_POLL = 0.005
 
 
@@ -165,8 +161,7 @@ class AsyncLLMEngine:
         except BaseException as error:
             self._die(error)
         finally:
-            # Flush the profiler here, on the engine thread that started it; the
-            # atexit path runs on the main thread and cannot stop it cleanly.
+            # Flush the profiler on the thread that started it; atexit runs on the main thread.
             if self.engine.profiler is not None:
                 self.engine.profiler.close()
 

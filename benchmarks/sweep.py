@@ -1,18 +1,13 @@
-r"""Runs `bench_serving` across arms and rates, restarting the server per arm.
+r"""Runs `bench_serving` across arms and rates, restarting the server per run.
 
     uv run python benchmarks/sweep.py --model ~/workspace/huggingface/Qwen3-8B \
-        --suite rate --rates 1,2,4,8,16 --num-kvcache-blocks 8192 --out results/8b
+        --suite rate --rates 1,2,4,8,16 --kvcache-tokens 131072 --out results/8b
 
-One arm is one server configuration; a rate sweep across it draws the
-goodput-against-p99 curve. Every run gets a freshly started server, so the
-`/metrics.json` beside it describes that run and not the one before it, and no
-run inherits the block pool the last one left. Runs go one at a time --
-`init_process_group` binds a fixed port, so only one engine fits on a machine.
+An arm is one server configuration. A fresh server per run keeps each run's
+`/metrics.json` and block pool its own. Runs go one at a time, since
+`init_process_group` binds a fixed port.
 
-Pin `--kvcache-tokens`. `warmup_model` sizes its warmup batch from
-`max_num_batched_tokens`, and on CUDA the cache is what is left after peak
-allocation, so changing the token budget silently changes the number of KV
-blocks and the budget sweep would measure two things at once.
+Pin `--kvcache-tokens`: otherwise the profiled cache size moves with the token budget.
 """
 
 import argparse
@@ -46,13 +41,9 @@ def rate_suite(args) -> list[Arm]:
 
 
 def chunked_suite(args) -> list[Arm]:
-    """Four runs, not two.
+    """Chunking on and off, each eager and with graphs.
 
-    Chunking on produces mixed steps that run eager; chunking off leaves
-    pure-decode steps that capture CUDA graphs. A two-run A/B would fuse the
-    scheduling change with the lost graph coverage. The eager pair isolates
-    scheduling and is the primary result, the default pair is the
-    deployment-realistic one, and the gap between the pairs is the graph effect.
+    Chunking changes which steps graphs cover, so the eager pair isolates scheduling.
     """
     return [
         Arm(f"chunked={chunked}-eager={eager}", {"enable-chunked-prefill": chunked, "enforce-eager": eager})
@@ -72,10 +63,7 @@ def policy_suite(args) -> list[Arm]:
 
 
 def prefix_suite(args) -> list[Arm]:
-    """What prefix caching is worth, and what the slower hash costs to get it.
-
-    Both engines take the same two flags, so the whole suite runs either side.
-    """
+    """What prefix caching is worth, and what the slower hash costs. Runs on either engine."""
     client = {"dataset": "prefix"}
     return [
         Arm("prefix-caching=off", {"enable-prefix-caching": False}, client),
@@ -85,7 +73,7 @@ def prefix_suite(args) -> list[Arm]:
 
 
 def starvation_suite(args) -> list[Arm]:
-    """The M2 knob: does capping one prompt's share of a step protect short ones?"""
+    """Does capping one prompt's share of a step protect short ones?"""
     client = {"dataset": "mixed"}
     return [
         Arm(f"long-prefill-threshold={threshold}", {"long-prefill-token-threshold": threshold}, client)
@@ -108,9 +96,7 @@ SUITES = {
     "starvation": starvation_suite,
 }
 
-# FA3 pages at any size, so lean-vLLM can meet vLLM on its own default of 16.
-# Pinned rather than left to each engine's default, because the two configure
-# capacity in blocks and the arithmetic below has to mean the same thing twice.
+# vLLM's default, which FA3 also takes; pinned so block counts mean the same on both engines.
 BLOCK_SIZE = 16
 
 
@@ -278,8 +264,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--startup-timeout", type=float, default=900.0)
     parser.add_argument("--out", default="results", help="directory for the per-run JSON and the summary")
-    # One quoted string each, so a flag starting with "-" cannot be mistaken
-    # for one of this parser's own.
+    # One quoted string each, so their flags are not parsed as this parser's.
     parser.add_argument("--server-args", default="", help='extra serve flags, e.g. "--max-num-seqs 64"')
     parser.add_argument("--client-args", default="", help='extra bench_serving flags, e.g. "--dataset mixed"')
     args = parser.parse_args(argv)

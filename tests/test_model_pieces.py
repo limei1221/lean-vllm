@@ -1,8 +1,6 @@
 """The decoder layer either side of attention, which is what piecewise capture takes.
 
-bf16 throughout, because that is what the runner sets the default dtype to and
-because RMSNorm's in-place arithmetic only copies its input when a cast is
-needed: in fp32 it would rewrite the caller's tensor.
+bf16 throughout, as in the runner: in fp32 RMSNorm's in-place arithmetic rewrites its input.
 """
 
 import pytest

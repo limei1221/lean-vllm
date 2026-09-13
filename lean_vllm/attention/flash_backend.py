@@ -44,7 +44,7 @@ class FlashAttention3Backend(AttentionBackend):
 
     @staticmethod
     def is_available() -> bool:
-        # FA3 is built for sm90 alone: Ampere has no wgmma and Blackwell is FA4's.
+        # FA3 is built for Hopper (sm90) only.
         return (_IMPORT_ERROR is None and torch.cuda.is_available()
                 and torch.cuda.get_device_capability()[0] == 9)
 
@@ -65,19 +65,15 @@ class FlashAttention3Backend(AttentionBackend):
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
         if context.keys_are_new or context.block_tables is None:
-            # k and v already hold every key this batch attends, so skip the page
-            # walk. Cold prompts and the first chunk of a long one land here.
+            # k and v hold every key this batch attends (cold prompts), so skip the pages.
             return flash_attn_varlen_func(
                 q, k, v,
                 cu_seqlens_q=context.cu_seqlens_q, cu_seqlens_k=context.cu_seqlens_k,
                 max_seqlen_q=context.max_seqlen_q, max_seqlen_k=context.max_seqlen_k,
                 softmax_scale=self.scale, causal=True,
             )
-        # Some row reads keys it computed on an earlier step. FA3's varlen entry
-        # point takes no page table, unlike FA2's, so those go through the kvcache
-        # one: queries packed as cu_seqlens_q says, one key length per row. The
-        # per-row key length is cu_seqlens_k's stride, matching the torch backend;
-        # context_lens is not part of the prefill contract (see test_prefill_*).
+        # Some row reads cached keys. FA3's varlen entry takes no page table, so use the
+        # kvcache one, with per-row key lengths from cu_seqlens_k as in the torch backend.
         cache_seqlens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
         return flash_attn_with_kvcache(
             q, k_cache, v_cache,

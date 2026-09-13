@@ -26,11 +26,7 @@ class SchedulerOutput:
 
 @dataclass(slots=True)
 class LaunchedRow:
-    """One sampling row of a launched step, and what reconciling it needs.
-
-    The preemption count is taken at launch: a row can be requeued between the
-    launch and its tokens arriving, and then its token is void.
-    """
+    """One sampling row of a launched step. A requeue after launch voids its token."""
     seq: Sequence
     num_preemptions: int
 
@@ -95,7 +91,7 @@ class Scheduler:
             output = self._schedule_whole_prompts()
             output.dropped = dropped + output.dropped
             if output:
-                return output    # prefill-only step, as before M2
+                return output    # prefill-only step
             dropped = output.dropped    # nothing to run, but the drops still owe an output
         output = SchedulerOutput(dropped=dropped)
         budget = self.max_num_batched_tokens
@@ -133,10 +129,9 @@ class Scheduler:
         return output
 
     def _expire_waiting(self) -> list[Sequence]:
-        """Drop requests that have waited past request_timeout without ever running.
+        """Drop requests that waited past request_timeout without ever running.
 
-        Only ones that never ran: a preempted sequence has tokens to show for
-        itself, and shedding it would throw that work away for nothing.
+        Preempted sequences are kept: shedding them would waste their work.
         """
         if not self.request_timeout:
             return []
@@ -203,8 +198,7 @@ class Scheduler:
     def _make_room(self, seq: Sequence, still_running: deque[Sequence], output: SchedulerOutput) -> bool:
         """Free blocks for one more decoded token. False if seq itself gave way.
 
-        A prefill chunk needs no room: its blocks were all taken at admission,
-        including any generated suffix being recomputed after preemption.
+        A prefill chunk needs none: its blocks were all taken at admission.
         """
         while not self.block_manager.can_append(seq):
             if self.running:
@@ -248,15 +242,13 @@ class Scheduler:
     def advance(self, seqs: list[Sequence]) -> list[LaunchedRow]:
         """Move bookkeeping forward with no token values. Returns the sampling rows.
 
-        The order matches the sampler's, which is the order prepare_batch built
-        logits_indices in, so reconcile() can zip rows against token ids.
+        Rows follow the sampler's order, so reconcile() can zip them with token ids.
         """
         rows = []
         for seq in seqs:
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            # Every scheduled row, before the skip below, exactly as postprocess
-            # did: a chunked prefill publishes each block as the chunk lands.
+            # Before the skip, so a chunked prefill publishes each block as it lands.
             self.block_manager.hash_blocks(seq, seq.num_cached_tokens)
             if seq.num_cached_tokens < seq.num_planned_tokens:
                 continue    # prefill or recomputation unfinished, so this row samples nothing

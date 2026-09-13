@@ -17,8 +17,7 @@ SCALE = 0.137    # not head_dim**-0.5, so a dropped scale argument is detectable
 BLOCK_SIZE = 16
 DTYPE = {"torch": torch.float32, "flash_attn_3": torch.float16}    # flash kernels are fp16/bf16 only
 
-# Tolerances per dtype for comparison against the fp32 oracle. bf16 is not checked
-# against a fixed tolerance; see test_low_precision_no_worse_than_naive.
+# Tolerances against the fp32 oracle; bf16 uses test_low_precision_no_worse_than_naive.
 TOLERANCE = {torch.float32: 2e-3, torch.float16: 6e-3}
 
 
@@ -336,8 +335,7 @@ def test_gqa_fallback_matches_broadcast(backend, device, block_size, dtype, tol,
 def test_low_precision_no_worse_than_naive(backend, device, block_size, dtype):
     """Backend error against fp32 oracle must not exceed naive arithmetic in the same dtype.
 
-    At bf16 with 8-bit mantissa, fixed atol is meaningless. Instead verify the backend
-    loses no more accuracy than naive arithmetic in the same precision.
+    A fixed atol means nothing at bf16, so compare against naive precision loss instead.
     """
     num_cached, num_new = 2 * block_size + 2, 6
     total = num_cached + num_new

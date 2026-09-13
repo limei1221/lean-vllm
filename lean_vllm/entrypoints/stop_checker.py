@@ -1,10 +1,7 @@
 class StopChecker:
     """Applies `stop` strings to streamed text.
 
-    String matching needs detokenized text, so it lives in the frontend rather
-    than the engine. A stop string can span token boundaries, so the tail is
-    held back up to the longest stop string minus one character — a deliberate
-    small addition to streaming latency.
+    A stop string can span tokens, so a tail of its length minus one is held back.
     """
 
     def __init__(self, stop: list[str]):

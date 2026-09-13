@@ -11,8 +11,6 @@ def run(args, engine_kwargs: dict):
     app = build_app(engine, args.served_model_name or args.model)
     config = uvicorn.Config(app, host=args.host, port=args.port, log_level=args.log_level)
     server = uvicorn.Server(config)
-    # The CUDA context, KV cache and tensor-parallel children do not survive the
-    # engine thread, so there is no in-process restart: shut down and let a
-    # supervisor bring the process back.
+    # CUDA state and TP workers die with the engine thread, so exit and let a supervisor restart.
     engine.on_death = lambda: setattr(server, "should_exit", True)
     server.run()

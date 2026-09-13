@@ -1,8 +1,6 @@
 """`lean-vllm serve <model>`.
 
-Engine flags are generated from `Config`, because a flag that is not a `Config`
-field has no way of reaching the engine: `LLMEngine.__init__` filters kwargs
-against `fields(Config)` and silently drops the rest.
+Engine flags are generated from `Config`, since `LLMEngine.__init__` drops any other kwarg.
 """
 
 import argparse
@@ -10,9 +8,7 @@ from dataclasses import MISSING, fields
 
 from lean_vllm.config import Config
 
-# Not flags: the positional and what the tokenizer decides. `num_kvcache_blocks`
-# stays a flag: profiling derives it from what the weights and the warmup batch
-# left over, so a benchmark sweeping the token budget has to pin it.
+# Not flags: the positional and what the tokenizer decides.
 INTERNAL = {"model", "hf_config", "eos"}
 
 

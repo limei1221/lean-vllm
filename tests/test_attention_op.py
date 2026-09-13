@@ -1,8 +1,6 @@
 """The attention custom op: the seam torch.compile splits a graph on.
 
-Piecewise CUDA graph capture needs attention to be an opaque node, so what these
-tests pin is the op's contract -- its schema, its fake, and the name lookup that
-replaces reaching for a module.
+These pin its contract: the schema, the fake, and the layer lookup by name.
 """
 
 import pytest

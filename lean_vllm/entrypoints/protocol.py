@@ -1,9 +1,6 @@
 """OpenAI-compatible request and response bodies.
 
-Only what the engine actually implements is accepted. Silently ignoring
-`top_p` returns wrong output with no signal, which is worse than a 400, so
-every unsupported field is refused by name and `extra="forbid"` catches the
-rest.
+Only what the engine implements is accepted: silently ignoring a field is worse than a 400.
 """
 
 from time import time
@@ -11,9 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-# Refused by name, with a reason, rather than left to the extra="forbid" message.
-# Each carries the values that are a no-op, so a client sending OpenAI's default
-# for a field it never set is not punished for it.
+# Refused by name with a reason. Each allows its no-op values, which clients send by default.
 UNSUPPORTED = {
     "top_p": ((1.0,), "lean-vLLM samples with temperature only"),
     "top_k": ((0, -1), "lean-vLLM samples with temperature only"),

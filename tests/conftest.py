@@ -48,8 +48,7 @@ class FakeSampledTokens:
 class FakeModelRunner:
     """Stands in for ModelRunner: same call() surface, deterministic tokens, no torch.
 
-    Records every batch it was handed, which is how tests assert what the
-    scheduler decided rather than only what came out the far end.
+    Records every batch, so tests can assert what the scheduler decided.
     """
 
     def __init__(self, eos_after: dict[str, int] | None = None):
@@ -72,9 +71,7 @@ class FakeModelRunner:
     def _completion_index(seq: Sequence) -> int:
         """Which completion token this row is about to produce.
 
-        Read off the batch rather than off committed tokens: a step's token is
-        not committed until the step after it, and a recomputed suffix must
-        reproduce the same ids it produced the first time.
+        Read off the batch: tokens commit a step later, and a recomputed suffix must repeat its ids.
         """
         return seq.num_cached_tokens + seq.num_scheduled_tokens - seq.num_prompt_tokens
 
@@ -141,7 +138,7 @@ class FakeEngine:
             )
             for seq in output.dropped if seq not in stepped
         ]
-        # output is this call's own launch, attributed once, here, at launch time.
+        # attributed to the step this call launched
         self.metrics.record_step(self.scheduler, output, outputs, perf_counter() - started, "enforced")
         return outputs
 

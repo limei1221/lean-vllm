@@ -1,12 +1,8 @@
 """Server-side metrics, as Prometheus text and as a JSON summary.
 
-Names mirror vLLM's under an `lean_vllm:` prefix, so one dashboard reads both
-engines. Hand-rolled rather than `prometheus_client`: three metric types and a
-renderer is less code than the dependency, and the same registry produces the
-summary the benchmark reads.
-
-The engine thread records; the HTTP handler renders. One lock covers both, so a
-render never catches a histogram between its bucket and its sum.
+Names mirror vLLM's under a `lean_vllm:` prefix, so one dashboard reads both.
+Hand-rolled, as that is less code than `prometheus_client`. One lock keeps a
+render from catching a histogram mid-update.
 """
 
 import threading
@@ -121,7 +117,7 @@ def _rate(numerator: float, denominator: float) -> float | None:
 
 
 def gpu_utilization() -> float | None:
-    """What nvidia-smi reports, for the note beside the honest number."""
+    """GPU utilization as nvidia-smi reports it, for comparison only."""
     try:
         import torch
 
@@ -161,8 +157,7 @@ class Metrics:
         self.steps = Counter("lean_vllm:num_steps_total", "Forward passes.")
         self.graph_steps = Counter("lean_vllm:num_graph_steps_total", "Forward passes replayed from a CUDA graph.")
         self.eager_steps = Counter("lean_vllm:num_eager_steps_total", "Forward passes that ran eager.", label="reason")
-        # Eager steps are the expensive kind, so their share of the count
-        # understates their share of the clock. This is the share that matters.
+        # Share of the clock, not the count: eager steps take longer each.
         self.step_seconds = Counter("lean_vllm:step_seconds_total", "Time in forward passes.", label="kind")
         self.model_busy = Counter("lean_vllm:model_busy_seconds_total", "Wall seconds spent inside a step.")
 
@@ -244,10 +239,8 @@ class Metrics:
             uptime = perf_counter() - self.start_time
             return {
                 "uptime_seconds": uptime,
-                # The honest utilization number: the fraction of wall clock the
-                # engine spent inside a forward pass. nvidia-smi counts any
-                # kernel as busy, so it reads high even when the batch is one
-                # row wide; it is here to be compared, not believed.
+                # Fraction of wall clock in a forward pass. nvidia-smi counts any
+                # kernel as busy, so it reads high; it is only for comparison.
                 "model_busy_fraction": _rate(self.model_busy.total, uptime),
                 "gpu_utilization_percent_nvidia_smi": gpu_utilization(),
                 "steps": self.steps.total,
@@ -275,8 +268,7 @@ class Metrics:
                 "kv_cache_usage": self.kv_usage.value,
                 "kv_cache_usage_peak": self.kv_usage.peak,
                 "preemptions": self.preemptions.total,
-                # Percentiles are the benchmark client's job: these buckets are
-                # too coarse to interpolate one from without lying about it.
+                # Percentiles are the client's job; these buckets are too coarse.
                 "latency": {
                     "ttft": self.ttft.summary(),
                     "tpot": self.tpot.summary(),

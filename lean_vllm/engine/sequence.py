@@ -11,14 +11,12 @@ from lean_vllm.sampling_params import SamplingParams
 
 
 def _serialize(token_ids: tuple[int, ...], prefix: int) -> bytes:
-    """Pickle, as vLLM does. It is stable within a Python version but not
-    promised across them, which is why vLLM also offers CBOR variants."""
+    """Pickle, as vLLM does. Stable within a Python version, not across them."""
     return pickle.dumps((prefix, token_ids), protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def sha256_hash(token_ids: tuple[int, ...], prefix: int) -> int:
-    """The default, and vLLM's. A collision here serves one tenant another's
-    tokens, so it is ruled out rather than made unlikely."""
+    """The default, and vLLM's. A collision would serve one tenant another's tokens."""
     return int.from_bytes(hashlib.sha256(_serialize(token_ids, prefix)).digest(), "big")
 
 
@@ -37,8 +35,7 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
-    # Set once from Config, since a Sequence is built in places that carry no
-    # config: the engine, the profiling warmup, and the spawned TP workers.
+    # Set once from Config: Sequences are built where no config is at hand (warmup, TP workers).
     block_size = 16
     enable_prefix_caching = True
     hash_algo = "sha256"
@@ -122,10 +119,7 @@ class Sequence:
     def _extend_block_hashes(self):
         """Hash every block that has just become full, chaining on the one before.
 
-        A full block never takes another token, so its hash is final and is
-        computed exactly once, here, as the tokens arrive. The scheduler queries
-        the cache again on every step a request spends at the head of the
-        waiting queue, and rehashing the prompt each time is the whole cost.
+        A full block's hash is final, so it is computed once rather than on every cache lookup.
         """
         if not self.enable_prefix_caching:
             return

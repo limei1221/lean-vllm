@@ -1,13 +1,11 @@
-# Window of already-decoded tokens kept as context, so a piece that only makes
-# sense after its predecessors still decodes correctly. vLLM uses 5.
+# Already-decoded tokens kept as context for the next piece. vLLM uses 5.
 INITIAL_OFFSET = 5
 
 
 class IncrementalDetokenizer:
     """Decodes one token at a time without re-decoding the prefix.
 
-    Holds back output that ends mid-character, so a multi-byte character split
-    across tokens is never emitted as U+FFFD.
+    Holds back output ending mid-character, so a split character never emits U+FFFD.
     """
 
     def __init__(self, tokenizer, prompt_token_ids: list[int], skip_special_tokens: bool = True):

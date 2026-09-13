@@ -4,10 +4,8 @@ import torch
 class SampledTokens:
     """One launched step's sampled tokens, fetched without awaiting later steps.
 
-    tolist() on a device tensor is a blocking copy on the default stream, so it
-    waits for everything queued ahead of it -- including the next step, once the
-    pipeline has launched it. The copy goes on its own stream instead and the
-    wait is on its event, so awaiting step k-1 never waits for step k.
+    tolist() would wait on the default stream, including the next launched step,
+    so the copy runs on its own stream and the wait is on its event.
     """
 
     _copy_stream: torch.cuda.Stream | None = None
@@ -27,9 +25,7 @@ class SampledTokens:
         stream = self._get_copy_stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            # Keep the device tensor alive until the copy has run.
-            # No record_stream() on tokens: safe only because self holds this
-            # reference past the event, keeping the allocator from reusing it early.
+            # Holding the device tensor until the copy runs makes record_stream() unnecessary.
             self._device_tokens = tokens
             self._host_tokens = torch.empty_like(tokens, device="cpu", pin_memory=True)
             self._host_tokens.copy_(tokens, non_blocking=True)

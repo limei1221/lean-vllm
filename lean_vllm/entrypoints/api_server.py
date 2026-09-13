@@ -104,9 +104,7 @@ def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
 
 async def _serve(engine: AsyncLLMEngine, model: str, body: BaseRequest, prompt_token_ids: list[int], chat: bool):
     if body.model != model:
-        # OpenAI's semantics, and vLLM's: a name the server does not serve is a
-        # 404, not a field to ignore. A benchmark client pointed at the wrong
-        # server should find out at the first request, not in the numbers.
+        # As in OpenAI and vLLM, an unserved model name is a 404, not a field to ignore.
         raise HTTPException(404, f"the model {body.model!r} does not exist")
     if engine.is_dead:
         raise HTTPException(503, f"the engine thread died: {engine.error!r}")
@@ -193,8 +191,7 @@ async def _stream(deltas, request_id: str, model: str, body: BaseRequest, num_pr
                 else:
                     yield _event(protocol.completion_chunk(request_id, model, created, delta, reason))
         except (EngineDeadError, HTTPException) as error:
-            # A status code cannot be retracted once the 200 went out, so the error
-            # rides in the stream instead.
+            # The 200 is already sent, so the error rides in the stream.
             yield _event(_error("server_error", str(getattr(error, "detail", error))))
             yield DONE
             return

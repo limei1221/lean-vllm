@@ -37,25 +37,12 @@ def validate_request(prompt: list[int], sampling_params: SamplingParams, vocab_s
 class _StepProfiler:
     """torch.profiler over a window of engine steps, enabled by environment.
 
-    nsys is unavailable on the benchmark box, which has no CUDA toolkit, so the
-    host side of the step loop is profiled in process instead. Set
-    ``LEAN_PROFILE_DIR`` to enable it; ``LEAN_PROFILE_SKIP`` steps pass before
-    capture starts, to clear warmup and the load ramp, and ``LEAN_PROFILE_STEPS``
-    steps are captured. The ``record_function`` ranges in the step loop label the
-    host phases -- schedule, prepare_batch, run_model, sample, launch,
-    await_tokens, reconcile, detokenize -- so their wall-clock share is read
-    straight off the trace. ``await_tokens`` is where the host blocks on the
-    device, so idle no longer hides inside ``sample`` the way it did in the
-    12 September trace.
+    ``LEAN_PROFILE_DIR`` enables it; ``LEAN_PROFILE_SKIP`` steps pass before
+    ``LEAN_PROFILE_STEPS`` steps are captured. ``record_function`` ranges label the
+    host phases; ``await_tokens`` is where the host waits on the device.
 
-    CPU activity only by default: online, ``step()`` runs on the engine thread
-    while CUDA was initialised on the main thread, and kineto refuses to collect
-    CUDA activity across that boundary ("External init callback must run in same
-    thread as registerClient"). Set ``LEAN_PROFILE_CUDA=1`` to add it anyway,
-    which is clean only when stepping on the main thread, i.e. offline generate.
-
-    The window need not fit the run: ``close()`` stops the profiler from the same
-    thread that started it and flushes whatever was captured, full window or not.
+    CPU only by default, since kineto refuses CUDA activity from the engine thread.
+    ``LEAN_PROFILE_CUDA=1`` adds it, clean only for offline generate.
     """
 
     def __init__(self, out_dir: str, skip: int, steps: int, cuda: bool):
@@ -181,10 +168,8 @@ class LLMEngine:
     def step(self) -> tuple[list[RequestOutput], int, int]:
         """Launch one step and drain the one launched before it.
 
-        With async_scheduling the launch goes first, so the GPU has this step
-        queued while the host reconciles and detokenizes the last one. Without
-        it, the last step's tokens are awaited before this one is scheduled, and
-        only detokenization overlaps.
+        With async_scheduling the launch goes first, so the GPU runs it while the
+        host drains the last; without it, only detokenization overlaps.
         """
         started = perf_counter()
         draining, self.in_flight = self.in_flight, None
@@ -196,9 +181,9 @@ class LLMEngine:
             output = self._launch()
         with record_function("detokenize"):
             outputs = [self._output(seq) for seq in stepped]
-        # A request dropped right after its token was reconciled already has its final output.
+        # A request dropped right after reconcile already has its final output.
         outputs += [self._dropped(seq) for seq in output.dropped if seq not in stepped]
-        # output is this call's own launch, attributed once, here, at launch time.
+        # attributed to the step this call launched
         self.metrics.record_step(
             self.scheduler, output, outputs, perf_counter() - started, self.model_runner.step_kind,
         )
