@@ -105,13 +105,59 @@ dropped rather than preempted forever.
 | `--num-kvcache-blocks` | profiled | pin it to hold cache capacity still across runs |
 | `--kvcache-block-size` | 16 | tokens per block |
 | `--enforce-eager` | off | on disables CUDA graphs |
-| `--async-scheduling` | on | overlaps scheduling and batch prep with the forward pass; off under tensor parallelism; see [pipelined-steps.md](pipelined-steps.md) |
+| `--async-scheduling` | on | overlaps scheduling and batch prep with the forward pass; off under tensor parallelism; see [Pipelined steps](#pipelined-steps) |
 
 Preemption recomputes rather than swaps, and a preempted sequence goes back to
 the head of the queue.
 
 `--long-prefill-token-threshold` follows vLLM's V1 meaning: a per-step token cap
 on one prompt, applied to every prefill.
+
+## Pipelined steps
+
+`step()` launches one step and drains the one launched before it, so the
+drain's host work runs while the GPU works on the step just queued.
+`--async-scheduling` picks which phases land in that overlap:
+
+```text
+off                              on
+---                              --
+await tokens of step k-1         schedule step k
+reconcile step k-1               launch step k
+schedule step k                  await tokens of step k-1
+launch step k                    reconcile step k-1
+detokenize step k-1              detokenize step k-1
+```
+
+Off, only detokenization overlaps. The drain still runs before scheduling, so a
+stop condition is always seen before the next step is built. On, scheduling and
+batch preparation for step k run ahead of the await too.
+
+**A stop is seen one step late.** With the flag on, a request that has just hit
+EOS or a stop sequence already has one more step launched. That token is
+discarded on reconcile and never emitted, but its compute is spent. A request
+ending at `max_tokens` does not pay it: the scheduler stops scheduling it once
+its reserved tokens reach the limit.
+
+**Awaiting a step does not wait for the next one.** `SampledTokens`
+(`lean_vllm/engine/sampled_tokens.py`) copies the sampled tensor to pinned host
+memory on its own CUDA stream and records an event at launch. The await waits
+on that event, not on the default stream, which may already hold the next
+step's kernels. A plain `.tolist()` on the device tensor would serialize the
+pipeline.
+
+**All other device work stays on one stream.** A later step's kernels run
+strictly after this step's writes, which is what makes it safe to free a KV
+block while a step is in flight, or to publish a prefix-cache block a running
+kernel is still writing. A pending token is a count, never a placeholder value,
+and it is discarded if its sequence was preempted or aborted since launch.
+
+The flag is on by default, as in vLLM, and turns itself off with a warning
+under tensor parallelism: ranks above zero never see the sampled tokens, so
+they could not follow. On an H100
+([benchmark-2026-09-13.md](../benchmarks/benchmark-2026-09-13.md)) turning it
+on cuts offline GPU idle from 22.4% to 3.2% and adds 7–9% serving goodput on
+Qwen3-8B at loads 24, 48 and 64.
 
 ## Prefix caching
 
@@ -205,8 +251,8 @@ Arrivals are open-loop and a 429 is never retried, so the offered load is the
 rate it claims to be.
 
 [benchmark-runbook.md](benchmark-runbook.md) is the step-by-step for a fresh
-GPU box. [benchmarks/benchmark-2026-09-08.md](../benchmarks/benchmark-2026-09-08.md)
-is the first full set of numbers.
+GPU box. [benchmarks/benchmark-2026-09-13.md](../benchmarks/benchmark-2026-09-13.md)
+has the latest numbers.
 
 ## How it fits together
 
