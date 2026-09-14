@@ -395,6 +395,18 @@ class TestPolicy:
         engine.step()
         assert expendable.num_preemptions == 1    # oldest, but least urgent
 
+    def test_priority_spares_the_urgent_sequence_admitted_after_the_expendable_one(self, make_engine):
+        engine = make_engine(num_kvcache_blocks=3, kvcache_block_size=8, scheduling_policy="priority")
+        expendable = engine.add(prompt(8), SamplingParams(max_tokens=64, ignore_eos=True, priority=5))
+        engine.step()
+        urgent = engine.add(prompt(8, 100), FOREVER)    # admitted a step later, behind it in running
+        for _ in range(20):
+            engine.step()
+            if engine.last_output.preempted:
+                break
+        assert engine.last_output.preempted == [expendable]
+        assert urgent.num_preemptions == 0
+
     def test_an_unknown_policy_is_rejected(self, make_engine):
         with pytest.raises(ValueError, match="unknown scheduling policy"):
             make_engine(scheduling_policy="lifo")
@@ -622,6 +634,12 @@ class TestChunkedPrefillDisabled:
         seq = engine.add(prompt(40), FOREVER)
         engine.step()
         assert seq.finish_reason == "capacity"
+
+    def test_the_long_prefill_cap_does_not_split_a_prompt(self, make_engine):
+        engine = make_engine(max_num_batched_tokens=64, enable_chunked_prefill=False, long_prefill_token_threshold=8)
+        seq = engine.add(prompt(40), FOREVER)
+        engine.step()
+        assert engine.model_runner.batches[0] == (True, [(seq.request_id, 40)])
 
 
 class TestTokenLimitGuard:

@@ -1,5 +1,6 @@
 """The HTTP layer against an in-process fake engine, so no model is needed."""
 
+import asyncio
 import json
 
 import pytest
@@ -12,7 +13,8 @@ from lean_vllm.engine.async_engine import EngineDeadError
 from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.output import RequestOutput
 from lean_vllm.engine.scheduler import InvalidRequest, QueueFull
-from lean_vllm.entrypoints.api_server import build_app
+from lean_vllm.entrypoints.api_server import _serve, build_app
+from lean_vllm.entrypoints.protocol import CompletionRequest
 
 MODEL = "fake-model"
 
@@ -40,8 +42,9 @@ class FakeAsyncEngine:
         self.is_dead = False
         self.error = None
         self.admission_error: Exception | None = None
+        self.hang = False    # never finish, like a request the client gives up on
         self.requests: list[tuple] = []
-        self.aborted: list[str] = []
+        self.aborted: list[tuple[str, str]] = []
 
     def start(self):
         pass
@@ -60,7 +63,7 @@ class FakeAsyncEngine:
     async def _outputs(self, request_id):
         try:
             for i, piece in enumerate(self.pieces):
-                last = i == len(self.pieces) - 1
+                last = i == len(self.pieces) - 1 and not self.hang
                 yield RequestOutput(
                     request_id=request_id,
                     token_ids=[i],
@@ -68,11 +71,13 @@ class FakeAsyncEngine:
                     finished=last,
                     finish_reason=self.finish_reason if last else None,
                 )
+            if self.hang:
+                await asyncio.Event().wait()
         finally:
-            self.aborted.append(request_id)
+            self.aborted.append((request_id, "abort"))
 
-    def abort(self, request_id):
-        self.aborted.append(request_id)
+    def abort(self, request_id, reason="abort"):
+        self.aborted.append((request_id, reason))
 
 
 @pytest.fixture
@@ -195,7 +200,27 @@ class TestStopStrings:
         body = complete(client, stop=",").json()
         assert body["choices"][0]["text"] == "Hello"
         assert body["choices"][0]["finish_reason"] == "stop"
-        assert engine.aborted == [body["id"]]    # the request is dropped, not run to max_tokens
+        assert engine.aborted[0] == (body["id"], "stop")    # dropped, not run to max_tokens, and not a cancel
+
+
+class TestDisconnect:
+
+    def test_a_client_that_leaves_a_non_streaming_request_aborts_it(self, engine):
+        """Starlette only watches for a disconnect while streaming."""
+        engine.hang = True
+        body = CompletionRequest(model=MODEL, prompt="hi", max_tokens=4)
+
+        class GoneRequest:
+            async def receive(self):
+                return {"type": "http.disconnect"}
+
+        async def serve():
+            return await asyncio.wait_for(_serve(engine, MODEL, body, [1, 2], False, GoneRequest()), timeout=1)
+
+        response = asyncio.run(serve())
+        assert response.status_code == 499
+        request_id = engine.requests[0][2]
+        assert (request_id, "abort") in engine.aborted
 
 
 class TestRefusals:

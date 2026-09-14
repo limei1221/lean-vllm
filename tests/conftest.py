@@ -178,10 +178,17 @@ class FakeLLMEngine(FakeEngine):
     def add_request(self, prompt: list[int], sampling_params=None, request_id: str | None = None) -> str:
         return self.add(prompt, sampling_params, request_id).request_id
 
-    def abort_request(self, request_id: str) -> bool:
-        aborted = self.scheduler.abort(request_id)
+    def abort_request(self, request_id: str, reason: str = "abort") -> bool:
+        seq = self.scheduler.seqs.get(request_id)
+        aborted = self.scheduler.abort(request_id, reason)
         if aborted:
-            self.metrics.record_aborted()
+            self.metrics.record_aborted(RequestOutput(
+                request_id=request_id,
+                token_ids=[],
+                finished=True,
+                finish_reason=seq.finish_reason,
+                metrics=seq.metrics(),
+            ))
         return aborted
 
     def step(self) -> tuple[list[RequestOutput], int, int]:

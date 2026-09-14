@@ -158,11 +158,13 @@ class LLMEngine:
         self.detokenizers[seq.request_id] = detokenizer
         return seq.request_id
 
-    def abort_request(self, request_id: str) -> bool:
-        aborted = self.scheduler.abort(request_id)
+    def abort_request(self, request_id: str, reason: str = "abort") -> bool:
+        """reason is "stop" when the server ends it on a stop string, which counts as a finish."""
+        seq = self.scheduler.seqs.get(request_id)
+        aborted = self.scheduler.abort(request_id, reason)
         self.detokenizers.pop(request_id, None)
         if aborted:
-            self.metrics.record_aborted()
+            self.metrics.record_aborted(self._dropped(seq))
         return aborted
 
     def step(self) -> tuple[list[RequestOutput], int, int]:

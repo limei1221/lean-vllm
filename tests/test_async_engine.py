@@ -195,6 +195,22 @@ class TestAbort:
         await settle(engine)
         assert not engine.is_dead
 
+    @asyncio_test
+    async def test_a_stop_string_finish_is_counted_as_a_stop(self, make_async_engine):
+        """The server ends it through abort, but the client did not cancel it."""
+        engine = make_async_engine(gated=True)
+        outputs = await engine.add_request(prompt(8), FOREVER, "stopped")
+        runner_of(engine).release(2)    # the launch that emits nothing, then the one that drains it
+        await outputs.__anext__()
+
+        engine.abort("stopped", "stop")
+        await outputs.aclose()    # its own abort lands after, on a finished request
+        runner_of(engine).release()
+        await settle(engine)
+        assert engine.metrics.requests_aborted.total == 0
+        assert engine.metrics.requests_finished.values == {"stop": 1}
+        assert engine.metrics.ttft.count == 1
+
 
 class TestAdmission:
 
@@ -261,6 +277,29 @@ class TestEngineDeath:
         await wait_until(lambda: engine.is_dead)
         with pytest.raises(EngineDeadError):
             await engine.add_request(prompt(8, 100), FOREVER)
+
+
+class TestShutdown:
+
+    @asyncio_test
+    async def test_a_stop_between_the_flag_check_and_the_clear_still_wakes_the_thread(self):
+        engine = AsyncLLMEngine(FakeLLMEngine(FakeConfig(), FakeModelRunner()))
+        raced = threading.Event()
+
+        class RacedEvent(threading.Event):
+            def clear(self):
+                if not raced.is_set():
+                    raced.set()
+                    engine._stopping.set()    # what stop() does, landing just before the clear
+                    self.set()
+                super().clear()
+
+        engine._work = RacedEvent()
+        engine.start()
+        engine._thread.join(1)
+        stuck = engine._thread.is_alive()
+        engine.stop(timeout=1)
+        assert not stuck
 
 
 def kill(engine: AsyncLLMEngine):

@@ -36,6 +36,10 @@ class SchedulingPolicy(ABC):
     def victim(self, running: deque[Sequence]) -> Sequence:
         """Which running sequence gives up its blocks first."""
 
+    def by_urgency(self, running: deque[Sequence]) -> deque[Sequence]:
+        """Running in the order victim() spares it, most spared first."""
+        return running
+
 
 class Fcfs(SchedulingPolicy):
     """Arrival order, with preempted sequences going back to the front."""
@@ -103,8 +107,15 @@ class Priority(SchedulingPolicy):
         self.heap.remove(self._key(seq))
         heapq.heapify(self.heap)
 
+    @staticmethod
+    def _urgency(seq: Sequence):
+        return (seq.priority, seq.arrival_time)
+
     def victim(self, running):
-        return max(running, key=lambda seq: (seq.priority, seq.arrival_time))
+        return max(running, key=self._urgency)
+
+    def by_urgency(self, running):
+        return deque(sorted(running, key=self._urgency))
 
     def __len__(self):
         return len(self.heap)

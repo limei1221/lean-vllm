@@ -72,7 +72,7 @@ class Scheduler:
         self.seqs[seq.request_id] = seq
         self.waiting.add(seq)
 
-    def abort(self, request_id: str) -> bool:
+    def abort(self, request_id: str, reason: str = "abort") -> bool:
         """Drop a request between steps. Returns False if it already finished."""
         seq = self.seqs.pop(request_id, None)
         if seq is None:
@@ -81,7 +81,7 @@ class Scheduler:
         queue.remove(seq)    # both queues expose remove()
         seq.drop_pending()
         self.block_manager.deallocate(seq)
-        self._finish(seq, "abort")
+        self._finish(seq, reason)
         return True
 
     def schedule(self) -> SchedulerOutput:
@@ -96,6 +96,8 @@ class Scheduler:
         output = SchedulerOutput(dropped=dropped)
         budget = self.max_num_batched_tokens
         still_running: deque[Sequence] = deque()
+        # Most urgent first, so a victim is never one already served this step.
+        self.running = self.waiting.by_urgency(self.running)
 
         while self.running:
             seq = self.running.popleft()
@@ -183,7 +185,7 @@ class Scheduler:
         """Give seq its share of the budget: a prompt chunk, or one decoded token."""
         # A preempted request also prefills its generated suffix until it samples again.
         num_tokens = min(seq.num_tokens - seq.num_cached_tokens, budget) if seq.is_prefill else 1
-        if seq.is_prefill and self.long_prefill_token_threshold:
+        if seq.is_prefill and self.enable_chunked_prefill and self.long_prefill_token_threshold:
             num_tokens = min(num_tokens, self.long_prefill_token_threshold)
         seq.num_scheduled_tokens = num_tokens
         if seq.first_scheduled_time is None:
