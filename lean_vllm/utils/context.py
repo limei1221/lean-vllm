@@ -15,6 +15,8 @@ class Context:
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
     logits_indices: torch.Tensor | None = None    # rows that sample; None means all of them
+    num_keys: int = 0    # cu_seqlens_k[-1], kept on the host so gathers can size without a sync
+    key_slots: torch.Tensor | None = None    # filled on first use by layers.attention.key_slots
 
 _CONTEXT = Context()
 

@@ -15,7 +15,7 @@ hardware.
 |---|---|---|
 | 0 | Attention backend abstraction | interface + Torch/FlashAttention backends done |
 | 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; numbers await a GPU |
-| 2 | DeepSeek-style model support: MLA + MoE + YaRN | |
+| 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite runs eager, checked against transformers; MLA kernels, graphs and numbers to come |
 | 3 | Speculative decoding | |
 | 4 | Disaggregated prefill / decode | |
 
@@ -61,6 +61,10 @@ outputs[0]["text"]
 
 The attention backend is picked automatically and can be forced with
 `LEAN_VLLM_ATTENTION_BACKEND`.
+
+Qwen3 and DeepSeek-V2 checkpoints load, picked by `architectures` in
+`config.json`. [docs/deepseek-v2.md](docs/deepseek-v2.md) covers DeepSeek-V2-Lite:
+its latent KV cache, MoE layer and YaRN rope.
 
 ## Serving
 
