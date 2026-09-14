@@ -178,9 +178,12 @@ class Metrics:
         with self.lock:
             self.requests_rejected.inc()
 
-    def record_aborted(self):
+    def record_aborted(self, request_output):
         with self.lock:
-            self.requests_aborted.inc()
+            if request_output.finish_reason == "abort":
+                self.requests_aborted.inc()
+            else:    # ended by the server on a stop string: a completion, not a cancel
+                self._record_finished(request_output)
 
     def record_step(self, scheduler, output, outputs, duration: float, step_kind: str):
         with self.lock:

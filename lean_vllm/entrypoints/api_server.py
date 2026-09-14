@@ -1,14 +1,15 @@
 """OpenAI-compatible HTTP server over `AsyncLLMEngine`."""
 
+import asyncio
 import json
 from contextlib import aclosing, asynccontextmanager
 from time import time
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from lean_vllm.engine.async_engine import AsyncLLMEngine, EngineDeadError
 from lean_vllm.engine.output import RequestOutput
@@ -86,23 +87,30 @@ def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
         return ModelList(data=[ModelCard(id=model)])
 
     @app.post("/v1/completions")
-    async def completions(body: CompletionRequest):
+    async def completions(body: CompletionRequest, request: Request):
         prompt_token_ids = body.prompt if isinstance(body.prompt, list) else engine.tokenizer.encode(body.prompt)
-        return await _serve(engine, model, body, prompt_token_ids, chat=False)
+        return await _serve(engine, model, body, prompt_token_ids, chat=False, request=request)
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(body: ChatCompletionRequest):
+    async def chat_completions(body: ChatCompletionRequest, request: Request):
         messages = [message.model_dump() for message in body.messages]
         # return_dict=False, or newer tokenizers hand back a BatchEncoding rather than ids.
         prompt_token_ids = engine.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=True, return_dict=False
         )
-        return await _serve(engine, model, body, prompt_token_ids, chat=True)
+        return await _serve(engine, model, body, prompt_token_ids, chat=True, request=request)
 
     return app
 
 
-async def _serve(engine: AsyncLLMEngine, model: str, body: BaseRequest, prompt_token_ids: list[int], chat: bool):
+async def _serve(
+    engine: AsyncLLMEngine,
+    model: str,
+    body: BaseRequest,
+    prompt_token_ids: list[int],
+    chat: bool,
+    request: Request | None = None,
+):
     if body.model != model:
         # As in OpenAI and vLLM, an unserved model name is a 404, not a field to ignore.
         raise HTTPException(404, f"the model {body.model!r} does not exist")
@@ -125,14 +133,38 @@ async def _serve(engine: AsyncLLMEngine, model: str, body: BaseRequest, prompt_t
     except EngineDeadError as dead:
         raise HTTPException(503, str(dead))
 
-    deltas = _deltas(outputs, StopChecker(body.stop_strings))
+    deltas = _deltas(outputs, StopChecker(body.stop_strings), engine, request_id)
     if body.stream:
         stream = _stream(deltas, request_id, model, body, len(prompt_token_ids), chat)
         return _RequestStreamingResponse(stream, engine, request_id)
     try:
-        return await _collect(deltas, request_id, model, len(prompt_token_ids), chat)
+        reply = await _unless_disconnected(request, _collect(deltas, request_id, model, len(prompt_token_ids), chat))
     except EngineDeadError as dead:
         raise HTTPException(503, str(dead))
+    if reply is None:
+        engine.abort(request_id)    # the generators may never have started, so no finally ran
+        return Response(status_code=499)    # nobody is left to read it
+    return reply
+
+
+async def _unless_disconnected(request: Request | None, work: Awaitable):
+    """Starlette only watches for a disconnect while streaming. None if the client left first."""
+    if request is None:
+        return await work
+    task = asyncio.ensure_future(work)
+    listener = asyncio.ensure_future(_disconnected(request))
+    try:
+        await asyncio.wait((task, listener), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        listener.cancel()
+        task.cancel()    # a no-op once done
+        await asyncio.wait((task,))
+    return None if task.cancelled() else task.result()
+
+
+async def _disconnected(request: Request):
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
 
 
 def _check_length(engine: AsyncLLMEngine, body: BaseRequest, num_prompt_tokens: int):
@@ -147,7 +179,9 @@ def _check_length(engine: AsyncLLMEngine, body: BaseRequest, num_prompt_tokens: 
         )
 
 
-async def _deltas(outputs: AsyncIterator[RequestOutput], checker: StopChecker):
+async def _deltas(
+    outputs: AsyncIterator[RequestOutput], checker: StopChecker, engine: AsyncLLMEngine, request_id: str,
+):
     """Yields (text, finish_reason, num_completion_tokens); the last has a reason."""
     num_tokens = 0
     try:
@@ -155,8 +189,9 @@ async def _deltas(outputs: AsyncIterator[RequestOutput], checker: StopChecker):
             num_tokens += len(output.token_ids)
             text = checker.push(output.text)
             if checker.matched:
+                engine.abort(request_id, "stop")    # frees the blocks, counted as a finish rather than a cancel
                 yield text, "stop", num_tokens
-                return    # the finally aborts, which is what frees the blocks
+                return
             if output.finished:
                 if output.finish_reason not in FINISH_REASONS:
                     status = DROP_STATUS.get(output.finish_reason, 503)

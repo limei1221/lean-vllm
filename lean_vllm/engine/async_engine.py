@@ -62,6 +62,7 @@ class _Add:
 @dataclass(slots=True)
 class _Abort:
     request_id: str
+    reason: str = "abort"
 
 
 class AsyncLLMEngine:
@@ -128,10 +129,10 @@ class AsyncLLMEngine:
         finally:
             self.abort(request_id)    # this is what makes a disconnect free KV blocks
 
-    def abort(self, request_id: str):
+    def abort(self, request_id: str, reason: str = "abort"):
         """Non-blocking and never raising, so it is safe in a generator's finally."""
         try:
-            self._submit(_Abort(request_id))
+            self._submit(_Abort(request_id, reason))
         except EngineDeadError:
             pass    # the blocks went with the thread
 
@@ -147,8 +148,10 @@ class AsyncLLMEngine:
 
     def _run(self):
         try:
-            while not self._stopping.is_set():
-                self._work.clear()
+            while True:
+                self._work.clear()    # before the check, so a stop() in between still wakes the wait
+                if self._stopping.is_set():
+                    break
                 self._drain_intake()
                 if self.engine.is_finished():
                     self._work.wait()    # idle rather than spin
@@ -172,7 +175,7 @@ class AsyncLLMEngine:
             except Empty:
                 return
             if isinstance(action, _Abort):
-                self.engine.abort_request(action.request_id)
+                self.engine.abort_request(action.request_id, action.reason)
                 self._streams.pop(action.request_id, None)
                 continue
             try:
