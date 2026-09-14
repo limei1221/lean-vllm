@@ -12,14 +12,18 @@ readme = "README.md"
 description = "a lightweight vLLM implementation for prototyping inference techniques and benchmarking them against vLLM"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "safetensors",
+    "tokenizers>=0.22",    # DecodeStream(ids=), for the fast detokenizer
     "torch>=2.4.0",
-    "transformers>=4.51.0",
+    "tqdm",
+    "transformers>=4.56.0",    # the first release that allows tokenizers 0.22
     "xxhash",
 ]
 
 [project.optional-dependencies]
 serve = [
     "fastapi>=0.115",
+    "pydantic>=2",
     "uvicorn>=0.30",
 ]
 cuda = [

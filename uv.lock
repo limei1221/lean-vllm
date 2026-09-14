@@ -425,7 +425,10 @@ name = "lean-vllm"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "safetensors" },
+    { name = "tokenizers" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "transformers" },
     { name = "xxhash" },
 ]
@@ -438,6 +441,7 @@ cuda = [
 ]
 serve = [
     { name = "fastapi" },
+    { name = "pydantic" },
     { name = "uvicorn" },
 ]
 
@@ -454,9 +458,13 @@ dev = [
 requires-dist = [
     { name = "fastapi", marker = "extra == 'serve'", specifier = ">=0.115" },
     { name = "flash-attn-3", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda'", url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn_3-3.0.0%2Bcu130torch2.11gite2743ab-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl" },
+    { name = "pydantic", marker = "extra == 'serve'", specifier = ">=2" },
+    { name = "safetensors" },
+    { name = "tokenizers", specifier = ">=0.22" },
     { name = "torch", specifier = ">=2.4.0" },
     { name = "torch", marker = "extra == 'cuda'", specifier = "==2.11.0" },
-    { name = "transformers", specifier = ">=4.51.0" },
+    { name = "tqdm" },
+    { name = "transformers", specifier = ">=4.56.0" },
     { name = "triton", marker = "extra == 'cuda'", specifier = ">=3.0.0" },
     { name = "uvicorn", marker = "extra == 'serve'", specifier = ">=0.30" },
     { name = "xxhash" },

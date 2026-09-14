@@ -21,10 +21,11 @@ from dataclasses import asdict, dataclass, field
 from time import perf_counter
 
 import httpx
+import numpy as np
 import openai
 from openai import AsyncOpenAI
 
-QUANTILES = (0.5, 0.9, 0.95, 0.99)
+PERCENTILES = (50, 90, 95, 99)
 
 
 @dataclass
@@ -310,23 +311,15 @@ async def server_summary(http: httpx.AsyncClient, base_url: str) -> dict | None:
 # ---------------------------------------------------------------- reporting
 
 
-def percentile(values: list[float], quantile: float) -> float:
-    position = (len(values) - 1) * quantile
-    low, high = math.floor(position), math.ceil(position)
-    if low == high:
-        return values[low]
-    return values[low] + (values[high] - values[low]) * (position - low)
-
-
 def distribution(values) -> dict | None:
-    values = sorted(value for value in values if value is not None)
+    values = [value for value in values if value is not None]
     if not values:
         return None
     return {
         "count": len(values),
-        "mean": sum(values) / len(values),
-        **{f"p{quantile * 100:g}": percentile(values, quantile) for quantile in QUANTILES},
-        "max": values[-1],
+        "mean": float(np.mean(values)),
+        **{f"p{p}": float(value) for p, value in zip(PERCENTILES, np.percentile(values, PERCENTILES))},
+        "max": max(values),
     }
 
 

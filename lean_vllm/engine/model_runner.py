@@ -1,4 +1,5 @@
 import logging
+import math
 import pickle
 import torch
 import torch.distributed as dist
@@ -10,10 +11,10 @@ from lean_vllm.attention import get_attention_backend
 from lean_vllm.config import Config, FULL_MODES, PIECEWISE_MODES
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.sequence import Sequence
-from lean_vllm.models.qwen3 import Qwen3ForCausalLM
-from lean_vllm.layers.attention import register_layers
+from lean_vllm.models import get_model_class
+from lean_vllm.layers.attention import Attention, register_layers
 from lean_vllm.layers.sampler import Sampler
-from lean_vllm.utils.context import set_context, get_context, reset_context
+from lean_vllm.utils.context import set_context, get_context
 from lean_vllm.utils.loader import load_model
 from lean_vllm.utils import device as dev
 
@@ -40,8 +41,9 @@ class ModelRunner:
         self.step_kind = "enforced"    # how the last step ran: see _step_kind
         self._prev_tokens: SampledTokens | None = None    # the step still in flight, if any
         self._prev_rows: dict[int, int] | None = None       # seq_id -> its row in those tokens
+        model_cls = get_model_class(hf_config)
         self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
-                              or not attention_backend.supports_cuda_graph())
+                              or not attention_backend.supports_cuda_graph() or not model_cls.supports_cuda_graph)
         self.cudagraph_mode = "none" if self.enforce_eager else config.cudagraph_mode
         self.graph_bs: list[int] = []          # captured batch sizes, full graphs
         self.piecewise_bs: list[int] = []      # captured token counts, piecewise graphs
@@ -57,7 +59,7 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device(self.device)
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = model_cls(hf_config)
         register_layers(self.model)    # before warmup_model, which runs the op
         load_model(self.model, config.model)
         self.sampler = Sampler()
@@ -134,20 +136,16 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # Each layer names its cache layout: keys and values per head, or one MLA latent.
+        layers = [module for module in self.model.modules() if isinstance(module, Attention)]
+        layer_shape = layers[0].kv_cache_shape(1, self.block_size)
+        block_bytes = len(layers) * math.prod(layer_shape) * config.hf_config.dtype.itemsize
         if config.num_kvcache_blocks <= 0:
             config.num_kvcache_blocks = dev.kvcache_bytes(self.device, config) // block_bytes
         assert config.num_kvcache_blocks > 0, "no memory left for the kv cache"
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        self.kv_cache = torch.empty(len(layers), *layers[0].kv_cache_shape(config.num_kvcache_blocks, self.block_size))
+        for layer, cache in zip(layers, self.kv_cache):
+            layer.bind_kv_cache(cache)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -156,7 +154,7 @@ class ModelRunner:
         return block_tables
 
     def prepare_batch(self, seqs: list[Sequence]):
-        """One batch for any mix of prompt chunks and decode rows."""
+        """One batch for any mix of prompt chunks and decode rows, and the context to run it in."""
         input_ids, positions, slot_mapping = [], [], []
         cu_seqlens_q, cu_seqlens_k = [0], [0]
         max_seqlen_q = max_seqlen_k = 0
@@ -202,12 +200,13 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
 
         block_tables = self.prepare_block_tables(seqs) if any(seq.block_table for seq in seqs) else None
-        set_context(
-            is_prefill,
+        context = dict(
+            is_prefill=is_prefill,
             cu_seqlens_q=dev.make_tensor(cu_seqlens_q, torch.int32, self.device),
             cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, self.device),
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            num_keys=cu_seqlens_k[-1],
             # Equal cumulative lengths: no row reads cached keys, so the cache can be skipped.
             keys_are_new=cu_seqlens_k == cu_seqlens_q,
             slot_mapping=dev.make_tensor(slot_mapping, torch.int32, self.device),
@@ -231,7 +230,7 @@ class ModelRunner:
         all_greedy = all(temperature == 0 for temperature in temperatures)
         temperatures = None if all_greedy else dev.make_tensor(temperatures, torch.float32, self.device)
         self._sampling_rows = sampling_rows
-        return input_ids, positions, temperatures, is_prefill
+        return input_ids, positions, temperatures, context
 
     def _prev_row(self, seq: Sequence) -> int:
         """Where this sequence sampled in the step still in flight."""
@@ -310,12 +309,12 @@ class ModelRunner:
     def run(self, seqs: list[Sequence]) -> SampledTokens | None:
         """Prepare, launch and sample. The tokens are not fetched here; the engine awaits them."""
         with record_function("prepare_batch"):
-            input_ids, positions, temperatures, is_prefill = self.prepare_batch(seqs)
-        with record_function("run_model"):
-            logits = self.run_model(input_ids, positions, is_prefill)
-        with record_function("sample"):
-            tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
-        reset_context()
+            input_ids, positions, temperatures, context = self.prepare_batch(seqs)
+        with set_context(**context):
+            with record_function("run_model"):
+                logits = self.run_model(input_ids, positions, context["is_prefill"])
+            with record_function("sample"):
+                tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
         if tokens is None:
             return None
         pending = SampledTokens(tokens, self.device)
@@ -417,15 +416,14 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            with set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs]):
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
             torch.cuda.synchronize()
-            reset_context()
 
         self.graph_vars = dict(
             input_ids=input_ids,

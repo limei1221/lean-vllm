@@ -41,8 +41,9 @@ layer. `qwen3.py` did not change.
 The interface is deliberately three methods, not one. `store_kvcache` belongs
 to the backend because the *cache layout* is a backend concern — FlashInfer and
 FlashMLA want different layouts, which is why `get_kv_cache_shape` is on the
-interface too, ready for the model runner to consult once the device layer
-lands.
+interface too. The model runner asks each layer for its cache shape, and a
+plain `Attention` layer answers from the backend. `MLAAttention` answers with
+its own latent layout, covered in [deepseek-v2.md](deepseek-v2.md).
 
 ### Tensor contract
 
@@ -193,8 +194,6 @@ are published.
 
 ## Next
 
-1. Have `allocate_kv_cache` call `get_kv_cache_shape`; the hook exists but the
-   model runner still hardcodes the FlashAttention layout.
-2. Batch the per-sequence loop in `TorchAttention` before publishing any
+1. Batch the per-sequence loop in `TorchAttention` before publishing any
    Torch-vs-Flash crossover numbers.
-3. FlashInfer / FlashMLA backends, then per-layer dispatch.
+2. FlashInfer / FlashMLA backends, then per-layer dispatch.
