@@ -1,10 +1,10 @@
-import os
-
 import torch
+
+from lean_vllm import envs
 
 
 def get_device() -> torch.device:
-    if override := os.getenv("LEAN_VLLM_DEVICE"):
+    if override := envs.LEAN_VLLM_DEVICE:
         return torch.device(override)
     if torch.cuda.is_available():
         return torch.device("cuda")

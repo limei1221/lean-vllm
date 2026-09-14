@@ -33,9 +33,8 @@ class FakeTokenizer:
 class FakeAsyncEngine:
     """Scripted outputs, so what is under test is the HTTP layer and nothing else."""
 
-    def __init__(self, pieces=("Hello", ", world"), finish_reason="length", max_model_len=64):
+    def __init__(self, pieces=("Hello", ", world"), finish_reason="length"):
         self.tokenizer = FakeTokenizer()
-        self.max_model_len = max_model_len
         self.metrics = Metrics()
         self.pieces = list(pieces)
         self.finish_reason = finish_reason
@@ -193,6 +192,20 @@ class TestStreaming:
     def test_usage_is_absent_unless_asked_for(self, client):
         assert all("usage" not in json.loads(p) for p in events(complete(client, stream=True))[:-1])
 
+    def test_a_chunk_keeps_its_null_fields(self, client):
+        """Chunks drop unset fields, so a null finish_reason and logprobs must still be sent."""
+        first = json.loads(events(complete(client, stream=True))[0])
+        assert first == {
+            "id": first["id"], "object": "text_completion", "created": first["created"], "model": MODEL,
+            "choices": [{"index": 0, "text": "Hello", "finish_reason": None, "logprobs": None}],
+        }
+
+    def test_a_chat_delta_carries_only_its_content(self, client):
+        body = {"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4, "stream": True}
+        second = json.loads(events(client.post("/v1/chat/completions", json=body))[1])
+        assert second["object"] == "chat.completion.chunk"
+        assert second["choices"] == [{"index": 0, "delta": {"content": "Hello"}, "finish_reason": None}]
+
 
 class TestStopStrings:
 
@@ -258,20 +271,16 @@ class TestRefusals:
             "model": "some-other-model", "messages": [{"role": "user", "content": "hi"}],
         }).status_code == 404
 
-    def test_a_prompt_over_the_context_is_refused(self, client, engine):
-        response = complete(client, prompt=[0] * (engine.max_model_len + 1))
-        assert response.status_code == 400
-        assert not engine.requests    # refused here, not asserted deep in the runner
-
-    def test_max_tokens_that_overruns_the_context_is_refused(self, client, engine):
-        assert complete(client, prompt=[0] * 60, max_tokens=10).status_code == 400
-
-    def test_a_prompt_the_engine_rejects_is_a_400_and_not_a_500(self, client, engine):
-        """Token ids are only checkable against the vocabulary, which lives in the engine."""
-        engine.admission_error = InvalidRequest("token id 999999 is outside the 100-token vocabulary")
+    @pytest.mark.parametrize("message", [
+        "token id 999999 is outside the 100-token vocabulary",
+        "prompt is 65 tokens, over the 64-token context",
+    ])
+    def test_a_prompt_the_engine_rejects_is_a_400_and_not_a_500(self, client, engine, message):
+        """Validation lives in the engine, which knows the vocabulary and the context length."""
+        engine.admission_error = InvalidRequest(message)
         response = complete(client, prompt=[999999])
         assert response.status_code == 400
-        assert "outside the 100-token vocabulary" in response.json()["error"]["message"]
+        assert response.json()["error"]["message"] == message
 
     def test_a_full_queue_is_a_429(self, client, engine):
         engine.admission_error = QueueFull("4 requests already waiting")

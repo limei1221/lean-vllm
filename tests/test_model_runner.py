@@ -9,7 +9,7 @@ from lean_vllm.engine.model_runner import (
     ModelRunner, PIECEWISE_MAX_PAD, PIECEWISE_MAX_TOKENS, PIECEWISE_MIN_TOKENS)
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.sampling_params import SamplingParams
-from lean_vllm.utils.context import get_context, reset_context
+from lean_vllm.utils.context import Context, get_context
 
 
 @pytest.fixture
@@ -20,8 +20,7 @@ def runner():
     runner.device = torch.device("cpu")
     runner.block_size = 8
     runner._prev_tokens = runner._prev_rows = None
-    yield runner
-    reset_context()
+    return runner
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -38,15 +37,15 @@ def test_batch_preparation_on_tensor_parallel_ranks(runner, rank, decode):
     if rank:
         seq = pickle.loads(pickle.dumps(seq))
 
-    ids, positions, temperatures, is_prefill = runner.prepare_batch([seq])
+    ids, positions, temperatures, context = runner.prepare_batch([seq])
 
     assert ids.tolist() == ([13] if decode else [10, 11, 12])
     assert positions.tolist() == ([3] if decode else [0, 1, 2])
-    assert is_prefill == (not decode)
+    assert context["is_prefill"] == (not decode)
     if decode:
-        assert get_context().logits_indices is None
+        assert context["logits_indices"] is None
     else:
-        assert get_context().logits_indices.tolist() == [2]
+        assert context["logits_indices"].tolist() == [2]
     if rank:
         assert temperatures is None
     else:
@@ -78,7 +77,7 @@ def test_a_pending_row_takes_its_input_from_the_previous_tokens(runner):
     runner._prev_tokens = SampledTokens(torch.tensor([77], dtype=torch.int64), torch.device("cpu"))
     runner._prev_rows = {seq.seq_id: 0}
 
-    ids, positions, temperatures, is_prefill = runner.prepare_batch([seq])
+    ids, positions, temperatures, context = runner.prepare_batch([seq])
 
     assert ids.tolist() == [77]
     assert positions.tolist() == [3]
@@ -96,7 +95,7 @@ def test_the_fast_path_slices_a_previous_tensor_with_extra_rows(runner):
     runner._prev_tokens = SampledTokens(torch.tensor([77, 88, 99], dtype=torch.int64), torch.device("cpu"))
     runner._prev_rows = {seq1.seq_id: 0, seq2.seq_id: 1}
 
-    ids, positions, temperatures, is_prefill = runner.prepare_batch([seq1, seq2])
+    ids, positions, temperatures, context = runner.prepare_batch([seq1, seq2])
 
     assert ids.tolist() == [77, 88]
 
@@ -113,7 +112,7 @@ def test_a_reordered_mapping_takes_the_general_path(runner):
     runner._prev_tokens = SampledTokens(torch.tensor([77, 88], dtype=torch.int64), torch.device("cpu"))
     runner._prev_rows = {seq1.seq_id: 1, seq2.seq_id: 0}
 
-    ids, positions, temperatures, is_prefill = runner.prepare_batch([seq1, seq2])
+    ids, positions, temperatures, context = runner.prepare_batch([seq1, seq2])
 
     assert ids.tolist() == [88, 77]
 
@@ -152,13 +151,28 @@ def test_keys_are_new_follows_the_cached_tokens(runner):
     """It decides which entry point a flash prefill takes, so it must not lag the batch."""
     cold = Sequence([10, 11, 12], SamplingParams())
     cold.num_scheduled_tokens = 3
-    runner.prepare_batch([cold])
-    assert get_context().keys_are_new
+    _, _, _, context = runner.prepare_batch([cold])
+    assert context["keys_are_new"]
 
     resumed = Sequence([20, 21, 22, 23], SamplingParams())
     resumed.num_cached_tokens, resumed.num_scheduled_tokens = 2, 2
-    runner.prepare_batch([cold, resumed])
-    assert not get_context().keys_are_new
+    _, _, _, context = runner.prepare_batch([cold, resumed])
+    assert not context["keys_are_new"]
+
+
+def test_a_failed_step_leaves_no_context_behind(runner):
+    """The next step, or a graph capture, must not read this one's layout."""
+    seq = Sequence([10, 11, 12], SamplingParams())
+    seq.num_scheduled_tokens = 3
+
+    def explode(input_ids, positions, is_prefill):
+        assert get_context().is_prefill
+        raise RuntimeError("boom")
+
+    runner.run_model = explode
+    with pytest.raises(RuntimeError, match="boom"):
+        runner.run([seq])
+    assert get_context() == Context()
 
 
 class TestPiecewiseBuckets:
@@ -255,12 +269,12 @@ def test_preemption_recomputes_the_generated_suffix(runner, make_engine, chunked
     assert second.num_tokens == 20
 
     scheduled = engine.scheduler.schedule().scheduled
-    ids, positions, temperatures, is_prefill = runner.prepare_batch(scheduled)
+    ids, positions, temperatures, context = runner.prepare_batch(scheduled)
 
-    assert is_prefill
+    assert context["is_prefill"]
     assert ids.tolist() == [1108, 1109, 1110, 1111]
     assert positions.tolist() == [16, 17, 18, 19]
-    assert get_context().logits_indices.tolist() == [3]
+    assert context["logits_indices"].tolist() == [3]
     assert temperatures.tolist() == [1.0]
     rows = engine.scheduler.advance(scheduled)
     stepped = engine.scheduler.reconcile(rows, [1112])
@@ -289,15 +303,15 @@ def test_recomputed_suffix_stays_prefill_across_chunks(runner, make_engine):
     ]:
         scheduled = engine.scheduler.schedule().scheduled
         assert scheduled == [seq]
-        ids, positions, temperatures, is_prefill = runner.prepare_batch(scheduled)
-        assert is_prefill
+        ids, positions, temperatures, context = runner.prepare_batch(scheduled)
+        assert context["is_prefill"]
         assert ids.tolist() == expected_ids
         assert positions.tolist() == expected_positions
         assert len(seq.block_table) == 2    # replay uses the blocks reserved at admission
         last = expected_positions == [8]
         # None until the chunk that samples: no row asks for a temperature before it.
         assert (temperatures.tolist() if last else temperatures) == ([1.0] if last else None)
-        assert get_context().logits_indices.tolist() == ([0] if last else [])
+        assert context["logits_indices"].tolist() == ([0] if last else [])
         rows = engine.scheduler.advance(scheduled)
         stepped = engine.scheduler.reconcile(rows, [27] if last else [])
         assert stepped == ([seq] if last else [])

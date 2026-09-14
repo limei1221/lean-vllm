@@ -93,9 +93,13 @@ class TestTrace:
 class TestStatistics:
 
     def test_percentiles_interpolate(self):
-        values = [0.0, 1.0, 2.0, 3.0, 4.0]
-        assert bench.percentile(values, 0.5) == 2.0
-        assert bench.percentile(values, 0.99) == pytest.approx(3.96)
+        summary = bench.distribution([4.0, 0.0, 3.0, 1.0, 2.0])
+        assert summary["p50"] == 2.0
+        assert summary["p99"] == pytest.approx(3.96)
+
+    def test_a_single_sample_is_every_percentile(self):
+        summary = bench.distribution([0.25])
+        assert summary == {"count": 1, "mean": 0.25, "p50": 0.25, "p90": 0.25, "p95": 0.25, "p99": 0.25, "max": 0.25}
 
     def test_a_distribution_of_nothing_is_none_rather_than_zero(self):
         assert bench.distribution([None, None]) is None

@@ -35,17 +35,17 @@ def model():
 def decode_step():
     """One decoding row, reading three cached tokens out of block 0."""
     torch.manual_seed(0)
-    set_context(
+    with set_context(
         False,
         slot_mapping=torch.tensor([-1], dtype=torch.int32),    # -1 skips the cache write
         context_lens=torch.tensor([3], dtype=torch.int32),
         block_tables=torch.tensor([[0]], dtype=torch.int32),
-    )
-    return (
-        torch.randn(1, NUM_HEADS, HEAD_DIM),
-        torch.randn(1, NUM_KV_HEADS, HEAD_DIM),
-        torch.randn(1, NUM_KV_HEADS, HEAD_DIM),
-    )
+    ):
+        yield (
+            torch.randn(1, NUM_HEADS, HEAD_DIM),
+            torch.randn(1, NUM_KV_HEADS, HEAD_DIM),
+            torch.randn(1, NUM_KV_HEADS, HEAD_DIM),
+        )
 
 
 def test_layers_are_named_by_module_path(model):

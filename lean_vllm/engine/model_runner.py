@@ -13,7 +13,7 @@ from lean_vllm.engine.sequence import Sequence
 from lean_vllm.models.qwen3 import Qwen3ForCausalLM
 from lean_vllm.layers.attention import register_layers
 from lean_vllm.layers.sampler import Sampler
-from lean_vllm.utils.context import set_context, get_context, reset_context
+from lean_vllm.utils.context import set_context, get_context
 from lean_vllm.utils.loader import load_model
 from lean_vllm.utils import device as dev
 
@@ -156,7 +156,7 @@ class ModelRunner:
         return block_tables
 
     def prepare_batch(self, seqs: list[Sequence]):
-        """One batch for any mix of prompt chunks and decode rows."""
+        """One batch for any mix of prompt chunks and decode rows, and the context to run it in."""
         input_ids, positions, slot_mapping = [], [], []
         cu_seqlens_q, cu_seqlens_k = [0], [0]
         max_seqlen_q = max_seqlen_k = 0
@@ -202,8 +202,8 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
 
         block_tables = self.prepare_block_tables(seqs) if any(seq.block_table for seq in seqs) else None
-        set_context(
-            is_prefill,
+        context = dict(
+            is_prefill=is_prefill,
             cu_seqlens_q=dev.make_tensor(cu_seqlens_q, torch.int32, self.device),
             cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, self.device),
             max_seqlen_q=max_seqlen_q,
@@ -231,7 +231,7 @@ class ModelRunner:
         all_greedy = all(temperature == 0 for temperature in temperatures)
         temperatures = None if all_greedy else dev.make_tensor(temperatures, torch.float32, self.device)
         self._sampling_rows = sampling_rows
-        return input_ids, positions, temperatures, is_prefill
+        return input_ids, positions, temperatures, context
 
     def _prev_row(self, seq: Sequence) -> int:
         """Where this sequence sampled in the step still in flight."""
@@ -310,12 +310,12 @@ class ModelRunner:
     def run(self, seqs: list[Sequence]) -> SampledTokens | None:
         """Prepare, launch and sample. The tokens are not fetched here; the engine awaits them."""
         with record_function("prepare_batch"):
-            input_ids, positions, temperatures, is_prefill = self.prepare_batch(seqs)
-        with record_function("run_model"):
-            logits = self.run_model(input_ids, positions, is_prefill)
-        with record_function("sample"):
-            tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
-        reset_context()
+            input_ids, positions, temperatures, context = self.prepare_batch(seqs)
+        with set_context(**context):
+            with record_function("run_model"):
+                logits = self.run_model(input_ids, positions, context["is_prefill"])
+            with record_function("sample"):
+                tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
         if tokens is None:
             return None
         pending = SampledTokens(tokens, self.device)
@@ -417,15 +417,14 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            with set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs]):
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
             torch.cuda.synchronize()
-            reset_context()
 
         self.graph_vars = dict(
             input_ids=input_ids,
