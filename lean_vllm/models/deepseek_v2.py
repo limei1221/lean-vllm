@@ -77,7 +77,7 @@ class DeepseekV2Attention(nn.Module):
         )
 
     def expand(self, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Keys and values, [n, heads, dim] each, from cached latents [n, kv_lora_rank + rope dim]."""
+        """Keys and values, [n, heads, dim] each, from cached latents [n, kv_lora_rank + qk_rope_head_dim]."""
         kv_c, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv = self.kv_b_proj(kv_c).view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)

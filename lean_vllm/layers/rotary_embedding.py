@@ -29,6 +29,7 @@ def yarn_inv_freq(rotary_dim: int, base: float, scaling: dict) -> torch.Tensor:
     factor = scaling["factor"]
     original_max_position = scaling["original_max_position_embeddings"]
 
+    # index of the RoPE pair that completes num_rotations turns over the original context
     def correction_dim(num_rotations: float) -> float:
         return rotary_dim * math.log(original_max_position / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
 
