@@ -68,6 +68,23 @@ class TorchAttention(AttentionBackend):
             outputs.append(self._sdpa(q_i, k_i, v_i, mask))
         return torch.cat(outputs, dim=0)
 
+    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal):
+        # Written out, since SDPA does not return the log-sum-exp.
+        cu_seqlens_q, cu_seqlens_k = cu_seqlens_q.tolist(), cu_seqlens_k.tolist()
+        repeats = self.num_heads // self.num_kv_heads
+        outputs, lses = [], []
+        for i in range(len(cu_seqlens_q) - 1):
+            q_i = q[cu_seqlens_q[i]:cu_seqlens_q[i + 1]].transpose(0, 1).float()    # [H, Lq, D]
+            k_i = k[cu_seqlens_k[i]:cu_seqlens_k[i + 1]].transpose(0, 1).float().repeat_interleave(repeats, dim=0)
+            v_i = v[cu_seqlens_k[i]:cu_seqlens_k[i + 1]].transpose(0, 1).float().repeat_interleave(repeats, dim=0)
+            scores = q_i @ k_i.transpose(1, 2) * self.scale    # [H, Lq, Lk]
+            mask = self._causal_mask(q_i.size(1), k_i.size(1), q.device) if causal else None
+            if mask is not None:
+                scores = scores.masked_fill(~mask, float("-inf"))
+            outputs.append((scores.softmax(dim=-1) @ v_i).transpose(0, 1).to(q.dtype))
+            lses.append(scores.logsumexp(dim=-1).transpose(0, 1))
+        return torch.cat(outputs), torch.cat(lses)
+
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
         block_tables = context.block_tables
         outputs = []

@@ -12,7 +12,7 @@ from lean_vllm.config import Config, FULL_MODES, PIECEWISE_MODES
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.models import get_model_class
-from lean_vllm.layers.attention import Attention, register_layers
+from lean_vllm.layers.attention import Attention, MLAAttention, register_layers
 from lean_vllm.layers.sampler import Sampler
 from lean_vllm.utils.context import set_context, get_context
 from lean_vllm.utils.loader import load_model
@@ -61,6 +61,10 @@ class ModelRunner:
         torch.set_default_device(self.device)
         self.model = model_cls(hf_config)
         register_layers(self.model)    # before warmup_model, which runs the op
+        for module in self.model.modules():
+            if isinstance(module, MLAAttention):
+                # Warmup expands a step's worth of new latents, so a chunk this size fits what it measured.
+                module.max_context_chunk = config.max_num_batched_tokens
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -206,7 +210,8 @@ class ModelRunner:
             cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, self.device),
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            num_keys=cu_seqlens_k[-1],
+            cu_seqlens_q_host=cu_seqlens_q,
+            cu_seqlens_k_host=cu_seqlens_k,
             # Equal cumulative lengths: no row reads cached keys, so the cache can be skipped.
             keys_are_new=cu_seqlens_k == cu_seqlens_q,
             slot_mapping=dev.make_tensor(slot_mapping, torch.int32, self.device),

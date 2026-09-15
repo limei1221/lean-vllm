@@ -12,7 +12,7 @@ from transformers import DeepseekV2ForCausalLM as HFDeepseekV2ForCausalLM
 
 from lean_vllm.engine.model_runner import ModelRunner
 from lean_vllm.engine.sequence import Sequence
-from lean_vllm.layers.attention import MLAAttention, register_layers
+from lean_vllm.layers.attention import MLAAttention, plan_context_chunks, register_layers
 from lean_vllm.models import get_model_class
 from lean_vllm.models.deepseek_v2 import DeepseekV2ForCausalLM
 from lean_vllm.utils.context import set_context
@@ -112,13 +112,16 @@ def test_a_prompt_matches_transformers(models, runner):
     torch.testing.assert_close(logits, reference_logits(reference, tokens), rtol=1e-4, atol=1e-4)
 
 
-def test_paged_steps_match_transformers(models, runner):
+# 4 splits a's cached keys across chunks and shares one chunk between a's tail and b's head.
+@pytest.mark.parametrize("max_context_chunk", [64, 4], ids=["one_chunk", "split_rows"])
+def test_paged_steps_match_transformers(models, runner, max_context_chunk):
     """Chunks, a cold prompt beside a resumed one, pure decode, then decode mixed with a prompt."""
     reference, model = models
     layers = [module for module in model.modules() if isinstance(module, MLAAttention)]
     cache = torch.zeros(len(layers), *layers[0].kv_cache_shape(NUM_BLOCKS, BLOCK_SIZE))
     for layer, layer_cache in zip(layers, cache):
         layer.bind_kv_cache(layer_cache)
+        layer.max_context_chunk = max_context_chunk
     a, b, c = (torch.randint(0, 128, (n,)).tolist() for n in (11, 8, 3))
     table_a, table_b, table_c = [5, 2, 9], [7, 0], [3]    # scattered, so a wrong page walk shows
 
@@ -135,6 +138,13 @@ def test_paged_steps_match_transformers(models, runner):
         for (seq, want), got in zip(rows, step(runner, model, seqs)):
             start = seq.num_cached_tokens
             torch.testing.assert_close(got, want[start:start + seq.num_scheduled_tokens], rtol=1e-4, atol=1e-4)
+
+
+def test_context_chunks_split_long_rows_and_skip_empty_ones():
+    # (first row, starts, lengths): row 0 splits three ways, row 1 has nothing cached, 2 and 3 share a chunk.
+    assert plan_context_chunks([9, 0, 2, 3], budget=4) == [
+        (0, [0], [4]), (0, [4], [4]), (0, [8], [1]), (2, [0, 0], [2, 2]), (3, [2], [1]),
+    ]
 
 
 def test_the_cache_holds_one_latent_per_token(models):

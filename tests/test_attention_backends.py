@@ -71,19 +71,29 @@ def tol(dtype):
     return TOLERANCE[dtype]
 
 
-def dense_attention(q, k, v, scale=SCALE, compute_dtype=torch.float32):
-    """Causal attention one head at a time. q is [lq, H, D], k/v [lk, Hkv, D] full sequence."""
+def dense_scores(q, k, scale=SCALE, compute_dtype=torch.float32, causal=True):
+    """Attention logits one head at a time, [H, lq, lk]. q is [lq, H, D], k [lk, Hkv, D] full sequence."""
     lq, num_heads, _ = q.shape
     lk, num_kv_heads, _ = k.shape
     k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
-    v = v.repeat_interleave(num_heads // num_kv_heads, dim=1)
+
+    scores = torch.empty(num_heads, lq, lk, dtype=compute_dtype, device=q.device)
+    for h in range(num_heads):
+        scores[h] = (q[:, h, :].to(compute_dtype) @ k[:, h, :].to(compute_dtype).T) * scale
+        for j in range(lq if causal else 0):
+            scores[h, j, lk - lq + j + 1:] = float("-inf")
+    return scores
+
+
+def dense_attention(q, k, v, scale=SCALE, compute_dtype=torch.float32, causal=True):
+    """Attention one head at a time. q is [lq, H, D], k/v [lk, Hkv, D] full sequence."""
+    num_heads = q.size(1)
+    v = v.repeat_interleave(num_heads // v.size(1), dim=1)
+    scores = dense_scores(q, k, scale, compute_dtype, causal)
 
     out = torch.empty_like(q)
     for h in range(num_heads):
-        scores = (q[:, h, :].to(compute_dtype) @ k[:, h, :].to(compute_dtype).T) * scale
-        for j in range(lq):
-            scores[j, lk - lq + j + 1:] = float("-inf")
-        out[:, h, :] = (scores.softmax(dim=-1) @ v[:, h, :].to(compute_dtype)).to(q.dtype)
+        out[:, h, :] = (scores[h].softmax(dim=-1) @ v[:, h, :].to(compute_dtype)).to(q.dtype)
     return out
 
 
@@ -128,6 +138,29 @@ def test_prefill_without_cache(backend, device, dtype, tol):
 
     expected = torch.cat([dense_attention(q, k, v) for q, k, v in zip(qs, ks, vs)])
     torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "unmasked"])
+def test_varlen_with_lse(backend, device, dtype, tol, causal):
+    """Uncached attention and its log-sum-exp, by which MLA merges chunks of cached keys."""
+    seqlens_q = [5, 1, 12]
+    seqlens_k = seqlens_q if causal else [7, 4, 16]    # unmasked chunks hold more keys than queries
+    qs = [randn(n, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens_q]
+    ks = [randn(n, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens_k]
+    vs = [randn(n, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens_k]
+
+    def cumulative(seqlens):
+        return torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device=device)
+
+    out, lse = backend.varlen_with_lse(
+        torch.cat(qs), torch.cat(ks), torch.cat(vs), cumulative(seqlens_q), cumulative(seqlens_k),
+        max(seqlens_q), max(seqlens_k), causal,
+    )
+
+    expected = torch.cat([dense_attention(q, k, v, causal=causal) for q, k, v in zip(qs, ks, vs)])
+    expected_lse = torch.cat([dense_scores(q, k, causal=causal).logsumexp(-1).T for q, k in zip(qs, ks)])
+    torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+    torch.testing.assert_close(lse, expected_lse, atol=tol, rtol=tol)
 
 
 def test_prefill_of_a_cold_batch_with_pages(backend, device, block_size, dtype, tol):

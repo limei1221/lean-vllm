@@ -28,7 +28,7 @@ Qwen3Attention
 layers.attention.Attention        # owns the layer's KV cache slice
       |
       v
-AttentionBackend                  # store_kvcache / prefill / decode
+AttentionBackend                  # store_kvcache / prefill / decode / varlen_with_lse
       |
       +-- TorchAttention          # SDPA, any device, reference oracle
       |
@@ -56,6 +56,13 @@ Identical across backends; sequences are packed, not padded.
 | `prefill` returns | `[num_tokens, num_heads, head_dim]` |
 | `decode` q | `[batch_size, num_heads, head_dim]` |
 | `decode` returns | `[batch_size, num_heads, head_dim]` |
+| `varlen_with_lse` k, v | `[num_keys, num_kv_heads, head_dim]`, no cache |
+| `varlen_with_lse` returns | output as `prefill`, and lse `[num_tokens, num_heads]` |
+
+`varlen_with_lse` serves MLA, which attends its cached context in chunks and
+merges them by log-sum-exp. FA3 returns the lse through `return_attn_probs`, as
+`[num_heads, num_tokens]`, so the flash backend transposes it. SDPA returns no
+lse, so the torch backend writes that attention out.
 
 `flash_attn_with_kvcache` returns a singleton query axis in the decode shape;
 the flash backend squeezes it so both backends return the same rank. An

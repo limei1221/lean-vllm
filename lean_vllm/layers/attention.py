@@ -1,4 +1,5 @@
 import dataclasses
+from itertools import accumulate
 from typing import Callable
 
 import torch
@@ -6,6 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from lean_vllm.attention import AttentionBackend, get_attention_backend
+from lean_vllm.utils import device as dev
 from lean_vllm.utils.context import Context, get_context
 
 # A custom op cannot take modules, so layers are looked up by name. One per process.
@@ -91,23 +93,84 @@ class Attention(nn.Module):
         return self.backend.decode(q, k_cache, v_cache, context)
 
 
-def key_slots(context: Context, block_size: int) -> torch.Tensor:
-    """The cache slot of every key the step attends, row after row. Computed once per step."""
-    if context.key_slots is None:
-        cu_seqlens_k = context.cu_seqlens_k.long()
-        rows = torch.repeat_interleave(cu_seqlens_k.diff(), output_size=context.num_keys)
-        positions = torch.arange(context.num_keys, device=rows.device) - cu_seqlens_k[rows]
-        blocks = context.block_tables[rows, positions // block_size].long()
-        context.key_slots = blocks * block_size + positions % block_size
-    return context.key_slots
+@dataclasses.dataclass(slots=True)
+class ContextChunk:
+    """Cached keys of consecutive rows, and the queries of those rows."""
+    queries: slice    # the rows' tokens in the step's q
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+    slots: torch.Tensor    # the cache slot of each key
+
+
+def plan_context_chunks(context_lens: list[int], budget: int) -> list[tuple[int, list[int], list[int]]]:
+    """Pack rows' cached keys into chunks of at most budget, as (first row, starts, lengths).
+
+    Rows stay consecutive within a chunk, one longer than the budget splits across chunks,
+    and a row with no cached keys belongs to none.
+    """
+    assert budget > 0
+    chunks = []
+    row = start = 0
+    while row < len(context_lens):
+        if not context_lens[row]:
+            row += 1
+            continue
+        first, starts, lens, used = row, [], [], 0
+        while row < len(context_lens) and context_lens[row] and used < budget:
+            take = min(context_lens[row] - start, budget - used)
+            starts.append(start)
+            lens.append(take)
+            used += take
+            start += take
+            if start == context_lens[row]:
+                row, start = row + 1, 0
+        chunks.append((first, starts, lens))
+    return chunks
+
+
+def context_chunks(context: Context, block_size: int, budget: int) -> list[ContextChunk]:
+    """The step's cached keys in chunks, planned on the host once per step."""
+    if context.context_chunks is None:
+        cu_q, cu_k = context.cu_seqlens_q_host, context.cu_seqlens_k_host
+        context_lens = [(cu_k[i + 1] - cu_k[i]) - (cu_q[i + 1] - cu_q[i]) for i in range(len(cu_q) - 1)]
+        device = context.block_tables.device
+        context.context_chunks = []
+        for first, starts, lens in plan_context_chunks(context_lens, budget):
+            last = first + len(lens)
+            cu_seqlens_k = [0, *accumulate(lens)]
+            num_keys = cu_seqlens_k[-1]
+            key_rows = torch.repeat_interleave(dev.make_tensor(lens, torch.int64, device), output_size=num_keys)
+            offsets = dev.make_tensor([s - c for s, c in zip(starts, cu_seqlens_k)], torch.int64, device)
+            positions = torch.arange(num_keys, device=device) + offsets[key_rows]
+            blocks = context.block_tables[first + key_rows, positions // block_size].long()
+            context.context_chunks.append(ContextChunk(
+                queries=slice(cu_q[first], cu_q[last]),
+                cu_seqlens_q=dev.make_tensor([n - cu_q[first] for n in cu_q[first:last + 1]], torch.int32, device),
+                cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, device),
+                max_seqlen_q=max(cu_q[i + 1] - cu_q[i] for i in range(first, last)),
+                max_seqlen_k=max(lens),
+                slots=blocks * block_size + positions % block_size,
+            ))
+    return context.context_chunks
+
+
+def merge_attention(o_a, lse_a, o_b, lse_b) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attention over two disjoint key sets, from each one's output and log-sum-exp."""
+    weight_b = torch.sigmoid(lse_b - lse_a).unsqueeze(-1)    # exp(lse_b) / (exp(lse_a) + exp(lse_b))
+    o = torch.lerp(o_a.float(), o_b.float(), weight_b)
+    return o.to(o_a.dtype), torch.logaddexp(lse_a, lse_b)
 
 
 class MLAAttention(Attention):
     """Multi-head latent attention: the cache holds one compressed latent per token.
 
-    Each step expands every latent it reads back into keys and values, then runs the
-    backend's varlen prefill over them, so decode rows are just rows one query long.
+    Each step expands the latents it reads back into keys and values. Cached ones are
+    read at most max_context_chunk at a time and merged by log-sum-exp, as vLLM does.
     """
+
+    max_context_chunk = 8192    # the runner sets its step token budget
 
     def __init__(
         self,
@@ -140,13 +203,31 @@ class MLAAttention(Attention):
         if cache.numel():
             # No -1 slots to skip: an MLA step is never padded for a graph.
             cache.view(-1, self.latent_dim).index_copy_(0, context.slot_mapping.long(), latent)
-        if context.is_prefill and (context.keys_are_new or context.block_tables is None):
-            keys = latent    # every key the step reads is new
-        else:
-            keys = cache.view(-1, self.latent_dim)[key_slots(context, cache.size(1))]
-        k, v = self.expand(keys)
-        # Backends take one head size, so values pad up to the keys' and are cut back after.
-        v = F.pad(v, (0, self.head_dim - self.v_head_dim))
-        unpaged = dataclasses.replace(context, block_tables=None, keys_are_new=True)
-        o = self.backend.prefill(q, k, v, self.k_cache, self.v_cache, unpaged)
+        k, v = self.expand(latent)
+        if context.keys_are_new or context.block_tables is None:
+            # Every key the step reads is new, so a plain prefill with no page table covers it.
+            unpaged = dataclasses.replace(context, block_tables=None, keys_are_new=True)
+            o = self.backend.prefill(q, k, self._pad(v), self.k_cache, self.v_cache, unpaged)
+            return o[..., :self.v_head_dim].contiguous()
+        # The step's tokens attend each other causally. Cached keys precede all of them, so each
+        # chunk of those is attended unmasked and merged in, keeping expansions bounded.
+        cu_seqlens_q, max_seqlen_q = context.cu_seqlens_q, context.max_seqlen_q
+        o, lse = self.backend.varlen_with_lse(
+            q, k, self._pad(v), cu_seqlens_q, cu_seqlens_q, max_seqlen_q, max_seqlen_q, causal=True,
+        )
+        del k, v
+        latents = cache.view(-1, self.latent_dim)
+        for chunk in context_chunks(context, cache.size(1), self.max_context_chunk):
+            k, v = self.expand(latents[chunk.slots])
+            rows = chunk.queries
+            o_chunk, lse_chunk = self.backend.varlen_with_lse(
+                q[rows], k, self._pad(v), chunk.cu_seqlens_q, chunk.cu_seqlens_k,
+                chunk.max_seqlen_q, chunk.max_seqlen_k, causal=False,
+            )
+            del k, v
+            o[rows], lse[rows] = merge_attention(o[rows], lse[rows], o_chunk, lse_chunk)
         return o[..., :self.v_head_dim].contiguous()
+
+    def _pad(self, v: torch.Tensor) -> torch.Tensor:
+        # Backends take one head size, so values pad up to the keys' and are cut back after.
+        return F.pad(v, (0, self.head_dim - self.v_head_dim))

@@ -31,21 +31,31 @@ back through `bind_kv_cache`, rather than reading head counts off the config.
 Each step it:
 
 1. scatters the step's latents into their slots;
-2. reads the latent of every key the step attends. When no row resumes
-   (`keys_are_new`) these are the step's own latents. Otherwise it gathers
-   through `key_slots`, which is computed once per step from the block tables
-   and `cu_seqlens_k`. The gather's size comes from `num_keys` on the host, so
-   it does not sync;
-3. expands the latents into keys and values with `kv_b_proj`;
-4. runs the backend's varlen `prefill` with no page table, where a decode row
-   is simply a row whose query is one token long.
+2. expands the step's own latents into keys and values with `kv_b_proj`. When
+   no row resumes (`keys_are_new`) these are every key the step reads, so the
+   backend's varlen `prefill` runs with no page table and that is all;
+3. otherwise runs `varlen_with_lse` causally over the step's own keys. A decode
+   row is simply a row whose query is one token long;
+4. reads the cached context in chunks of at most `max_context_chunk` keys, as
+   vLLM's chunked context does. Each chunk gathers its latents, expands them,
+   attends them unmasked, since all cached keys precede the step's queries, and
+   merges its output into the running one by log-sum-exp.
+
+`plan_context_chunks` packs consecutive rows into a chunk and splits a row
+longer than the budget across chunks. The plan and its slots are built once per
+step from `cu_seqlens_q_host` and `cu_seqlens_k_host`, so nothing syncs. The
+runner sets the budget to `max_num_batched_tokens`: warmup expands that many new
+latents, so no chunk expands more than the KV-cache sizing already measured.
+vLLM uses a separate workspace of up to 64k tokens and reserves it in its
+profile run instead.
 
 Values are zero-padded from `v_head_dim` (128) to the query/key head size (192),
 so a backend still sees one head size. The softmax scale is passed explicitly,
 so the padding changes nothing, and the output is cut back to 128.
 
-The trade-off is decode. Every step re-expands the whole context in every layer,
-which costs compute in proportion to context length. FlashMLA avoids that by
+The trade-off is decode. Chunking bounds the memory, not the compute: every step
+still re-expands the whole context in every layer, now one chunk at a time, so
+a long decode batch pays one attention call per chunk. FlashMLA avoids that by
 attending over the latents directly. This path comes first because it is
 obviously correct. An MLA decode kernel should land before any numbers are
 published.
@@ -73,7 +83,7 @@ GPT-J style, so its rotary embedding is built with `is_neox_style=False`.
 ## CUDA graphs
 
 This model reports `supports_cuda_graph = False`, so it runs eager everywhere.
-The key gather is sized per step, and piecewise capture expects the q/k/v
+The context chunks are planned per step, and piecewise capture expects the q/k/v
 pieces of the Qwen3 layer split.
 
 ## Testing
@@ -84,11 +94,18 @@ It runs three configs: V2-Lite's shape, one with `q_lora_rank`, and one with
 group-limited routing. It compares a whole prompt, then a sequence of paged
 steps built by the runner's own `prepare_batch`: a chunk, a resumed chunk beside
 a cold prompt, pure decode, and decode mixed with a prompt. The block tables are
-scattered.
+scattered. The paged steps run twice: with the context in one chunk, and with a
+budget of 4, which splits a row across chunks and puts the end of one row and
+the start of the next in the same chunk. `test_varlen_with_lse` checks both
+backends' output and lse against the dense oracle.
 
 Mutations the suite catches: resumed rows reading only their new latents, a key
 gather that reads only the first page, uncut value padding, a dropped softmax
-mscale, a dropped cos/sin attention factor, and unscaled routing weights.
+mscale, a dropped cos/sin attention factor, and unscaled routing weights. For
+the chunked context: unmerged chunks, chunks attended causally, split rows read
+from position 0, swapped merge weights, and an lse that is not accumulated.
+
+The flash backend's `varlen_with_lse` has not run yet: FA3 needs a Hopper GPU.
 
 Writing it turned up an fp32 bug in `RMSNorm`. `.float()` and `.to()` alias an
 fp32 tensor, so the in-place normalization rewrote the residual. bf16 always

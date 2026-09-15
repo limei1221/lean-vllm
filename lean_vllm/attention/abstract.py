@@ -62,6 +62,23 @@ class AttentionBackend(ABC):
         """
 
     @abstractmethod
+    def varlen_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        causal: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attention over packed k and v with no cache, and its log-sum-exp, [num_tokens, num_heads].
+
+        The lse lets attention over disjoint key sets be merged. A causal mask is bottom-right aligned.
+        """
+
+    @abstractmethod
     def decode(
         self,
         q: torch.Tensor,

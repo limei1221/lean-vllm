@@ -82,6 +82,15 @@ class FlashAttention3Backend(AttentionBackend):
             softmax_scale=self.scale, causal=True,
         )
 
+    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal):
+        o, lse = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.scale, causal=causal, return_attn_probs=True,
+        )
+        return o, lse.transpose(0, 1)    # FA3's varlen lse is [heads, tokens]
+
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
         o = flash_attn_with_kvcache(
             q.unsqueeze(1), k_cache, v_cache,
