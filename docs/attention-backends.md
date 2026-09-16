@@ -2,7 +2,8 @@
 
 Status: interface + `TorchAttention` + `FlashAttention3Backend` +
 `FlashMLABackend` landed, and CUDA-graph capture is gated on
-`supports_cuda_graph()`. Not yet done: FlashInfer.
+`supports_cuda_graph()`, plus `supports_mla_decode()` for an MLA model's full
+graphs. Not yet done: FlashInfer.
 
 ## Problem
 
@@ -62,6 +63,7 @@ Identical across backends; sequences are packed, not padded.
 | `varlen_with_lse` returns | output as `prefill`, and lse `[num_tokens, num_heads]` |
 | `mla_decode` q | `[batch_size, num_heads, latent_dim]` |
 | `mla_decode` returns | `[batch_size, num_heads, v_dim]` |
+| `store_latents` latent | `[num_tokens, latent_dim]`, slot `-1` skips |
 
 `varlen_with_lse` serves MLA, which attends its cached context in chunks and
 merges them by log-sum-exp. FA3 returns the lse through `return_attn_probs`, as
@@ -73,6 +75,12 @@ paged MLA latent cache as one key head, with each latent's first `v_dim` entries
 as the value. `TorchAttention` implements it as the reference and
 `FlashMLABackend` with FlashMLA's dense decode kernel, which reads 64-token
 pages only, so it reports `mla_block_size() == 64`.
+
+`store_latents` is the latent cache's scatter, the MLA counterpart of
+`store_kvcache` and split from it because one cache is written, not two. It
+takes the same `-1` for a row a CUDA graph padded: the flash backend masks that
+in the Triton kernel, whose block overhangs a latent width that is no power of
+two, and the torch backend pays a host sync to drop those rows.
 
 `flash_attn_with_kvcache` returns a singleton query axis in the decode shape;
 the flash backend squeezes it so both backends return the same rank. An

@@ -52,6 +52,18 @@ class TorchAttention(AttentionBackend):
         k_cache.view(-1, dim).index_copy_(0, slots, key.reshape(-1, dim))
         v_cache.view(-1, dim).index_copy_(0, slots, value.reshape(-1, dim))
 
+    def store_latents(self, latent, latent_cache, slot_mapping) -> None:
+        dim = latent_cache.size(-1)
+        assert slot_mapping.numel() == latent.size(0)
+
+        slots = slot_mapping.long()
+        keep = slots >= 0
+        if not keep.all():    # costs a host sync; kernels mask in-kernel instead
+            slots = slots[keep]
+            latent = latent[keep]
+
+        latent_cache.view(-1, dim).index_copy_(0, slots, latent)
+
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
         cu_seqlens_q = context.cu_seqlens_q.tolist()
         cu_seqlens_k = context.cu_seqlens_k.tolist()
@@ -62,7 +74,7 @@ class TorchAttention(AttentionBackend):
             seqlen_q = cu_seqlens_q[i + 1] - cu_seqlens_q[i]
             seqlen_k = cu_seqlens_k[i + 1] - cu_seqlens_k[i]
             q_i = q[cu_seqlens_q[i]:cu_seqlens_q[i + 1]]
-            if block_tables is not None:    # prefix cache
+            if block_tables is not None:    # read every key back from the pages
                 k_i = self._gather_pages(k_cache, block_tables[i], seqlen_k)
                 v_i = self._gather_pages(v_cache, block_tables[i], seqlen_k)
             else:
@@ -99,23 +111,25 @@ class TorchAttention(AttentionBackend):
         return torch.cat(outputs, dim=0)
 
     def mla_decode(self, q, latent_cache, v_dim, context: Context) -> torch.Tensor:
+        # q: [B, H, D], D= latent_dim = (kv_lora_rank + rope_dim)
+        # v_dim = kv_lora_rank
         block_tables = context.block_tables
         outputs = []
         for i, seqlen_k in enumerate(context.context_lens.tolist()):
             latent = self._gather_pages(latent_cache.unsqueeze(2), block_tables[i], seqlen_k)    # [Lk, 1, D]
-            kv = latent.transpose(0, 1).unsqueeze(0).expand(-1, q.size(1), -1, -1)    # every head reads it
+            kv = latent.transpose(0, 1).unsqueeze(0).expand(-1, q.size(1), -1, -1)    # [1, H, Lk, D]
             o = F.scaled_dot_product_attention(
                 q[i:i + 1].transpose(0, 1).unsqueeze(0), kv, kv[..., :v_dim], scale=self.scale,
-            )
-            outputs.append(o.squeeze(0).transpose(0, 1))
-        return torch.cat(outputs, dim=0)
+            ) # [1, H, 1, v_dim]
+            outputs.append(o.squeeze(0).transpose(0, 1)) # (1, H, v_dim)
+        return torch.cat(outputs, dim=0) # [B, H, v_dim]
 
     @staticmethod
     def _gather_pages(cache: torch.Tensor, block_table: torch.Tensor, seqlen: int) -> torch.Tensor:
-        block_size = cache.size(1)
+        block_size = cache.size(1) # [num_blocks, block_size, num_kv_heads, head_dim]
         num_blocks = (seqlen + block_size - 1) // block_size
         blocks = block_table[:num_blocks].long()
-        return cache[blocks].reshape(-1, cache.size(2), cache.size(3))[:seqlen]
+        return cache[blocks].reshape(-1, cache.size(2), cache.size(3))[:seqlen] # [seq_len, num_kv_heads, head_dim]
 
     @staticmethod
     def _causal_mask(seqlen_q: int, seqlen_k: int, device: torch.device) -> torch.Tensor | None:

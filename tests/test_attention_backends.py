@@ -273,6 +273,26 @@ def test_mla_decode(backend_cls):
     torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
 
 
+@pytest.mark.parametrize("backend_cls", MLA_CASES, ids=[b.get_name() for b in MLA_CASES])
+def test_store_latents_skips_negative_slots(backend_cls):
+    """A full graph pads its batch, so slot -1 must leave that cache row untouched."""
+    name = backend_cls.get_name()
+    device, dtype = torch.device("cpu" if name == "torch" else "cuda"), DTYPE[name]
+    backend = backend_cls(NUM_HEADS, LATENT_DIM, SCALE, NUM_HEADS)
+    cache = torch.full((2, MLA_BLOCK_SIZE, LATENT_DIM), 7.0, device=device, dtype=dtype)
+    latent = randn(3, LATENT_DIM, device=device, dtype=dtype)
+    written = [0, MLA_BLOCK_SIZE + 5]
+
+    backend.store_latents(latent, cache, torch.tensor(
+        [written[0], -1, written[1]], dtype=torch.int32, device=device))
+
+    flat = cache.view(-1, LATENT_DIM)
+    torch.testing.assert_close(flat[written[0]], latent[0], atol=0, rtol=0)
+    torch.testing.assert_close(flat[written[1]], latent[2], atol=0, rtol=0)
+    untouched = [i for i in range(2 * MLA_BLOCK_SIZE) if i not in written]
+    assert (flat[untouched] == 7.0).all(), "untouched slots were overwritten"
+
+
 def test_flashmla_is_preferred_for_mla_models_only(monkeypatch):
     monkeypatch.delenv("LEAN_VLLM_ATTENTION_BACKEND", raising=False)
     monkeypatch.setattr(FlashMLABackend, "is_available", staticmethod(lambda: True))

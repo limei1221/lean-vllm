@@ -77,6 +77,10 @@ class Attention(nn.Module):
     def bind_kv_cache(self, cache: torch.Tensor):
         self.k_cache, self.v_cache = cache[0], cache[1]
 
+    def output_shape(self, num_tokens: int) -> tuple[int, ...]:
+        """What attend returns for this many tokens; piecewise capture sizes its buffer with it."""
+        return (num_tokens, self.num_heads, self.head_dim)
+
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         # Through the opaque op, so torch.compile splits the graph here for piecewise capture.
         return torch.ops.lean_vllm.attention(q, k, v, self.layer_name)
@@ -197,6 +201,9 @@ class MLAAttention(Attention):
     def bind_kv_cache(self, cache: torch.Tensor):
         self.latent_cache = cache[0]
 
+    def output_shape(self, num_tokens: int) -> tuple[int, ...]:
+        return (num_tokens, self.num_heads, self.v_head_dim)
+
     def forward(self, q: torch.Tensor, latent: torch.Tensor):
         return torch.ops.lean_vllm.mla_attention(q, latent, self.layer_name)
 
@@ -204,8 +211,7 @@ class MLAAttention(Attention):
         context = get_context()
         cache = self.latent_cache
         if cache.numel():
-            # No -1 slots to skip: an MLA step is never padded for a graph.
-            cache.view(-1, self.latent_dim).index_copy_(0, context.slot_mapping.long(), latent)
+            self.backend.store_latents(latent, cache, context.slot_mapping)
             if not context.is_prefill and self.backend.supports_mla_decode():
                 return self._decode_latents(q, context)
         k, v = self.expand(latent)

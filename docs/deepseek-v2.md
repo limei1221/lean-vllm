@@ -1,9 +1,10 @@
 # DeepSeek-V2: MLA, MoE and YaRN
 
-Status: `DeepseekV2ForCausalLM` loads DeepSeek-V2-Lite and runs it eager on the
-torch, FlashAttention-3 and FlashMLA backends. It has been checked against
-transformers on tiny random checkpoints only, and FlashMLA has not run on a GPU. It has not yet run on the real 16B weights or
-been benchmarked against vLLM.
+Status: `DeepseekV2ForCausalLM` loads DeepSeek-V2-Lite and runs on the torch,
+FlashAttention-3 and FlashMLA backends, with CUDA graphs on. It has been checked
+against transformers on tiny random checkpoints only; neither FlashMLA nor
+either graph mode has run on a GPU. It has not yet run on the real 16B weights
+or been benchmarked against vLLM.
 
 ## Running it
 
@@ -109,9 +110,25 @@ GPT-J style, so its rotary embedding is built with `is_neox_style=False`.
 
 ## CUDA graphs
 
-This model reports `supports_cuda_graph = False`, so it runs eager everywhere.
-The context chunks are planned per step, and piecewise capture expects the q/k/v
-pieces of the Qwen3 layer split.
+The model reports `supports_cuda_graph = True`, and both modes took a change.
+
+A full graph holds attention, so the step inside it must neither plan chunks on
+the host nor expand latents — that is exactly what `mla_decode` avoids. The
+runner drops full graphs for an MLA model on a backend without one, keeping
+piecewise (`_cudagraph_mode`). A graph also pads its batch to a captured size,
+which is why the latent store is a backend call: `store_latents` skips slot -1
+in the kernel, as `store_kvcache` already did, rather than masking on the host.
+
+Piecewise capture no longer assumes q/k/v. `pre_attention` returns whatever this
+model hands attention — a query and a latent here, three tensors for Qwen3 — and
+the runner shapes one buffer per tensor from a real call at the largest bucket.
+The buffer for attention's output comes from `Attention.output_shape`, which MLA
+answers with `v_head_dim`. Attention itself still runs eager between the pieces,
+on real rows only, so the chunked context path is untouched.
+
+The MoE is inside the captured pieces, so `grouped_mm` and the `searchsorted`
+offsets feeding it must stay launch-only; nothing in them syncs today. None of
+this has run on a GPU.
 
 ## Testing
 
@@ -153,5 +170,5 @@ transformers' `generate` token for token.
 1. Run the real weights: compare outputs with vLLM, then benchmark.
 2. Run FlashMLA's decode on an H100 against the torch reference, then a Triton
    MLA decode off Hopper.
-3. CUDA graphs for MLA and MoE, and a check of `grouped_mm` against a fused
-   Triton MoE on an H100.
+3. Capture both graph modes on an H100, and check `grouped_mm` against a fused
+   Triton MoE there.

@@ -91,11 +91,12 @@ class DeepseekV2Attention(nn.Module):
         w_k, w_v = weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
         return w_k, w_v
 
-    def forward(
+    def project(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Up to attention: the query, and the latent this step caches."""
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
         else:
@@ -106,8 +107,10 @@ class DeepseekV2Attention(nn.Module):
         kv_c = self.kv_a_layernorm(kv_c)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
         # The latent is cached normalized and with rope applied, so a read needs only kv_b_proj.
-        latent = torch.cat([kv_c, k_pe.squeeze(1)], dim=-1)
-        o = self.attn(torch.cat([q_nope, q_pe], dim=-1), latent)
+        return torch.cat([q_nope, q_pe], dim=-1), torch.cat([kv_c, k_pe.squeeze(1)], dim=-1)
+
+    def combine(self, o: torch.Tensor) -> torch.Tensor:
+        """From attention's output back to the residual stream."""
         return self.o_proj(o.flatten(1, -1))
 
 
@@ -175,19 +178,37 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def pre_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The layer up to attention. Touches no KV cache, so it is capturable."""
+        if residual is None:
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        return self.self_attn.project(positions, hidden_states) + (residual,)
+
+    def post_attention(
+        self,
+        attn_out: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The layer after attention. Capturable for the same reason."""
+        hidden_states = self.self_attn.combine(attn_out)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return self.mlp(hidden_states), residual
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        return self.mlp(hidden_states), residual
+        q, latent, residual = self.pre_attention(positions, hidden_states, residual)
+        return self.post_attention(self.self_attn.attn(q, latent), residual)
 
 
 class DeepseekV2Model(nn.Module):
@@ -215,8 +236,7 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module):
-    # MLA reads a step-sized gather of the cache, and piecewise capture expects q/k/v pieces.
-    supports_cuda_graph = False
+    supports_cuda_graph = True
     packed_modules_mapping = {
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),

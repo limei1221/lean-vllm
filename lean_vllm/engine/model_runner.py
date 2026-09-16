@@ -7,7 +7,7 @@ from torch.profiler import record_function
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from lean_vllm.attention import get_attention_backend
+from lean_vllm.attention import AttentionBackend, get_attention_backend
 from lean_vllm.config import Config, FULL_MODES, PIECEWISE_MODES
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.sequence import Sequence
@@ -35,7 +35,8 @@ class ModelRunner:
         self.block_size = config.kvcache_block_size
         Sequence.block_size = self.block_size    # spawned workers never run LLMEngine.__init__
         self.device = dev.get_device()
-        attention_backend = get_attention_backend(mla=getattr(hf_config, "kv_lora_rank", None) is not None)
+        mla = getattr(hf_config, "kv_lora_rank", None) is not None
+        attention_backend = get_attention_backend(mla=mla)
         if rank == 0:
             logger.info("attention backend: %s", attention_backend.get_name())
         self.step_kind = "enforced"    # how the last step ran: see _step_kind
@@ -44,7 +45,10 @@ class ModelRunner:
         model_cls = get_model_class(hf_config)
         self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
                               or not attention_backend.supports_cuda_graph() or not model_cls.supports_cuda_graph)
-        self.cudagraph_mode = "none" if self.enforce_eager else config.cudagraph_mode
+        mode = "none" if self.enforce_eager else config.cudagraph_mode
+        self.cudagraph_mode = self._cudagraph_mode(mode, mla, attention_backend)
+        if rank == 0 and self.cudagraph_mode != mode:
+            logger.info("full CUDA graphs are off: %s has no MLA decode", attention_backend.get_name())
         self.graph_bs: list[int] = []          # captured batch sizes, full graphs
         self.piecewise_bs: list[int] = []      # captured token counts, piecewise graphs
         self.graphs: dict = {}
@@ -243,6 +247,17 @@ class ModelRunner:
         assert row is not None, "a pending token but no row in the launched step"
         return row
 
+    @staticmethod
+    def _cudagraph_mode(mode: str, mla: bool, backend: type[AttentionBackend]) -> str:
+        """The mode these captures can actually serve.
+
+        A full graph holds attention, so an MLA model needs a backend that attends the
+        latents; expanding them instead reads a plan this step built on the host.
+        """
+        if mla and mode in FULL_MODES and not backend.supports_mla_decode():
+            return "piecewise" if mode in PIECEWISE_MODES else "none"
+        return mode
+
     def _step_kind(self, is_prefill: bool, num_tokens: int) -> str:
         """How this step runs: "graph", "piecewise", or why it must run eager.
 
@@ -303,9 +318,7 @@ class ModelRunner:
         for layer, pre, post in zip(self.model.model.layers, graphs["pre"], graphs["post"]):
             pre.replay()
             # Real rows only: attention reads this step's sequence layout, which no graph can hold.
-            attn_out = layer.self_attn.attn(
-                buffers["q"][:num_tokens], buffers["k"][:num_tokens], buffers["v"][:num_tokens]
-            )
+            attn_out = layer.self_attn.attn(*(buffer[:num_tokens] for buffer in buffers["attn_in"]))
             buffers["attn_out"][:num_tokens] = attn_out
             post.replay()
         graphs["tail"].replay()
@@ -350,18 +363,17 @@ class ModelRunner:
         layers = self.model.model.layers
         self.piecewise_bs = self._piecewise_buckets()
         largest = self.piecewise_bs[-1]
-        attn = layers[0].self_attn
         buffers = dict(
             input_ids=torch.zeros(largest, dtype=torch.int64),
             positions=torch.zeros(largest, dtype=torch.int64),
             hidden=torch.zeros(largest, hf_config.hidden_size),
             residual=torch.zeros(largest, hf_config.hidden_size),
             output=torch.zeros(largest, hf_config.hidden_size),
-            q=torch.zeros(largest, attn.num_heads, attn.head_dim),
-            k=torch.zeros(largest, attn.num_kv_heads, attn.head_dim),
-            v=torch.zeros(largest, attn.num_kv_heads, attn.head_dim),
-            attn_out=torch.zeros(largest, attn.num_heads, attn.head_dim),
+            attn_out=torch.zeros(layers[0].self_attn.attn.output_shape(largest)),
         )
+        # What attention takes is the model's own: q, k and v for Qwen3, a query and a latent for MLA.
+        *attn_inputs, _ = layers[0].pre_attention(buffers["positions"], buffers["hidden"], None)
+        buffers["attn_in"] = [torch.zeros_like(tensor) for tensor in attn_inputs]
         self.piecewise_vars = buffers
         self.piecewise_graphs = {}
 
@@ -387,10 +399,10 @@ class ModelRunner:
             def pre(layer, first, size=size):
                 # The first layer takes no residual in; its graph bakes that in.
                 carried = None if first else buffers["residual"][:size]
-                q, k, v, residual = layer.pre_attention(buffers["positions"][:size], buffers["hidden"][:size], carried)
-                buffers["q"][:size].copy_(q)
-                buffers["k"][:size].copy_(k)
-                buffers["v"][:size].copy_(v)
+                *attn_inputs, residual = layer.pre_attention(
+                    buffers["positions"][:size], buffers["hidden"][:size], carried)
+                for buffer, tensor in zip(buffers["attn_in"], attn_inputs):
+                    buffer[:size].copy_(tensor)
                 buffers["residual"][:size].copy_(residual)
 
             def post(layer, size=size):

@@ -252,6 +252,25 @@ class TestStepKind:
         assert runner._step_kind(is_prefill=False, num_tokens=8) == "oversized"
 
 
+class TestCudagraphMode:
+    """What an MLA model's backend leaves capturable. Pure: config and backend."""
+
+    def mode(self, mode, decodes_latents, mla=True):
+        backend = type("FakeBackend", (), {"supports_mla_decode": staticmethod(lambda: decodes_latents)})
+        return ModelRunner._cudagraph_mode(mode, mla, backend)
+
+    def test_a_backend_without_mla_decode_loses_its_full_graphs(self):
+        """They would capture attention expanding latents, which needs the step's host plan."""
+        assert self.mode("full_and_piecewise", decodes_latents=False) == "piecewise"
+        assert self.mode("full", decodes_latents=False) == "none"
+
+    def test_a_backend_with_mla_decode_keeps_the_mode(self):
+        assert self.mode("full_and_piecewise", decodes_latents=True) == "full_and_piecewise"
+
+    def test_a_model_without_mla_is_never_downgraded(self):
+        assert self.mode("full", decodes_latents=False, mla=False) == "full"
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_preemption_recomputes_the_generated_suffix(runner, make_engine, chunked):
     engine = make_engine(num_kvcache_blocks=6, enable_chunked_prefill=chunked)

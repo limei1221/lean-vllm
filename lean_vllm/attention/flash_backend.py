@@ -35,6 +35,24 @@ else:
         tl.store(v_cache_ptr + cache_offsets, value)
 
 
+    @triton.jit
+    def store_latents_kernel(
+        latent_ptr,
+        latent_stride,
+        cache_ptr,
+        slot_mapping_ptr,
+        D: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        idx = tl.program_id(0)
+        slot = tl.load(slot_mapping_ptr + idx)
+        if slot == -1: return
+        offsets = tl.arange(0, BLOCK)
+        mask = offsets < D    # a latent is 576 wide for V2-Lite, so the block overhangs it
+        latent = tl.load(latent_ptr + idx * latent_stride + offsets, mask=mask)
+        tl.store(cache_ptr + slot * D + offsets, latent, mask=mask)
+
+
 class FlashAttention3Backend(AttentionBackend):
     """FlashAttention-3 kernels with a Triton KV-cache scatter. Hopper only."""
 
@@ -61,6 +79,14 @@ class FlashAttention3Backend(AttentionBackend):
         assert slot_mapping.numel() == num_tokens
         store_kvcache_kernel[(num_tokens,)](
             key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, dim
+        )
+
+    def store_latents(self, latent, latent_cache, slot_mapping) -> None:
+        num_tokens, dim = latent.shape
+        assert latent.stride(-1) == 1 and latent_cache.stride(-2) == dim
+        assert slot_mapping.numel() == num_tokens
+        store_latents_kernel[(num_tokens,)](
+            latent, latent.stride(0), latent_cache, slot_mapping, dim, triton.next_power_of_2(dim)
         )
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:

@@ -16,7 +16,7 @@ from lean_vllm.engine.sequence import Sequence
 from lean_vllm.layers.attention import MLAAttention, plan_context_chunks, register_layers
 from lean_vllm.models import get_model_class
 from lean_vllm.models.deepseek_v2 import DeepseekV2ForCausalLM
-from lean_vllm.utils.context import set_context
+from lean_vllm.utils.context import reset_context, set_context
 from lean_vllm.utils.loader import load_model
 
 BLOCK_SIZE = 4
@@ -149,6 +149,95 @@ def test_context_chunks_split_long_rows_and_skip_empty_ones():
     assert plan_context_chunks([9, 0, 2, 3], budget=4) == [
         (0, [0], [4]), (0, [4], [4]), (0, [8], [1]), (2, [0, 0], [2, 2]), (3, [2], [1]),
     ]
+
+
+class FakeAttention(torch.nn.Module):
+    """Deterministic and shaped like the real thing, so both paths see one value."""
+
+    def __init__(self, v_head_dim: int):
+        super().__init__()
+        self.v_head_dim = v_head_dim
+
+    def forward(self, q, latent):
+        return q[..., :self.v_head_dim] * 0.5
+
+
+def pieces(model) -> tuple:
+    """A MoE layer, so the piece after attention carries routing, and what stands in for attention."""
+    layer = model.model.layers[1]
+    return layer, FakeAttention(layer.self_attn.v_head_dim), model.model.embed_tokens.weight.size(1)
+
+
+def unsplit(layer, positions, hidden_states, residual, attend):
+    """The layer written out as it read before the split, module for module."""
+    if residual is None:
+        hidden_states, residual = layer.input_layernorm(hidden_states), hidden_states
+    else:
+        hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+    attn = layer.self_attn
+    if attn.q_lora_rank is None:
+        q = attn.q_proj(hidden_states)
+    else:
+        q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(hidden_states)))
+    q = q.view(-1, attn.num_heads, attn.qk_head_dim)
+    q_nope, q_pe = q.split([attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1)
+    kv_c, k_pe = attn.kv_a_proj_with_mqa(hidden_states).split([attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1)
+    kv_c = attn.kv_a_layernorm(kv_c)
+    q_pe, k_pe = attn.rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+    o = attend(torch.cat([q_nope, q_pe], dim=-1), torch.cat([kv_c, k_pe.squeeze(1)], dim=-1))
+    hidden_states = attn.o_proj(o.flatten(1, -1))
+    hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
+    return layer.mlp(hidden_states), residual
+
+
+@pytest.mark.parametrize("first_layer", [True, False])
+def test_the_split_layer_matches_the_unsplit_one(models, first_layer):
+    """Bitwise, on the same weights: the split piecewise capture takes must move no arithmetic."""
+    _, model = models
+    layer, attend, hidden_size = pieces(model)
+    positions = torch.arange(5)
+    hidden_states = torch.randn(5, hidden_size)
+    residual = None if first_layer else torch.randn(5, hidden_size)
+
+    with torch.inference_mode():
+        # fp32 RMSNorm adds into its input, so each path gets its own copy
+        q, latent, carried = layer.pre_attention(positions, hidden_states.clone(), residual)
+        got, got_residual = layer.post_attention(attend(q, latent), carried)
+        want, want_residual = unsplit(layer, positions, hidden_states.clone(), residual, attend)
+
+    assert torch.equal(got, want)
+    assert torch.equal(got_residual, want_residual)
+
+
+def test_the_pieces_need_no_attention_context(models):
+    """What a graph replays cannot depend on this step's sequence layout."""
+    reset_context()    # any read of it would see an empty Context and misbehave
+    _, model = models
+    layer, attend, hidden_size = pieces(model)
+    attn = layer.self_attn
+
+    with torch.inference_mode():
+        q, latent, residual = layer.pre_attention(torch.arange(5), torch.randn(5, hidden_size), None)
+        hidden_states, residual = layer.post_attention(attend(q, latent), residual)
+
+    assert q.shape == (5, attn.num_heads, attn.qk_head_dim)
+    assert latent.shape == (5, attn.kv_lora_rank + attn.qk_rope_head_dim)
+    assert hidden_states.shape == residual.shape == (5, hidden_size)
+
+
+def test_forward_still_runs_the_pieces(models, monkeypatch):
+    """forward is the composition, so the captured path cannot drift from it."""
+    _, model = models
+    layer, attend, hidden_size = pieces(model)
+    monkeypatch.setattr(layer.self_attn, "attn", attend)
+    positions, hidden_states = torch.arange(5), torch.randn(5, hidden_size)
+
+    with torch.inference_mode():
+        got, got_residual = layer(positions, hidden_states.clone(), None)
+        want, want_residual = unsplit(layer, positions, hidden_states.clone(), None, attend)
+
+    assert torch.equal(got, want)
+    assert torch.equal(got_residual, want_residual)
 
 
 def test_the_cache_holds_one_latent_per_token(models):

@@ -55,6 +55,18 @@ class AttentionBackend(ABC):
     ) -> None:
         """Scatter new keys/values into the paged cache in place. Slot -1 skips."""
 
+    def store_latents(
+        self,
+        latent: torch.Tensor,
+        latent_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Scatter MLA latents into the paged latent cache in place. Slot -1 skips.
+
+        latent is [num_tokens, latent_dim] and the cache [num_blocks, block_size, latent_dim].
+        """
+        raise NotImplementedError(f"the {self.get_name()} backend stores no MLA latents")
+
     @abstractmethod
     def prefill(
         self,
