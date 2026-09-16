@@ -33,6 +33,10 @@ class TorchAttention(AttentionBackend):
     def supports_cuda_graph() -> bool:
         return False
 
+    @staticmethod
+    def supports_mla_decode() -> bool:
+        return True
+
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
         num_tokens = key.size(0)
         assert slot_mapping.numel() == num_tokens
@@ -92,6 +96,18 @@ class TorchAttention(AttentionBackend):
             k_i = self._gather_pages(k_cache, block_tables[i], seqlen_k)
             v_i = self._gather_pages(v_cache, block_tables[i], seqlen_k)
             outputs.append(self._sdpa(q[i:i + 1], k_i, v_i, None))
+        return torch.cat(outputs, dim=0)
+
+    def mla_decode(self, q, latent_cache, v_dim, context: Context) -> torch.Tensor:
+        block_tables = context.block_tables
+        outputs = []
+        for i, seqlen_k in enumerate(context.context_lens.tolist()):
+            latent = self._gather_pages(latent_cache.unsqueeze(2), block_tables[i], seqlen_k)    # [Lk, 1, D]
+            kv = latent.transpose(0, 1).unsqueeze(0).expand(-1, q.size(1), -1, -1)    # every head reads it
+            o = F.scaled_dot_product_attention(
+                q[i:i + 1].transpose(0, 1).unsqueeze(0), kv, kv[..., :v_dim], scale=self.scale,
+            )
+            outputs.append(o.squeeze(0).transpose(0, 1))
         return torch.cat(outputs, dim=0)
 
     @staticmethod

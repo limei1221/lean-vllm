@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from lean_vllm.attention import BACKENDS
+from lean_vllm.attention import BACKENDS, MLA_BACKENDS, FlashMLABackend, get_attention_backend
 from lean_vllm.utils.context import Context
 
 torch.manual_seed(0)
@@ -15,7 +15,7 @@ SCALE = 0.137    # not head_dim**-0.5, so a dropped scale argument is detectable
 
 # The engine's default page size, which FA3 and torch both take.
 BLOCK_SIZE = 16
-DTYPE = {"torch": torch.float32, "flash_attn_3": torch.float16}    # flash kernels are fp16/bf16 only
+DTYPE = {"torch": torch.float32, "flash_attn_3": torch.float16, "flashmla": torch.float16}    # flash kernels are fp16/bf16 only
 
 # Tolerances against the fp32 oracle; bf16 uses test_low_precision_no_worse_than_naive.
 TOLERANCE = {torch.float32: 2e-3, torch.float16: 6e-3}
@@ -237,6 +237,47 @@ def test_prefill_with_prefix_cache(backend, device, block_size, dtype, tol):
 
     expected = torch.cat([dense_attention(q, k, v) for q, k, v in zip(q_list, k_full, v_full)])
     torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+
+
+# The only shapes FlashMLA's dense decode takes: a 512 + 64 latent, 512 of it the value, 64-token pages.
+LATENT_DIM, LATENT_V_DIM, MLA_BLOCK_SIZE = 576, 512, 64
+MLA_CASES = [b for b in (*MLA_BACKENDS, *BACKENDS) if b.supports_mla_decode() and b.is_available()]
+
+
+@pytest.mark.parametrize("backend_cls", MLA_CASES, ids=[b.get_name() for b in MLA_CASES])
+def test_mla_decode(backend_cls):
+    """Each row's query attends its cached latents as one shared key head, valued by their first v_dim entries."""
+    name = backend_cls.get_name()
+    device, dtype = torch.device("cpu" if name == "torch" else "cuda"), DTYPE[name]
+    backend = backend_cls(NUM_HEADS, LATENT_DIM, SCALE, NUM_HEADS)
+    context_lens = [MLA_BLOCK_SIZE + 3, 3, 2 * MLA_BLOCK_SIZE]    # mid-page, part-page, full
+    block_tables_list = [[2, 0], [3, -1], [1, 4]]    # scattered
+    cache = torch.zeros(5, MLA_BLOCK_SIZE, LATENT_DIM, device=device, dtype=dtype)
+    latents = [randn(n, LATENT_DIM, device=device, dtype=dtype) for n in context_lens]
+    for latent, table in zip(latents, block_tables_list):
+        slots = torch.tensor(slots_for(table, MLA_BLOCK_SIZE, 0, latent.size(0)), device=device)
+        cache.view(-1, LATENT_DIM)[slots] = latent
+
+    q = randn(len(context_lens), NUM_HEADS, LATENT_DIM, device=device, dtype=dtype)
+    context = Context(
+        context_lens=torch.tensor(context_lens, dtype=torch.int32, device=device),
+        block_tables=torch.tensor(block_tables_list, dtype=torch.int32, device=device),
+    )
+    out = backend.mla_decode(q, cache, LATENT_V_DIM, context)
+
+    expected = torch.cat([
+        (dense_scores(q[i:i + 1], latent.unsqueeze(1)).softmax(-1) @ latent[:, :LATENT_V_DIM].float()).transpose(0, 1)
+        for i, latent in enumerate(latents)
+    ]).to(dtype)
+    tol = TOLERANCE[dtype]
+    torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+
+
+def test_flashmla_is_preferred_for_mla_models_only(monkeypatch):
+    monkeypatch.delenv("LEAN_VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setattr(FlashMLABackend, "is_available", staticmethod(lambda: True))
+    assert get_attention_backend(mla=True) is FlashMLABackend
+    assert get_attention_backend() is not FlashMLABackend
 
 
 def test_decode(backend, device, block_size, dtype, tol):

@@ -166,8 +166,9 @@ def merge_attention(o_a, lse_a, o_b, lse_b) -> tuple[torch.Tensor, torch.Tensor]
 class MLAAttention(Attention):
     """Multi-head latent attention: the cache holds one compressed latent per token.
 
-    Each step expands the latents it reads back into keys and values. Cached ones are
+    A step expands the latents it reads back into keys and values. Cached ones are
     read at most max_context_chunk at a time and merged by log-sum-exp, as vLLM does.
+    Pure decode on a backend with an MLA decode attends the latents instead.
     """
 
     max_context_chunk = 8192    # the runner sets its step token budget
@@ -180,12 +181,14 @@ class MLAAttention(Attention):
         scale: float,
         latent_dim: int,
         expand: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+        latent_projections: Callable[[], tuple[torch.Tensor, torch.Tensor]],
         backend: type[AttentionBackend] | None = None,
     ):
-        super().__init__(num_heads, qk_head_dim, scale, num_heads, backend)
+        super().__init__(num_heads, qk_head_dim, scale, num_heads, backend or get_attention_backend(mla=True))
         self.v_head_dim = v_head_dim
         self.latent_dim = latent_dim
-        self.expand = expand    # a method of the owning layer, so not a registered submodule
+        self.expand = expand    # methods of the owning layer, so not a registered submodule
+        self.latent_projections = latent_projections
         self.latent_cache = torch.tensor([])
 
     def kv_cache_shape(self, num_blocks: int, block_size: int) -> tuple[int, ...]:
@@ -203,6 +206,8 @@ class MLAAttention(Attention):
         if cache.numel():
             # No -1 slots to skip: an MLA step is never padded for a graph.
             cache.view(-1, self.latent_dim).index_copy_(0, context.slot_mapping.long(), latent)
+            if not context.is_prefill and self.backend.supports_mla_decode():
+                return self._decode_latents(q, context)
         k, v = self.expand(latent)
         if context.keys_are_new or context.block_tables is None:
             # Every key the step reads is new, so a plain prefill with no page table covers it.
@@ -227,6 +232,18 @@ class MLAAttention(Attention):
             del k, v
             o[rows], lse[rows] = merge_attention(o[rows], lse[rows], o_chunk, lse_chunk)
         return o[..., :self.v_head_dim].contiguous()
+
+    def _decode_latents(self, q: torch.Tensor, context: Context) -> torch.Tensor:
+        """Attention over the cached latents as they are, so nothing expands.
+
+        A key's nope part is W_k c for latent c, and q . W_k c = W_k^T q . c, so the query moves
+        into latent space instead. Attention is linear in the values, so W_v applies after it.
+        """
+        w_k, w_v = self.latent_projections()
+        q_nope, q_pe = q.split([w_k.size(1), self.head_dim - w_k.size(1)], dim=-1)
+        q = torch.cat([torch.einsum("bhn,hnl->bhl", q_nope, w_k), q_pe], dim=-1)
+        o = self.backend.mla_decode(q, self.latent_cache, w_k.size(2), context)
+        return torch.einsum("bhl,hvl->bhv", o, w_v)
 
     def _pad(self, v: torch.Tensor) -> torch.Tensor:
         # Backends take one head size, so values pad up to the keys' and are cut back after.

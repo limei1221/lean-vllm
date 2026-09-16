@@ -10,6 +10,7 @@ import torch.distributed as dist
 from transformers import DeepseekV2Config
 from transformers import DeepseekV2ForCausalLM as HFDeepseekV2ForCausalLM
 
+from lean_vllm.attention import TorchAttention
 from lean_vllm.engine.model_runner import ModelRunner
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.layers.attention import MLAAttention, plan_context_chunks, register_layers
@@ -114,8 +115,11 @@ def test_a_prompt_matches_transformers(models, runner):
 
 # 4 splits a's cached keys across chunks and shares one chunk between a's tail and b's head.
 @pytest.mark.parametrize("max_context_chunk", [64, 4], ids=["one_chunk", "split_rows"])
-def test_paged_steps_match_transformers(models, runner, max_context_chunk):
+# Pure decode attends the latents through mla_decode, or expands them as other steps do.
+@pytest.mark.parametrize("latent_decode", [True, False], ids=["latent_decode", "expanded_decode"])
+def test_paged_steps_match_transformers(models, runner, max_context_chunk, latent_decode, monkeypatch):
     """Chunks, a cold prompt beside a resumed one, pure decode, then decode mixed with a prompt."""
+    monkeypatch.setattr(TorchAttention, "supports_mla_decode", staticmethod(lambda: latent_decode))
     reference, model = models
     layers = [module for module in model.modules() if isinstance(module, MLAAttention)]
     cache = torch.zeros(len(layers), *layers[0].kv_cache_shape(NUM_BLOCKS, BLOCK_SIZE))

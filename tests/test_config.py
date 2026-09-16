@@ -25,3 +25,13 @@ def test_tensor_parallelism_turns_async_scheduling_off(make_config, caplog):
     config = make_config(tensor_parallel_size=2)
     assert not config.async_scheduling
     assert "async_scheduling is off" in caplog.text
+
+
+def test_an_mla_model_takes_the_page_size_of_its_decode_kernel(make_config, monkeypatch, caplog):
+    from lean_vllm.attention import FlashMLABackend
+    monkeypatch.setattr(config_module, "get_attention_backend", lambda mla: FlashMLABackend)
+    assert make_config().kvcache_block_size == 16    # not an MLA model
+
+    monkeypatch.setattr(FakeHFConfig, "kv_lora_rank", 512, raising=False)
+    assert make_config().kvcache_block_size == 64
+    assert "kvcache_block_size is 64" in caplog.text

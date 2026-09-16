@@ -74,6 +74,7 @@ class DeepseekV2Attention(nn.Module):
             scaling,
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.expand,
+            self.latent_projections,
         )
 
     def expand(self, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -83,6 +84,12 @@ class DeepseekV2Attention(nn.Module):
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k = torch.cat([k_nope, k_pe.unsqueeze(1).expand(-1, self.num_heads, -1)], dim=-1)
         return k, v
+
+    def latent_projections(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """kv_b_proj per head: key [heads, qk_nope_head_dim, kv_lora_rank] and value [heads, v_head_dim, kv_lora_rank]."""
+        weight = self.kv_b_proj.weight.view(self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
+        w_k, w_v = weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        return w_k, w_v
 
     def forward(
         self,

@@ -1,8 +1,8 @@
 # DeepSeek-V2: MLA, MoE and YaRN
 
 Status: `DeepseekV2ForCausalLM` loads DeepSeek-V2-Lite and runs it eager on the
-torch and FlashAttention-3 backends. It has been checked against transformers
-on tiny random checkpoints only. It has not yet run on the real 16B weights or
+torch, FlashAttention-3 and FlashMLA backends. It has been checked against
+transformers on tiny random checkpoints only, and FlashMLA has not run on a GPU. It has not yet run on the real 16B weights or
 been benchmarked against vLLM.
 
 ## Running it
@@ -53,12 +53,39 @@ Values are zero-padded from `v_head_dim` (128) to the query/key head size (192),
 so a backend still sees one head size. The softmax scale is passed explicitly,
 so the padding changes nothing, and the output is cut back to 128.
 
-The trade-off is decode. Chunking bounds the memory, not the compute: every step
-still re-expands the whole context in every layer, now one chunk at a time, so
-a long decode batch pays one attention call per chunk. FlashMLA avoids that by
-attending over the latents directly. This path comes first because it is
-obviously correct. An MLA decode kernel should land before any numbers are
-published.
+Chunking bounds the memory, not the compute: a step that goes this way
+re-expands the whole context in every layer, one chunk at a time. Pure decode
+avoids that on a backend with `mla_decode`, below. A mixed step still expands.
+
+## Decode over latents: FlashMLA
+
+A key's nope part is `W_k c` for a latent `c`, so `q · W_k c = (W_kᵀ q) · c`.
+On a pure-decode step `MLAAttention` moves each head's nope query into latent
+space with the key half of `kv_b_proj`, keeps the rope query as it is, and
+attends the cached latents directly as one shared key head. The values are the
+first `kv_lora_rank` entries of each latent. Attention is linear in them, so the
+value half of `kv_b_proj` applies after it. Nothing expands. vLLM does the same
+with `W_UK_T` and `W_UV`.
+
+`FlashMLABackend` runs this with FlashMLA's dense decode kernel and uses
+FlashAttention-3 for every other step. The kernel takes bf16 or fp16, a latent
+of 512 + 64 and 64-token pages, on Hopper only. V2-Lite's latent fits. When the
+backend is selected, `Config` sets `kvcache_block_size` to 64. The kernel's
+schedule is built by the first layer of a step and reused by the rest.
+
+FlashMLA publishes no wheel, and `flash-mla` on PyPI is an empty placeholder.
+Build it into the project's environment from a checkout, against the pinned
+torch. `uv sync` removes it again unless run with `--inexact`:
+
+```bash
+git clone --recursive https://github.com/deepseek-ai/FlashMLA.git && cd FlashMLA
+VIRTUAL_ENV=~/workspace/lean-vllm/.venv uv pip install --no-build-isolation -v .
+```
+
+The backend targets FlashMLA's current interface, where `get_mla_metadata()`
+takes no arguments and returns a `FlashMLASchedMeta`. `TorchAttention` also
+implements `mla_decode`, as the reference, so the torch backend decodes the
+same way.
 
 ## MoE
 
@@ -105,7 +132,13 @@ mscale, a dropped cos/sin attention factor, and unscaled routing weights. For
 the chunked context: unmerged chunks, chunks attended causally, split rows read
 from position 0, swapped merge weights, and an lse that is not accumulated.
 
-The flash backend's `varlen_with_lse` has not run yet: FA3 needs a Hopper GPU.
+The paged steps also run with pure decode both over latents and expanded.
+`test_mla_decode` checks each backend's `mla_decode` against the dense oracle
+at FlashMLA's shapes. Mutations it and the paged steps catch: the query or value
+projection using another head's weights, and values read from the latent's tail.
+
+The flash backend's `varlen_with_lse` and FlashMLA's decode have not run yet:
+both need a Hopper GPU.
 
 Writing it turned up an fp32 bug in `RMSNorm`. `.float()` and `.to()` alias an
 fp32 tensor, so the in-place normalization rewrote the residual. bf16 always
@@ -118,6 +151,7 @@ transformers' `generate` token for token.
 ## Next
 
 1. Run the real weights: compare outputs with vLLM, then benchmark.
-2. An MLA decode kernel over latents (FlashMLA, or Triton off Hopper).
+2. Run FlashMLA's decode on an H100 against the torch reference, then a Triton
+   MLA decode off Hopper.
 3. CUDA graphs for MLA and MoE, and a check of `grouped_mm` against a fused
    Triton MoE on an H100.

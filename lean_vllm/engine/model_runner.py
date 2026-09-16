@@ -35,7 +35,7 @@ class ModelRunner:
         self.block_size = config.kvcache_block_size
         Sequence.block_size = self.block_size    # spawned workers never run LLMEngine.__init__
         self.device = dev.get_device()
-        attention_backend = get_attention_backend()
+        attention_backend = get_attention_backend(mla=getattr(hf_config, "kv_lora_rank", None) is not None)
         if rank == 0:
             logger.info("attention backend: %s", attention_backend.get_name())
         self.step_kind = "enforced"    # how the last step ran: see _step_kind

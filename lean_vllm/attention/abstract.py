@@ -30,6 +30,16 @@ class AttentionBackend(ABC):
         return False
 
     @staticmethod
+    def supports_mla_decode() -> bool:
+        """True if mla_decode attends MLA latents directly, so a decode step expands no keys."""
+        return False
+
+    @staticmethod
+    def mla_block_size() -> int | None:
+        """The page size mla_decode requires, or None for any."""
+        return None
+
+    @staticmethod
     def get_kv_cache_shape(num_blocks: int, block_size: int, num_kv_heads: int, head_dim: int) -> tuple[int, ...]:
         """Per-layer shape of one of the key/value cache tensors."""
         return (num_blocks, block_size, num_kv_heads, head_dim)
@@ -87,3 +97,17 @@ class AttentionBackend(ABC):
         context: Context,
     ) -> torch.Tensor:
         """Single-query attention against the paged cache. q is [batch, heads, dim]."""
+
+    def mla_decode(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        v_dim: int,
+        context: Context,
+    ) -> torch.Tensor:
+        """Single-query attention over a paged MLA latent cache, read as one key head shared by all.
+
+        q is [batch, heads, latent_dim] and latent_cache [num_blocks, block_size, latent_dim].
+        Values are each latent's first v_dim entries, so this returns [batch, heads, v_dim].
+        """
+        raise NotImplementedError(f"the {self.get_name()} backend has no MLA decode")

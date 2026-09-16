@@ -15,7 +15,7 @@ hardware.
 |---|---|---|
 | 0 | Attention backend abstraction | interface + Torch/FlashAttention backends done |
 | 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; numbers await a GPU |
-| 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite runs eager, checked against transformers; MLA kernels, graphs and numbers to come |
+| 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite runs eager, checked against transformers; FlashMLA decode awaits a GPU run; graphs and numbers to come |
 | 3 | Speculative decoding | |
 | 4 | Disaggregated prefill / decode | |
 
@@ -33,6 +33,8 @@ Dao-AILab publishes no FlashAttention-3 wheel, so the `cuda` extra installs a
 third-party build of it, pinned by URL and hash. That build covers Linux on
 x86_64, against the torch pinned beside it. The kernels are Hopper's, so the
 backend reports itself unavailable on anything but an H100 or H200.
+DeepSeek-V2 also decodes with FlashMLA when it is built from source; see
+[docs/deepseek-v2.md](docs/deepseek-v2.md).
 
 Without it, and without Triton, the engine runs on CPU and Apple Silicon via the
 `torch` attention backend, at laptop speed — enough to develop and test the

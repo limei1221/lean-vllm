@@ -18,6 +18,7 @@ class Context:
     cu_seqlens_q_host: list[int] | None = None    # cu_seqlens_q and _k kept on the host, so MLA plans without a sync
     cu_seqlens_k_host: list[int] | None = None
     context_chunks: list | None = None    # filled on first use by layers.attention.context_chunks
+    mla_decode_metadata: object | None = None    # FlashMLA's schedule, filled by the step's first layer
 
 _CONTEXT = Context()
 
