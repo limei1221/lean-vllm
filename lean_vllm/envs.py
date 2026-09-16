@@ -14,6 +14,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LEAN_VLLM_DEVICE": lambda: os.getenv("LEAN_VLLM_DEVICE") or None,
     # Forces an attention backend by name; unset picks the first available.
     "LEAN_VLLM_ATTENTION_BACKEND": lambda: os.getenv("LEAN_VLLM_ATTENTION_BACKEND") or None,
+    # Forces "triton" or "torch" for the routed experts; unset takes Triton where it runs.
+    "LEAN_VLLM_MOE_BACKEND": lambda: os.getenv("LEAN_VLLM_MOE_BACKEND") or None,
     # Enables the step-loop profiler, which writes its trace here.
     "LEAN_PROFILE_DIR": lambda: os.getenv("LEAN_PROFILE_DIR") or None,
     # Steps passed before the capture, then steps captured.

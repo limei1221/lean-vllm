@@ -2,8 +2,8 @@
 
 Status: `DeepseekV2ForCausalLM` loads DeepSeek-V2-Lite and runs on the torch,
 FlashAttention-3 and FlashMLA backends, with CUDA graphs on. It has been checked
-against transformers on tiny random checkpoints only; neither FlashMLA nor
-either graph mode has run on a GPU. It has not yet run on the real 16B weights
+against transformers on tiny random checkpoints only; neither FlashMLA, the
+Triton MoE nor either graph mode has run on a GPU. It has not yet run on the real 16B weights
 or been benchmarked against vLLM.
 
 ## Running it
@@ -92,13 +92,23 @@ same way.
 
 `FusedMoE` (`layers/moe.py`) stacks the routed experts into one `gate_up_proj`
 of shape `[E, 2I, H]` and one `down_proj` of shape `[E, H, I]`. The loader maps
-each checkpoint weight `experts.{e}.{proj}.weight` into its expert's row. The
-forward pass sorts tokens by expert and runs two `F.grouped_mm` calls. Group
-offsets come from `searchsorted` rather than `bincount`, which syncs on CUDA.
+each checkpoint weight `experts.{e}.{proj}.weight` into its expert's row.
 Routing follows the original V2 code: softmax scores, `greedy` or
 `group_limited_greedy` selection, then either `routed_scaling_factor` or
 `norm_topk_prob`. Tensor parallelism shards each expert's intermediate size.
 Shared experts reuse the dense gated MLP.
+
+Two paths run the experts, and both sort the token-expert pairs by expert with
+`searchsorted` rather than `bincount`, which syncs on CUDA. On CUDA it is the
+Triton kernel in `layers/fused_moe.py`, as vLLM's fused MoE does it:
+`align_blocks` pads each expert's run of sorted rows to a whole number of
+`BLOCK_M` rows, so `fused_moe_kernel` reads one expert's weight per block and
+reuses it down the block. The kernel runs once per projection — `A[pair //
+top_k] @ B[expert]`, with the routing weight folded into the second epilogue —
+and the top-k rows are summed at the end. Everywhere else, and under
+`LEAN_VLLM_MOE_BACKEND=torch`, two `F.grouped_mm` calls over the same sorted
+rows do the same thing; that path is the reference the kernel is checked
+against.
 
 ## YaRN
 
@@ -126,9 +136,14 @@ The buffer for attention's output comes from `Attention.output_shape`, which MLA
 answers with `v_head_dim`. Attention itself still runs eager between the pieces,
 on real rows only, so the chunked context path is untouched.
 
-The MoE is inside the captured pieces, so `grouped_mm` and the `searchsorted`
-offsets feeding it must stay launch-only; nothing in them syncs today. None of
-this has run on a GPU.
+The MoE is inside the captured pieces, so everything feeding it must stay
+launch-only. The padding makes the Triton path's block count depend on the
+routing, which a graph cannot have: `align_blocks` sizes its output from the
+batch shape instead, an upper bound of one wasted block per expert, and writes
+how many rows survived to a device tensor. The kernel reads that tensor to drop
+the blocks the padding left empty, and masks the rows overhanging the last block
+of a run, so no count reaches the host. Nothing in the `grouped_mm` path syncs
+either. None of this has run on a GPU.
 
 ## Testing
 
@@ -154,8 +169,17 @@ The paged steps also run with pure decode both over latents and expanded.
 at FlashMLA's shapes. Mutations it and the paged steps catch: the query or value
 projection using another head's weights, and values read from the latent's tail.
 
+`tests/test_fused_moe.py` covers the Triton path's blocking without a GPU.
+`blocked_moe` writes out in torch what the kernel does with `align_blocks` — the
+same gather, one expert per block, the same masked scatter — and checks it
+against `torch_experts`, at both row block sizes. The alignment itself is
+checked for holding every pair exactly once, for never putting two experts in
+one block, and for giving an expert with no tokens no block. Only the arithmetic
+inside `tl.dot` awaits a GPU.
+
 The flash backend's `varlen_with_lse` and FlashMLA's decode have not run yet:
-both need a Hopper GPU.
+both need a Hopper GPU. `fused_moe_kernel` needs only a CUDA GPU, and has not
+run either.
 
 Writing it turned up an fp32 bug in `RMSNorm`. `.float()` and `.to()` alias an
 fp32 tensor, so the in-place normalization rewrote the residual. bf16 always
@@ -170,5 +194,7 @@ transformers' `generate` token for token.
 1. Run the real weights: compare outputs with vLLM, then benchmark.
 2. Run FlashMLA's decode on an H100 against the torch reference, then a Triton
    MLA decode off Hopper.
-3. Capture both graph modes on an H100, and check `grouped_mm` against a fused
-   Triton MoE there.
+3. Capture both graph modes on an H100, and run the Triton MoE there against
+   `grouped_mm`: first for agreement, then for time at decode and prefill
+   shapes. Its block sizes are a guess until then, where vLLM ships a tuned
+   table per shape and dtype.

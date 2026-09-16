@@ -10,6 +10,7 @@ def test_unset_variables_take_their_defaults(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     assert envs.LEAN_VLLM_DEVICE is None
     assert envs.LEAN_VLLM_ATTENTION_BACKEND is None
+    assert envs.LEAN_VLLM_MOE_BACKEND is None
     assert envs.LEAN_PROFILE_DIR is None
     assert (envs.LEAN_PROFILE_SKIP, envs.LEAN_PROFILE_STEPS) == (200, 200)
     assert envs.LEAN_PROFILE_CUDA is False

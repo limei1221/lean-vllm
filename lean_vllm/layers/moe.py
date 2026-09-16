@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from lean_vllm.layers import fused_moe
 from lean_vllm.layers.activation import SiluAndMul
 from lean_vllm.layers.linear import divide
 
@@ -10,8 +11,11 @@ from lean_vllm.layers.linear import divide
 class FusedMoE(nn.Module):
     """Routed experts, stacked per projection and run as two grouped matrix multiplies.
 
-    Tokens are sorted by expert on the device, so routing never waits on the host.
-    Tensor parallelism shards each expert's intermediate size, as the dense MLP does.
+    On CUDA the Triton kernels in `fused_moe.py` run them, as vLLM does; elsewhere
+    `grouped_mm` does, which is also the reference the kernel is checked against.
+    Tokens are sorted by expert on the device either way, so routing never waits on
+    the host. Tensor parallelism shards each expert's intermediate size, as the dense
+    MLP does.
     """
 
     def __init__(
@@ -42,7 +46,8 @@ class FusedMoE(nn.Module):
         shard = loaded_weight.chunk(self.tp_size, 0)[self.tp_rank]
         param.data[expert_id].narrow(0, offset, self.intermediate_size).copy_(shard)
 
-    def forward(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+    def torch_experts(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+        """The portable path: one row per token-expert pair, two grouped matrix multiplies, scatter back."""
         expert_ids, order = topk_ids.flatten().sort()
         token_ids = order // self.top_k
         # Where each expert's run of sorted rows ends; searchsorted, unlike bincount, does not sync.
@@ -51,7 +56,15 @@ class FusedMoE(nn.Module):
         h = F.grouped_mm(x[token_ids], self.gate_up_proj.transpose(1, 2), offs=offsets)
         h = F.grouped_mm(self.act_fn(h), self.down_proj.transpose(1, 2), offs=offsets)
         h = h * topk_weights.flatten()[order].unsqueeze(1).to(h.dtype)
-        out = torch.zeros_like(x).index_add_(0, token_ids, h)
+        return torch.zeros_like(x).index_add_(0, token_ids, h)
+
+    def forward(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+        if fused_moe.use_triton(x):
+            out = fused_moe.fused_experts(
+                x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids, self.act_fn
+            )
+        else:
+            out = self.torch_experts(x, topk_weights, topk_ids)
         if self.tp_size > 1:
             dist.all_reduce(out)
         return out
