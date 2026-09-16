@@ -461,7 +461,7 @@ requires-dist = [
     { name = "pydantic", marker = "extra == 'serve'", specifier = ">=2" },
     { name = "safetensors" },
     { name = "tokenizers", specifier = ">=0.22" },
-    { name = "torch", specifier = ">=2.4.0" },
+    { name = "torch", specifier = ">=2.10" },
     { name = "torch", marker = "extra == 'cuda'", specifier = "==2.11.0" },
     { name = "tqdm" },
     { name = "transformers", specifier = ">=4.56.0" },

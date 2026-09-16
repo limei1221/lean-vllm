@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from lean_vllm.engine.llm_engine import LLMEngine
 from lean_vllm.engine.output import RequestOutput
+from lean_vllm.engine.scheduler import DuplicateRequestId
 from lean_vllm.sampling_params import SamplingParams
 
 # Wait on intake after an empty step, but poll so a wedged request cannot deadlock the loop.
@@ -104,6 +105,10 @@ class AsyncLLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         request_id = request_id or f"req-{uuid4().hex}"
+        if request_id in self._streams:
+            # The scheduler would refuse it too, but only after this stream replaced the live
+            # one, leaving the first caller waiting on a stream no output can reach again.
+            raise DuplicateRequestId(f"{request_id} is already in flight")
         stream = AsyncStream()
         accepted = self._loop.create_future()
         self._submit(_Add(prompt, sampling_params, request_id, accepted))

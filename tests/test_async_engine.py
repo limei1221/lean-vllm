@@ -7,7 +7,7 @@ import pytest
 
 from conftest import FakeConfig, FakeLLMEngine, FakeModelRunner, asyncio_test
 from lean_vllm.engine.async_engine import AsyncLLMEngine, EngineDeadError
-from lean_vllm.engine.scheduler import QueueFull
+from lean_vllm.engine.scheduler import DuplicateRequestId, QueueFull
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.sampling_params import SamplingParams
 
@@ -230,6 +230,26 @@ class TestAdmission:
         runner_of(engine).release()
         with pytest.raises(QueueFull):
             await refused
+
+    @asyncio_test
+    async def test_a_duplicate_id_is_refused_without_disturbing_the_original(self, make_async_engine):
+        """Refused before the stream is replaced, or the live request is stranded holding blocks."""
+        engine = make_async_engine(gated=True)
+        outputs = await engine.add_request(prompt(8), FOREVER, "twice")
+
+        with pytest.raises(DuplicateRequestId):
+            # Refused here, not out at the engine: a gated thread drains no intake, so waiting
+            # on admission for this one would hang rather than fail.
+            await asyncio.wait_for(engine.add_request(prompt(8, 100), FOREVER, "twice"), timeout=1)
+        assert set(engine._streams) == {"twice"}
+
+        runner_of(engine).release(2)    # the launch that emits nothing, then the one that drains it
+        output = await asyncio.wait_for(outputs.__anext__(), timeout=1)    # a stranded stream hangs here
+        assert output.token_ids
+
+        await outputs.aclose()
+        runner_of(engine).release()
+        await settle(engine)
 
     @pytest.mark.parametrize("chunked", [False, True])
     @asyncio_test
