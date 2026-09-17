@@ -399,32 +399,6 @@ def test_top_left_causal_alignment_would_be_wrong(backend, device, block_size, d
         "top-left and bottom-right masks agree; test is not discriminating"
 
 
-def test_gqa_fallback_matches_broadcast(backend, device, block_size, dtype, tol, monkeypatch):
-    """Force the torch<2.5 path that materializes KV heads instead of broadcasting."""
-    if backend.get_name() != "torch":
-        pytest.skip("fallback is specific to the torch backend")
-
-    from lean_vllm.attention import torch_backend
-
-    seqlen = 2 * block_size + 3
-    block_table = [0, 1, 2]
-    k_cache, v_cache = make_cache(3, device, block_size, dtype)
-    k_full = randn(seqlen, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype)
-    v_full = randn(seqlen, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype)
-    write_prefix(k_cache, v_cache, k_full, v_full, block_table, block_size, seqlen)
-
-    q = randn(4, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype)
-    context = Context(
-        is_prefill=False,
-        context_lens=torch.tensor([seqlen] * 4, dtype=torch.int32, device=device),
-        block_tables=torch.tensor([block_table] * 4, dtype=torch.int32, device=device),
-    )
-    expected = torch.cat([dense_attention(q[i:i + 1], k_full, v_full) for i in range(4)])
-
-    monkeypatch.setattr(torch_backend, "_SDPA_ENABLE_GQA", False)
-    torch.testing.assert_close(backend.decode(q, k_cache, v_cache, context), expected, atol=tol, rtol=tol)
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
 def test_low_precision_no_worse_than_naive(backend, device, block_size, dtype):
     """Backend error against fp32 oracle must not exceed naive arithmetic in the same dtype.

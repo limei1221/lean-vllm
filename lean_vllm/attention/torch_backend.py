@@ -5,19 +5,6 @@ from lean_vllm.attention.abstract import AttentionBackend
 from lean_vllm.utils.context import Context
 
 
-def _probe_enable_gqa() -> bool:
-    q = torch.zeros(1, 2, 1, 1)
-    k = torch.zeros(1, 1, 1, 1)
-    try:
-        F.scaled_dot_product_attention(q, k, k, enable_gqa=True)
-    except TypeError:
-        return False
-    return True
-
-
-_SDPA_ENABLE_GQA = _probe_enable_gqa()
-
-
 class TorchAttention(AttentionBackend):
     """SDPA reference backend. Runs anywhere; optimized for clarity, not speed."""
 
@@ -148,13 +135,5 @@ class TorchAttention(AttentionBackend):
             mask = mask.view(1, 1, *mask.shape)
 
         gqa = self.num_heads != self.num_kv_heads
-        if gqa and not _SDPA_ENABLE_GQA:    # torch < 2.5
-            repeats = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeats, dim=1)
-            v = v.repeat_interleave(repeats, dim=1)
-            kwargs = {}
-        else:
-            kwargs = {"enable_gqa": gqa} if _SDPA_ENABLE_GQA else {}
-
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale, **kwargs) # [1, H, Lq, D]
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale, enable_gqa=gqa) # [1, H, Lq, D]
         return o.squeeze(0).transpose(0, 1)

@@ -181,10 +181,10 @@ The offline pair adds device activity, which gives the GPU idle fraction to
 compare against the 34.4% of 12 September:
 
 ```bash
-LEAN_PROFILE_DIR="$RUN_RESULTS/offline-off" LEAN_PROFILE_CUDA=1 LEAN_ASYNC_SCHEDULING=0 \
-  uv run python benchmarks/bench_offline.py
-LEAN_PROFILE_DIR="$RUN_RESULTS/offline-on" LEAN_PROFILE_CUDA=1 LEAN_ASYNC_SCHEDULING=1 \
-  uv run python benchmarks/bench_offline.py
+LEAN_PROFILE_DIR="$RUN_RESULTS/offline-off" LEAN_PROFILE_CUDA=1 \
+  uv run python benchmarks/bench_offline.py --no-async-scheduling
+LEAN_PROFILE_DIR="$RUN_RESULTS/offline-on" LEAN_PROFILE_CUDA=1 \
+  uv run python benchmarks/bench_offline.py --async-scheduling
 ```
 
 ## 6. Compare and archive

@@ -46,6 +46,7 @@ dev = [
     "pytest",
     "httpx",       # what the openai SDK speaks: the benchmark client and the ASGI tests
     "httpx2",      # starlette's testclient prefers it and warns when it falls back to httpx
+    "numpy",       # bench_serving's percentiles; only transformers pulled it in before
     # the server itself, so `uv run pytest tests/` runs the whole suite rather than
     # skipping the two modules that importorskip fastapi
     "lean-vllm[serve]",
