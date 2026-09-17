@@ -124,15 +124,12 @@ class LLMEngine:
         self.tokenizer = load_tokenizer(config.model)    # before workers spawn, so a bad one fails fast
         config.eos = self.tokenizer.eos_token_id
         self.ps = []
-        self.events = []
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process = ctx.Process(target=ModelRunner, args=(config, i))
             process.start()
             self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.model_runner = ModelRunner(config, 0)
         self.scheduler = Scheduler(config)
         self.metrics = Metrics()
         self.detokenizers: dict[str, FastIncrementalDetokenizer] = {}
