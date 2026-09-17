@@ -167,12 +167,39 @@ def merge_attention(o_a, lse_a, o_b, lse_b) -> tuple[torch.Tensor, torch.Tensor]
     return o.to(o_a.dtype), torch.logaddexp(lse_a, lse_b)
 
 
+def mla_partitions(context: Context) -> list[tuple[torch.Tensor, Context]]:
+    """Build each phase's metadata once, without reading lengths back from the device."""
+    if context.mla_partitions is None:
+        cu_q, cu_k = context.cu_seqlens_q_host, context.cu_seqlens_k_host
+        device = context.block_tables.device
+        context.mla_partitions = []
+        for is_prefill in (False, True):
+            rows = [i for i, phase in enumerate(context.prefill_rows) if phase == is_prefill]
+            q_lens = [cu_q[i + 1] - cu_q[i] for i in rows]
+            k_lens = [cu_k[i + 1] - cu_k[i] for i in rows]
+            tokens = dev.make_tensor([t for i in rows for t in range(cu_q[i], cu_q[i + 1])], torch.int64, device)
+            row_indices = dev.make_tensor(rows, torch.int64, device)
+            sub_q, sub_k = [0, *accumulate(q_lens)], [0, *accumulate(k_lens)]
+            subset = Context(
+                is_prefill=is_prefill,
+                cu_seqlens_q=dev.make_tensor(sub_q, torch.int32, device),
+                cu_seqlens_k=dev.make_tensor(sub_k, torch.int32, device),
+                cu_seqlens_q_host=sub_q, cu_seqlens_k_host=sub_k,
+                max_seqlen_q=max(q_lens), max_seqlen_k=max(k_lens),
+                keys_are_new=sub_q == sub_k,
+                block_tables=context.block_tables[row_indices],
+                context_lens=context.context_lens[row_indices],
+            )
+            context.mla_partitions.append((tokens, subset))
+    return context.mla_partitions
+
+
 class MLAAttention(Attention):
     """Multi-head latent attention: the cache holds one compressed latent per token.
 
     A step expands the latents it reads back into keys and values. Cached ones are
     read at most max_context_chunk at a time and merged by log-sum-exp, as vLLM does.
-    Pure decode on a backend with an MLA decode attends the latents instead.
+    Decode rows on a backend with MLA decode attend latents, including in mixed steps.
     """
 
     max_context_chunk = 8192    # the runner sets its step token budget
@@ -214,6 +241,20 @@ class MLAAttention(Attention):
             self.backend.store_latents(latent, cache, context.slot_mapping)
             if not context.is_prefill and self.backend.supports_mla_decode():
                 return self._decode_latents(q, context)
+            if (context.is_prefill and context.prefill_rows is not None
+                    and not all(context.prefill_rows) and self.backend.supports_mla_decode()):
+                out = q.new_empty(self.output_shape(q.size(0)))
+                for tokens, subset in mla_partitions(context):
+                    if subset.is_prefill:
+                        part = self._prefill(q[tokens], latent[tokens], subset)
+                    else:
+                        part = self._decode_latents(q[tokens], subset)
+                    out.index_copy_(0, tokens, part)
+                return out
+        return self._prefill(q, latent, context)
+
+    def _prefill(self, q: torch.Tensor, latent: torch.Tensor, context: Context) -> torch.Tensor:
+        cache = self.latent_cache
         k, v = self.expand(latent)
         if context.keys_are_new or context.block_tables is None:
             # Every key the step reads is new, so a plain prefill with no page table covers it.

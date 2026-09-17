@@ -210,6 +210,7 @@ class ModelRunner:
         block_tables = self.prepare_block_tables(seqs) if any(seq.block_table for seq in seqs) else None
         context = dict(
             is_prefill=is_prefill,
+            prefill_rows=[seq.is_prefill for seq in seqs],
             cu_seqlens_q=dev.make_tensor(cu_seqlens_q, torch.int32, self.device),
             cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, self.device),
             max_seqlen_q=max_seqlen_q,

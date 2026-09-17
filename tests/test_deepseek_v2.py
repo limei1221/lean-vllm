@@ -151,6 +151,46 @@ def test_context_chunks_split_long_rows_and_skip_empty_ones():
     ]
 
 
+@pytest.mark.parametrize("latent_decode", [True, False])
+def test_mixed_rows_keep_latent_decode_and_original_order(models, runner, monkeypatch, latent_decode):
+    """Decode must not expand its history when interleaved with resumed and cold prompts."""
+    reference, model = models
+    monkeypatch.setattr(TorchAttention, "supports_mla_decode", staticmethod(lambda: latent_decode))
+    layers = [module for module in model.modules() if isinstance(module, MLAAttention)]
+    for layer in layers:
+        layer.bind_kv_cache(torch.zeros(*layer.kv_cache_shape(NUM_BLOCKS, BLOCK_SIZE)))
+        layer.max_context_chunk = 4
+    a, b, c, d = (torch.randint(0, 128, (n,)).tolist() for n in (10, 7, 8, 1))
+    tables = [[5, 2, 9], [7, 0], [3, 8], [6]]
+    step(runner, model, [row(a, 0, 9, tables[0]), row(b, 0, 6, tables[1]), row(c, 0, 6, tables[2])])
+    decoded = []
+    original = TorchAttention.mla_decode
+
+    def record_decode(self, q, cache, v_dim, context):
+        decoded.append(context.context_lens.tolist())
+        return original(self, q, cache, v_dim, context)
+
+    monkeypatch.setattr(TorchAttention, "mla_decode", record_decode)
+    expanded = []
+    for layer in layers:
+        expand = layer.expand
+
+        def record_expand(latent, expand=expand):
+            expanded.append(latent.size(0))
+            return expand(latent)
+
+        monkeypatch.setattr(layer, "expand", record_expand)
+    seqs = [row(c, 6, 2, tables[2]), row(a, 9, 1, tables[0], decode=True),
+            row(d, 0, 1, tables[3]), row(b, 6, 1, tables[1], decode=True)]
+    for seq, tokens, got in zip(seqs, [c, a, d, b], step(runner, model, seqs)):
+        want = reference_logits(reference, tokens)[seq.num_cached_tokens:]
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+    assert decoded == ([[10, 7]] * len(layers) if latent_decode else [])
+    if latent_decode:
+        # Three new prefill tokens and six cached prefill tokens per layer.
+        assert sum(expanded) == 9 * len(layers)
+
+
 class FakeAttention(torch.nn.Module):
     """Deterministic and shaped like the real thing, so both paths see one value."""
 

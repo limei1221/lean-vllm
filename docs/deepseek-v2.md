@@ -55,18 +55,28 @@ so a backend still sees one head size. The softmax scale is passed explicitly,
 so the padding changes nothing, and the output is cut back to 128.
 
 Chunking bounds the memory, not the compute: a step that goes this way
-re-expands the whole context in every layer, one chunk at a time. Pure decode
-avoids that on a backend with `mla_decode`, below. A mixed step still expands.
+re-expands the prefill context in every layer, one chunk at a time. On a backend
+with `mla_decode`, decode rows avoid expansion even in a mixed step. Backends
+without it use the expanded path for every row.
 
 ## Decode over latents: FlashMLA
 
 A key's nope part is `W_k c` for a latent `c`, so `q · W_k c = (W_kᵀ q) · c`.
-On a pure-decode step `MLAAttention` moves each head's nope query into latent
+For decode rows `MLAAttention` moves each head's nope query into latent
 space with the key half of `kv_b_proj`, keeps the rope query as it is, and
 attends the cached latents directly as one shared key head. The values are the
 first `kv_lora_rank` entries of each latent. Attention is linear in them, so the
 value half of `kv_b_proj` applies after it. Nothing expands. vLLM does the same
 with `W_UK_T` and `W_UV`.
+
+For mixed steps, `prepare_batch` records each request's prefill/decode phase.
+After storing all new latents, attention gathers decode queries and runs them
+against their own page tables, while only prefill rows expand their latents.
+It scatters both outputs back into the original token order before the output
+projection. The subset metadata, prefill context-chunk plan and FlashMLA decode
+schedule are reused across layers within the step. A one-token prefill remains
+a prefill. Mixed steps still use piecewise graphs or eager execution; the
+full-graph path remains for pure decode.
 
 `FlashMLABackend` runs this with FlashMLA's dense decode kernel and uses
 FlashAttention-3 for every other step. The kernel takes bf16 or fp16, a latent
@@ -169,6 +179,13 @@ The paged steps also run with pure decode both over latents and expanded.
 at FlashMLA's shapes. Mutations it and the paged steps catch: the query or value
 projection using another head's weights, and values read from the latent's tail.
 
+The mixed-row regression interleaves two decode requests with a resumed prompt
+and a one-token cold prompt. It checks logits against transformers, verifies
+that both decode requests use `mla_decode`, and counts expanded tokens to
+ensure their cached context is excluded. It also checks the expanded fallback
+when the backend does not support latent decode. These checks use the torch
+backend; mixed FlashMLA execution still needs GPU validation.
+
 `tests/test_fused_moe.py` covers the Triton path's blocking without a GPU.
 `blocked_moe` writes out in torch what the kernel does with `align_blocks` — the
 same gather, one expert per block, the same masked scatter — and checks it
@@ -198,3 +215,46 @@ transformers' `generate` token for token.
    `grouped_mm`: first for agreement, then for time at decode and prefill
    shapes. Its block sizes are a guess until then, where vLLM ships a tuned
    table per shape and dtype.
+
+## Closing the gap with vLLM
+
+Compressed MLA caching, latent-space decode, chunked context attention, MoE
+and YaRN are already implemented. The remaining work is to validate the GPU
+paths, benchmark mixed-batch execution, and measure which kernel
+optimizations matter. Follow this order:
+
+1. Validate the existing GPU paths. On an H100, compare FlashMLA decode with
+   the torch reference and Triton MoE with `grouped_mm`. Check eager, full
+   graph and piecewise graph execution, including padded batches and resumed
+   prefills. Then run the real V2-Lite weights and compare logits and greedy
+   generation with a pinned vLLM version. Record numerical tolerances and
+   mismatches before making performance claims.
+2. Establish a reproducible baseline. Use the same GPU, checkpoint, dtype,
+   context lengths, concurrency and token budgets in both engines. Measure
+   prefill, pure decode and mixed traffic separately, recording time to first
+   token, inter-token latency, throughput and peak memory. Record backend,
+   graph and prefix-cache settings alongside the vLLM commit.
+3. Validate mixed latent decode on GPU. Attention now separates prefill and
+   decode subsets and restores the original token order, as vLLM's MLA path
+   does. The torch regression checks paged-cache correctness and confirms that
+   decode context is not expanded. Check FlashMLA and piecewise graph behavior
+   on an H100, then measure decode latency while prompts arrive. The saved
+   expansion work has not yet been measured as an end-to-end speedup.
+4. Optimize the measured bottlenecks. Profile routing, expert GEMMs, latent
+   projections, context gathering and attention merging. Tune the MoE launch
+   configuration for actual shapes and dtypes. Evaluate prepared per-head
+   projection layouts and batched matmuls for latent decode, fused routing,
+   and shared-expert execution. For models with `q_lora_rank`, evaluate fusing
+   `q_a_proj` with `kv_a_proj_with_mqa`, as vLLM's MLA path does; V2-Lite does
+   not have that query-compression stage. Keep changes only when correctness
+   checks pass and benchmarks show a benefit.
+5. Extend support when a workload needs it. Weight and KV-cache quantization,
+   expert and pipeline parallelism, expert load balancing, and optimized
+   MLA decode beyond Hopper are separate feature gaps. Prioritize them from
+   memory, hardware and scaling requirements rather than treating all of
+   vLLM's features as prerequisites for efficient V2-Lite inference.
+
+Upstream references: [DeepSeek model and MoE](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/deepseek_v2.py),
+[MLA wrapper](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mla.py),
+and [MLA execution](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/attention/mla_attention.py).
+These links track `main`; pin the compared revision in benchmark results.
