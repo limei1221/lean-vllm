@@ -1,3 +1,4 @@
+from einops import rearrange, reduce, repeat
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -80,14 +81,14 @@ class DeepseekV2Attention(nn.Module):
     def expand(self, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Keys and values, [n, heads, dim] each, from cached latents [n, kv_lora_rank + qk_rope_head_dim]."""
         kv_c, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv = self.kv_b_proj(kv_c).view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        kv = rearrange(self.kv_b_proj(kv_c), "n (h d) -> n h d", h=self.num_heads)
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k = torch.cat([k_nope, k_pe.unsqueeze(1).expand(-1, self.num_heads, -1)], dim=-1)
+        k = torch.cat([k_nope, repeat(k_pe, "n d -> n h d", h=self.num_heads)], dim=-1)
         return k, v
 
     def latent_projections(self) -> tuple[torch.Tensor, torch.Tensor]:
         """kv_b_proj per head: key [heads, qk_nope_head_dim, kv_lora_rank] and value [heads, v_head_dim, kv_lora_rank]."""
-        weight = self.kv_b_proj.weight.view(self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
+        weight = rearrange(self.kv_b_proj.weight, "(h d) r -> h d r", h=self.num_heads)
         w_k, w_v = weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
         return w_k, w_v
 
@@ -101,17 +102,17 @@ class DeepseekV2Attention(nn.Module):
             q = self.q_proj(hidden_states)
         else:
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        q = rearrange(q, "n (h d) -> n h d", h=self.num_heads)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c = self.kv_a_layernorm(kv_c)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, rearrange(k_pe, "n d -> n 1 d"))
         # The latent is cached normalized and with rope applied, so a read needs only kv_b_proj.
-        return torch.cat([q_nope, q_pe], dim=-1), torch.cat([kv_c, k_pe.squeeze(1)], dim=-1)
+        return torch.cat([q_nope, q_pe], dim=-1), torch.cat([kv_c, rearrange(k_pe, "n 1 d -> n d")], dim=-1)
 
     def combine(self, o: torch.Tensor) -> torch.Tensor:
         """From attention's output back to the residual stream."""
-        return self.o_proj(o.flatten(1, -1))
+        return self.o_proj(rearrange(o, "n h d -> n (h d)"))
 
 
 class DeepseekV2MoE(nn.Module):
@@ -143,9 +144,9 @@ class DeepseekV2MoE(nn.Module):
         scores = F.linear(x.float(), self.gate.weight.float()).softmax(dim=-1)
         if self.topk_method == "group_limited_greedy":
             # Only experts in the topk_group best groups stay eligible.
-            groups = scores.view(-1, self.num_group, scores.size(-1) // self.num_group).amax(dim=-1)
+            groups = reduce(scores, "n (g e) -> n g", "max", g=self.num_group)
             kept = torch.zeros_like(groups, dtype=torch.bool).scatter_(1, groups.topk(self.topk_group, dim=-1).indices, True)
-            scores = scores.masked_fill(~kept.repeat_interleave(scores.size(-1) // self.num_group, dim=1), 0.0)
+            scores = scores.masked_fill(~repeat(kept, "n g -> n (g e)", e=scores.size(-1) // self.num_group), 0.0)
         topk_weights, topk_ids = scores.topk(self.top_k, dim=-1, sorted=False)
         if self.top_k > 1 and self.norm_topk_prob:
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)

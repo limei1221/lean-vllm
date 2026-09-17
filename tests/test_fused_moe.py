@@ -6,6 +6,7 @@ the same gather, one expert per block, the same masked scatter. So the contract 
 two is tested here, and only the arithmetic inside `tl.dot` awaits a GPU.
 """
 
+from einops import rearrange, reduce
 import pytest
 import torch
 import torch.distributed as dist
@@ -47,7 +48,7 @@ def batch():
 def blocked_moe(moe: FusedMoE, x, topk_weights, topk_ids, block_m: int) -> torch.Tensor:
     """What the kernel computes, in torch: a block reads one expert, a row reads one pair."""
     sorted_pairs, block_experts, num_rows = align_blocks(topk_ids, moe.num_experts, block_m)
-    num_pairs, weights = topk_ids.numel(), topk_weights.flatten()
+    num_pairs, weights = topk_ids.numel(), rearrange(topk_weights, "n k -> (n k)")
     h = torch.empty(num_pairs, 2 * moe.intermediate_size)
     out = torch.empty(num_pairs, x.size(1))
     for gate_up in (True, False):
@@ -58,8 +59,8 @@ def blocked_moe(moe: FusedMoE, x, topk_weights, topk_ids, block_m: int) -> torch
             pairs = sorted_pairs[block * block_m:(block + 1) * block_m]
             pairs = pairs[pairs < num_pairs].long()    # the mask the kernel applies to an overhanging block
             acc = a[pairs // per] @ b[expert].T
-            c[pairs] = acc if gate_up else acc * weights[pairs].unsqueeze(1)
-    return out.view(-1, moe.top_k, x.size(1)).sum(dim=1)
+            c[pairs] = acc if gate_up else acc * rearrange(weights[pairs], "n -> n 1")
+    return reduce(out, "(n k) d -> n d", "sum", k=moe.top_k)
 
 
 def test_the_blocking_holds_every_pair_exactly_once(batch):
@@ -73,7 +74,7 @@ def test_a_block_reads_one_expert(batch):
     """The whole point of the padding: no block spans two experts' weights."""
     _, _, topk_ids = batch
     sorted_pairs, block_experts, _ = align_blocks(topk_ids, NUM_EXPERTS, BLOCK_M)
-    pairs_expert = topk_ids.flatten()
+    pairs_expert = rearrange(topk_ids, "n k -> (n k)")
     for block, expert in enumerate(block_experts.tolist()):
         held = sorted_pairs[block * BLOCK_M:(block + 1) * BLOCK_M]
         held = held[held < topk_ids.numel()].long()
@@ -83,7 +84,7 @@ def test_a_block_reads_one_expert(batch):
 def test_the_row_count_covers_each_padded_run(batch):
     _, _, topk_ids = batch
     _, _, num_rows = align_blocks(topk_ids, NUM_EXPERTS, BLOCK_M)
-    counts = torch.bincount(topk_ids.flatten(), minlength=NUM_EXPERTS)
+    counts = torch.bincount(rearrange(topk_ids, "n k -> (n k)"), minlength=NUM_EXPERTS)
     assert num_rows == sum((count + BLOCK_M - 1) // BLOCK_M * BLOCK_M for count in counts.tolist())
 
 

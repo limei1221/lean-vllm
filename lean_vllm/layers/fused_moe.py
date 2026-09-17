@@ -8,6 +8,7 @@ Nothing here decides a shape on the host: the block count comes from the batch s
 the padding the sort leaves over is masked inside the kernel, so the layer stays capturable.
 """
 
+from einops import rearrange, reduce
 import torch
 
 from lean_vllm import envs
@@ -98,7 +99,7 @@ def align_blocks(topk_ids: torch.Tensor, num_experts: int, block_m: int) -> tupl
     each block reads, and how many rows survive the padding. Launch-only: sort, searchsorted and
     cumsum, where bincount or a host-side offset would sync.
     """
-    pairs = topk_ids.flatten()
+    pairs = rearrange(topk_ids, "n k -> (n k)")
     num_pairs = pairs.numel()
     experts = torch.arange(num_experts, device=pairs.device, dtype=pairs.dtype)
     expert_of_pair, order = pairs.sort()
@@ -134,7 +135,7 @@ def fused_experts(
     num_pairs = num_tokens * top_k
     launch = config(num_pairs)
     sorted_pairs, block_experts, num_rows = align_blocks(topk_ids, num_experts, launch["BLOCK_M"])
-    topk_weights = topk_weights.flatten().to(x.dtype)
+    topk_weights = rearrange(topk_weights, "n k -> (n k)").to(x.dtype)
 
     def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, pairs_per_row: int, mul_routed_weight: bool):
         n, k = b.shape[1], b.shape[2]
@@ -154,4 +155,4 @@ def fused_experts(
     h = act_fn(h)
     out = torch.empty(num_pairs, hidden_size, device=x.device, dtype=x.dtype)
     gemm(h, down_proj, out, 1, mul_routed_weight=True)    # h is already one row per pair
-    return out.view(num_tokens, top_k, hidden_size).sum(dim=1)
+    return reduce(out, "(n k) d -> n d", "sum", k=top_k)

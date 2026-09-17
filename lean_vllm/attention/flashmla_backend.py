@@ -1,3 +1,4 @@
+from einops import rearrange
 import torch
 
 from lean_vllm.attention.flash_backend import FlashAttention3Backend
@@ -35,7 +36,7 @@ class FlashMLABackend(FlashAttention3Backend):
             # Scheduled by the first layer's call; the rest reuse it, as they share the step's lengths.
             context.mla_decode_metadata, _ = get_mla_metadata()
         o, _ = flash_mla_with_kvcache(
-            q.unsqueeze(1), latent_cache.unsqueeze(2), context.block_tables, context.context_lens, v_dim,
+            rearrange(q, "b h d -> b 1 h d"), rearrange(latent_cache, "n p d -> n p 1 d"), context.block_tables, context.context_lens, v_dim,
             context.mla_decode_metadata, softmax_scale=self.scale, causal=True,
         )
-        return o.squeeze(1)    # match the [batch, heads, v_dim] contract
+        return rearrange(o, "b 1 h d -> b h d")    # match the [batch, heads, v_dim] contract
