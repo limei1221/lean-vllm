@@ -208,17 +208,19 @@ See [benchmark-runbook.md](benchmark-runbook.md) for a fresh GPU box and
      HTTP (FastAPI / uvicorn)      <- tokenize, stop strings, SSE
                |
          AsyncLLMEngine            <- per-request asyncio.Queue
-               |  (thread boundary)
-      engine thread: step()        <- detokenize
+               |  (event loop -> worker thread)
+      step() on one worker         <- detokenize
                |
            Scheduler               <- one token budget per step
                |
           ModelRunner              <- one mixed batch
 ```
 
-The engine is synchronous and runs on its own thread, because `step()` blocks
-for a whole forward pass and would starve the HTTP handlers. Requests and
-aborts cross into it through a queue drained at the top of `step()`.
+The engine is synchronous. Its loop runs on the event loop and hands each
+`step()` to a single worker thread, because a step blocks for a whole forward
+pass and would starve the HTTP handlers. Requests and aborts reach the engine on
+the event loop, between steps: an add waits for the step in flight, and an abort
+that arrives during one is applied as it returns.
 
 There is no in-process restart. An unhandled engine exception fails every
 outstanding request, flips `/health` to 503, and exits for a supervisor to

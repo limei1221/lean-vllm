@@ -1,14 +1,13 @@
-"""The synchronous engine on a dedicated thread, with an async front door.
+"""The synchronous engine driven from the event loop, with each step on a worker thread.
 
 `step()` blocks for a whole forward pass, which would starve the HTTP handlers on
-the event loop. Requests go in on a thread-safe queue; each step's outputs come back
-to the loop in one callback, which feeds the per-request streams.
+the event loop, so only that call leaves it. Everything else, admission, abort and
+feeding the per-request streams, runs on the loop, and a lock keeps it off the
+engine while a step is running.
 """
 
 import asyncio
-import threading
-from dataclasses import dataclass
-from queue import Empty, Queue
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import AsyncIterator, Callable
 from uuid import uuid4
 
@@ -17,12 +16,12 @@ from lean_vllm.engine.output import RequestOutput
 from lean_vllm.engine.scheduler import DuplicateRequestId
 from lean_vllm.sampling_params import SamplingParams
 
-# Wait on intake after an empty step, but poll so a wedged request cannot deadlock the loop.
+# Backoff after a step that ran nothing although work is outstanding, so the loop does not spin.
 IDLE_POLL = 0.005
 
 
 class EngineDeadError(RuntimeError):
-    """The engine thread raised. Nothing can be served until the process restarts."""
+    """The engine raised. Nothing can be served until the process restarts."""
 
 
 class AsyncStream:
@@ -44,24 +43,6 @@ class AsyncStream:
                 return
 
 
-@dataclass(slots=True)
-class _Add:
-    prompt: list[int]
-    sampling_params: SamplingParams
-    request_id: str
-    accepted: asyncio.Future
-
-
-@dataclass(slots=True)
-class _Abort:
-    request_id: str
-    reason: str = "abort"
-
-
-class _Stop:
-    pass
-
-
 class AsyncLLMEngine:
 
     def __init__(self, engine: LLMEngine):
@@ -70,10 +51,16 @@ class AsyncLLMEngine:
         self.metrics = engine.metrics
         self.error: BaseException | None = None
         self.on_death: Callable[[], None] | None = None
-        self._intake: Queue = Queue()
-        self._streams: dict[str, AsyncStream] = {}    # event loop only
+        # One worker, so every step runs on the same thread: CUDA's current device and the profiler are per thread.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lean-vllm-engine")
+        # The rest is event loop only.
+        self._streams: dict[str, AsyncStream] = {}
+        self._lock = asyncio.Lock()    # held while a step runs
+        self._aborts: list[tuple[str, str]] = []    # arrived during a step, applied after it
+        self._has_work = asyncio.Event()
+        self._stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
+        self._task: asyncio.Task | None = None
 
     @classmethod
     def from_engine_args(cls, model: str, **kwargs) -> "AsyncLLMEngine":
@@ -86,13 +73,17 @@ class AsyncLLMEngine:
     def start(self):
         """Called from the event loop that will read the streams."""
         self._loop = asyncio.get_running_loop()
-        self._thread = threading.Thread(target=self._run, name="lean-vllm-engine", daemon=True)
-        self._thread.start()
+        self._task = self._loop.create_task(self._run())
 
     def stop(self, timeout: float = 30.0):
-        self._intake.put(_Stop())    # FIFO, so adds already submitted are settled first
-        if self._thread is not None:
-            self._thread.join(timeout)
+        """Callable from any thread. Waits up to timeout for the step in flight."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self._call_soon(self._has_work.set)
+        closed = self._close_profiler()    # queued behind the step in flight
+        done, _ = wait([closed], timeout)
+        self._executor.shutdown(wait=bool(done))
         self._call_soon(self._fail_streams, EngineDeadError("the server is shutting down"))
 
     async def add_request(
@@ -101,23 +92,24 @@ class AsyncLLMEngine:
         sampling_params: SamplingParams,
         request_id: str | None = None,
     ) -> AsyncIterator[RequestOutput]:
-        """Returns a generator of per-step outputs; closing it aborts the request."""
+        """Returns a generator of per-step outputs; closing it aborts the request.
+
+        Admission is settled before this returns, so the caller can still choose a status code.
+        """
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         request_id = request_id or f"req-{uuid4().hex}"
         if request_id in self._streams:
-            # The scheduler would refuse it too, but only after this stream replaced the live
-            # one, leaving the first caller waiting on a stream no output can reach again.
+            # The scheduler would refuse it too, but only after this stream replaced the live one.
             raise DuplicateRequestId(f"{request_id} is already in flight")
-        stream = AsyncStream()
-        accepted = self._loop.create_future()
-        self._submit(_Add(prompt, sampling_params, request_id, accepted))
-        self._streams[request_id] = stream    # no callback for it can run before this line
-        try:
-            await accepted    # admission is settled before the caller sends a status code
-        except asyncio.CancelledError:
-            self.abort(request_id)    # intake is FIFO, so the abort lands behind the add
-            raise
+        async with self._lock:    # a cancel while waiting here leaves nothing behind
+            if self._stopped:
+                raise EngineDeadError("the server is shutting down")
+            if self.is_dead:
+                raise self._dead_error()
+            self.engine.add_request(prompt, sampling_params, request_id)
+            stream = self._streams[request_id] = AsyncStream()
+            self._has_work.set()
         return self._generate(request_id, stream)
 
     async def _generate(self, request_id: str, stream: AsyncStream) -> AsyncIterator[RequestOutput]:
@@ -130,32 +122,38 @@ class AsyncLLMEngine:
     def abort(self, request_id: str, reason: str = "abort"):
         """Non-blocking and never raising, so it is safe in a generator's finally."""
         self._streams.pop(request_id, None)
+        if self.is_dead or self._stopped:
+            return    # the blocks went with the engine
+        if self._lock.locked():
+            self._aborts.append((request_id, reason))
+            return
         try:
-            self._submit(_Abort(request_id, reason))
-        except EngineDeadError:
-            pass    # the blocks went with the thread
+            self.engine.abort_request(request_id, reason)
+        except Exception as error:
+            self._die(error)
 
-    def _submit(self, action: _Add | _Abort):
-        if self.is_dead:
-            raise EngineDeadError("the engine thread died") from self.error
-        self._intake.put(action)
-        if self.is_dead and isinstance(action, _Add) and not action.accepted.done():
-            action.accepted.set_exception(self._dead_error())    # it died as we submitted
-
-    # --- event loop, called from the engine thread ---
-
-    def _call_soon(self, callback: Callable, *args):
+    async def _run(self):
         try:
-            self._loop.call_soon_threadsafe(callback, *args)
-        except (AttributeError, RuntimeError):
-            pass    # never started, or the loop is closed and its handlers with it
-
-    def _settle(self, action: _Add, error: Exception | None):
-        if error is not None:
-            self._streams.pop(action.request_id, None)
-        if action.accepted.done():
-            return    # cancelled, or already failed by _submit
-        action.accepted.set_exception(error) if error else action.accepted.set_result(None)
+            while not self._stopped:
+                if self.engine.is_finished():
+                    self._has_work.clear()
+                    await self._has_work.wait()
+                    continue
+                async with self._lock:
+                    outputs, num_prefill_tokens, num_decode_tokens = await self._loop.run_in_executor(
+                        self._executor, self.engine.step
+                    )
+                    for request_id, reason in self._aborts:
+                        self.engine.abort_request(request_id, reason)
+                    self._aborts.clear()
+                self._deliver(outputs)
+                if not (outputs or num_prefill_tokens or num_decode_tokens):
+                    await asyncio.sleep(IDLE_POLL)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if not self._stopped:    # else a step refused by the shut-down executor
+                self._die(error)
 
     def _deliver(self, outputs: list[RequestOutput]):
         for output in outputs:
@@ -171,58 +169,24 @@ class AsyncLLMEngine:
         for stream in streams.values():
             stream.put(error)
 
-    # --- engine thread ---
-
-    def _run(self):
-        try:
-            wait: float | None = 0
-            while self._drain_intake(None if self.engine.is_finished() else wait):
-                if self.engine.is_finished():
-                    continue
-                outputs, num_prefill_tokens, num_decode_tokens = self.engine.step()
-                wait = 0 if outputs or num_prefill_tokens or num_decode_tokens else IDLE_POLL
-                if outputs:
-                    self._call_soon(self._deliver, outputs)
-        except BaseException as error:
-            self._die(error)
-        finally:
-            # Flush the profiler on the thread that started it; atexit runs on the main thread.
-            if self.engine.profiler is not None:
-                self.engine.profiler.close()
-
-    def _drain_intake(self, timeout: float | None) -> bool:
-        """Waits up to timeout (None: forever) for the first action. False once told to stop."""
-        while True:
-            try:
-                action = self._intake.get(timeout=timeout)
-            except Empty:
-                return True
-            timeout = 0
-            if isinstance(action, _Stop):
-                return False
-            if isinstance(action, _Abort):
-                self.engine.abort_request(action.request_id, action.reason)
-                continue
-            try:
-                self.engine.add_request(action.prompt, action.sampling_params, action.request_id)
-            except Exception as error:    # QueueFull, and anything else intake can reject
-                self._call_soon(self._settle, action, error)
-                continue
-            self._call_soon(self._settle, action, None)
-
     def _die(self, error: BaseException):
         """A status code cannot be retracted, so live streams get the error instead."""
         self.error = error
-        self._call_soon(self._fail_streams, self._dead_error())
-        while True:    # nobody is left to accept the intake queue
-            try:
-                action = self._intake.get_nowait()
-            except Empty:
-                break
-            if isinstance(action, _Add):
-                self._call_soon(self._settle, action, self._dead_error())
+        self._fail_streams(self._dead_error())
+        self._close_profiler()
         if self.on_death is not None:
-            self._call_soon(self.on_death)
+            self.on_death()
+
+    def _close_profiler(self) -> Future:
+        """On the worker, since the profiler must be flushed by the thread that stepped it."""
+        profiler = self.engine.profiler
+        return self._executor.submit(profiler.close if profiler is not None else lambda: None)
+
+    def _call_soon(self, callback: Callable, *args):
+        try:
+            self._loop.call_soon_threadsafe(callback, *args)
+        except (AttributeError, RuntimeError):
+            pass    # never started, or the loop is closed and its handlers with it
 
     def _dead_error(self) -> EngineDeadError:
         dead = EngineDeadError(f"the engine thread died: {self.error!r}")
