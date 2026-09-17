@@ -20,7 +20,7 @@ class FlashMLABackend(FlashAttention3Backend):
 
     @staticmethod
     def is_available() -> bool:
-        # The dense decode kernel is built for sm90 alone, as FA3 is.
+        # sm90 only, as FA3 is.
         return _IMPORT_ERROR is None and FlashAttention3Backend.is_available()
 
     @staticmethod

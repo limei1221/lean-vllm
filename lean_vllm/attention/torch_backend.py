@@ -99,8 +99,7 @@ class TorchAttention(AttentionBackend):
         return torch.cat(outputs, dim=0)
 
     def mla_decode(self, q, latent_cache, v_dim, context: Context) -> torch.Tensor:
-        # q: [B, H, D], D= latent_dim = (kv_lora_rank + rope_dim)
-        # v_dim = kv_lora_rank
+        # q: [B, H, D], D = kv_lora_rank + rope_dim, and v_dim = kv_lora_rank
         block_tables = context.block_tables
         outputs = []
         for i, seqlen_k in enumerate(context.context_lens.tolist()):

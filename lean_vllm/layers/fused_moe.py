@@ -1,11 +1,7 @@
 """A fused MoE built the way vLLM's Triton path builds it.
 
-The token-expert pairs are sorted by expert and each expert's run is padded to a whole number
-of row blocks, so one grouped GEMM kernel can read a block's expert weight once and reuse it.
-Two launches, gate_up then down, with the routing weight folded into the second epilogue.
-
-Nothing here decides a shape on the host: the block count comes from the batch shape alone and
-the padding the sort leaves over is masked inside the kernel, so the layer stays capturable.
+Pairs are sorted by expert and padded to whole row blocks, so each block reads one expert's weight.
+No shape is decided on the host, so the layer stays capturable.
 """
 
 from einops import rearrange, reduce
@@ -95,9 +91,7 @@ def config(num_pairs: int) -> dict:
 def align_blocks(topk_ids: torch.Tensor, num_experts: int, block_m: int) -> tuple[torch.Tensor, ...]:
     """Sort the token-expert pairs by expert, and pad each expert's run to a multiple of block_m.
 
-    Returns the pair each padded row carries (out of range where a block overhangs), the expert
-    each block reads, and how many rows survive the padding. Launch-only: sort, searchsorted and
-    cumsum, where bincount or a host-side offset would sync.
+    Returns each padded row's pair (out of range in an overhang), each block's expert, and the row count. No sync.
     """
     pairs = rearrange(topk_ids, "n k -> (n k)")
     num_pairs = pairs.numel()

@@ -1,9 +1,6 @@
-"""The Triton MoE's blocking, checked on the CPU against the grouped_mm path it replaces.
+"""The Triton MoE's blocking, checked on the CPU against the grouped_mm path.
 
-The kernel itself needs a GPU, but everything it indexes with comes from `align_blocks`, and
-what it does with that is short enough to write out in torch. `blocked_moe` is that writing:
-the same gather, one expert per block, the same masked scatter. So the contract between the
-two is tested here, and only the arithmetic inside `tl.dot` awaits a GPU.
+`blocked_moe` writes the kernel's indexing out in torch, so only the `tl.dot` arithmetic needs a GPU.
 """
 
 from einops import rearrange, reduce

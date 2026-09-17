@@ -229,20 +229,13 @@ class ModelRunner:
 
     @staticmethod
     def _cudagraph_mode(mode: str, mla: bool, backend: type[AttentionBackend]) -> str:
-        """The mode these captures can actually serve.
-
-        A full graph holds attention, so an MLA model needs a backend that attends the
-        latents; expanding them instead reads a plan this step built on the host.
-        """
+        """The mode these captures can serve. A full graph holds attention, so MLA needs a backend that attends latents."""
         if mla and mode in FULL_MODES and not backend.supports_mla_decode():
             return "piecewise" if mode in PIECEWISE_MODES else "none"
         return mode
 
     def _step_kind(self, is_prefill: bool, num_tokens: int) -> str:
-        """How this step runs: "graph", "piecewise", or why it must run eager.
-
-        For pure decode num_tokens is the batch size. A mode whose graphs were never captured runs eager.
-        """
+        """How this step runs: "graph", "piecewise", or why it must run eager. num_tokens is the batch size for decode."""
         if self.cudagraph_mode == "none":
             return "enforced"
         if not is_prefill and self.cudagraph_mode in FULL_MODES and self.graph_bs:
@@ -284,10 +277,7 @@ class ModelRunner:
         return None if bucket is None or num_tokens < self.piecewise_bs[0] else bucket
 
     def _replay_piecewise(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """A graph per piece, with attention run eager between them.
-
-        Pieces are per token, so pad rows never touch real ones; attention sees only real rows.
-        """
+        """A graph per piece, with attention run eager on the real rows between them."""
         num_tokens = input_ids.size(0)
         bucket = self._piecewise_bucket(num_tokens)
         graphs, buffers = self.piecewise_graphs[bucket], self.piecewise_vars
@@ -321,10 +311,7 @@ class ModelRunner:
         return pending
 
     def _piecewise_buckets(self) -> list[int]:
-        """Token counts to capture at: small steps only, none padded past a quarter.
-
-        Capture pays off only where launch overhead rivals compute; larger steps run eager, as in vLLM.
-        """
+        """Token counts to capture at: small steps only, where launch overhead rivals compute, none padded past a quarter."""
         top = min(PIECEWISE_MAX_TOKENS, self.config.max_num_batched_tokens)
         sizes, size = [], PIECEWISE_MIN_TOKENS
         while size < top:
@@ -335,10 +322,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_piecewise(self):
-        """Capture the model either side of attention, one graph per piece per bucket.
-
-        Pieces use fixed buffers and touch no context or KV cache, which makes them capturable.
-        """
+        """Capture the model either side of attention, one graph per piece per bucket."""
         hf_config = self.config.hf_config
         layers = self.model.model.layers
         self.piecewise_bs = self._piecewise_buckets()

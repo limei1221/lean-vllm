@@ -1,5 +1,4 @@
-"""The sweep driver's command building, which is where an engine comparison
-turns unfair without saying so."""
+"""The sweep driver's command building, where an engine comparison can silently turn unfair."""
 
 import sys
 from pathlib import Path

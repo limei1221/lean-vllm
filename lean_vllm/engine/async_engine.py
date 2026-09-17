@@ -1,9 +1,6 @@
 """The synchronous engine driven from the event loop, with each step on a worker thread.
 
-`step()` blocks for a whole forward pass, which would starve the HTTP handlers on
-the event loop, so only that call leaves it. Everything else, admission, abort and
-feeding the per-request streams, runs on the loop, and a lock keeps it off the
-engine while a step is running.
+Only the blocking `step()` leaves the loop; a lock keeps everything else off the engine meanwhile.
 """
 
 import asyncio
@@ -92,10 +89,7 @@ class AsyncLLMEngine:
         sampling_params: SamplingParams,
         request_id: str | None = None,
     ) -> AsyncIterator[RequestOutput]:
-        """Returns a generator of per-step outputs; closing it aborts the request.
-
-        Admission is settled before this returns, so the caller can still choose a status code.
-        """
+        """Per-step outputs; closing the generator aborts. Admission settles first, so a status code is still choosable."""
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         request_id = request_id or f"req-{uuid4().hex}"

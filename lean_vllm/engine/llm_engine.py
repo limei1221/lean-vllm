@@ -44,14 +44,9 @@ def load_tokenizer(model: str) -> PreTrainedTokenizerFast:
 
 
 class _StepProfiler:
-    """torch.profiler over a window of engine steps, enabled by environment.
-
-    ``LEAN_PROFILE_DIR`` enables it; ``LEAN_PROFILE_SKIP`` steps pass before
-    ``LEAN_PROFILE_STEPS`` steps are captured. ``record_function`` ranges label the
-    host phases; ``await_tokens`` is where the host waits on the device.
+    """torch.profiler over a window of engine steps, set by the LEAN_PROFILE_* variables.
 
     CPU only by default, since kineto refuses CUDA activity from the engine thread.
-    ``LEAN_PROFILE_CUDA=1`` adds it, clean only for offline generate.
     """
 
     def __init__(self, out_dir: str, skip: int, steps: int, cuda: bool):
@@ -170,11 +165,7 @@ class LLMEngine:
         return aborted
 
     def step(self) -> tuple[list[RequestOutput], int, int]:
-        """Launch one step and drain the one launched before it.
-
-        With async_scheduling the launch goes first, so the GPU runs it while the
-        host drains the last; without it, only detokenization overlaps.
-        """
+        """Launch one step and drain the previous one; async_scheduling launches first so the two overlap."""
         started = perf_counter()
         draining, self.in_flight = self.in_flight, None
         if self.config.async_scheduling:

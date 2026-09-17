@@ -61,10 +61,7 @@ class AttentionBackend(ABC):
         latent_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        """Scatter MLA latents into the paged latent cache in place. Slot -1 skips.
-
-        latent is [num_tokens, latent_dim] and the cache [num_blocks, block_size, latent_dim].
-        """
+        """Scatter latents [num_tokens, latent_dim] into the paged cache in place. Slot -1 skips."""
         raise NotImplementedError(f"the {self.get_name()} backend stores no MLA latents")
 
     @abstractmethod
@@ -95,10 +92,7 @@ class AttentionBackend(ABC):
         max_seqlen_k: int,
         causal: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Attention over packed k and v with no cache, and its log-sum-exp, [num_tokens, num_heads].
-
-        The lse lets attention over disjoint key sets be merged. A causal mask is bottom-right aligned.
-        """
+        """Uncached attention, bottom-right aligned, plus its log-sum-exp [num_tokens, num_heads] for merging."""
 
     @abstractmethod
     def decode(

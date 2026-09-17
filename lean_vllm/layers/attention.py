@@ -87,8 +87,7 @@ class Attention(nn.Module):
         return torch.ops.lean_vllm.attention(q, k, v, self.layer_name)
 
     def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        """The op's body. Writes the KV cache, which the op does not declare as a
-        mutation: the cache is module state rather than an argument."""
+        """The op's body. Its KV cache write is undeclared, as the cache is module state."""
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
@@ -110,11 +109,7 @@ class ContextChunk:
 
 
 def plan_context_chunks(context_lens: list[int], budget: int) -> list[tuple[int, list[int], list[int]]]:
-    """Pack rows' cached keys into chunks of at most budget, as (first row, starts, lengths).
-
-    Rows stay consecutive within a chunk, one longer than the budget splits across chunks,
-    and a row with no cached keys belongs to none.
-    """
+    """Pack rows' cached keys into chunks of at most budget, as (first row, starts, lengths). Long rows split."""
     assert budget > 0
     chunks = []
     row = start = 0
@@ -198,9 +193,7 @@ def mla_partitions(context: Context) -> list[tuple[torch.Tensor, Context]]:
 class MLAAttention(Attention):
     """Multi-head latent attention: the cache holds one compressed latent per token.
 
-    A step expands the latents it reads back into keys and values. Cached ones are
-    read at most max_context_chunk at a time and merged by log-sum-exp, as vLLM does.
-    Decode rows on a backend with MLA decode attend latents, including in mixed steps.
+    Cached latents expand max_context_chunk at a time, merged by log-sum-exp; MLA decode backends skip expanding.
     """
 
     max_context_chunk = 8192    # the runner sets its step token budget
@@ -262,8 +255,7 @@ class MLAAttention(Attention):
             unpaged = dataclasses.replace(context, block_tables=None, keys_are_new=True)
             o = self.backend.prefill(q, k, self._pad(v), self.k_cache, self.v_cache, unpaged)
             return o[..., :self.v_head_dim].contiguous()
-        # The step's tokens attend each other causally. Cached keys precede all of them, so each
-        # chunk of those is attended unmasked and merged in, keeping expansions bounded.
+        # New tokens attend each other causally, then each chunk of cached keys unmasked.
         cu_seqlens_q, max_seqlen_q = context.cu_seqlens_q, context.max_seqlen_q
         o, lse = self.backend.varlen_with_lse(
             q, k, self._pad(v), cu_seqlens_q, cu_seqlens_q, max_seqlen_q, max_seqlen_q, causal=True,
@@ -284,8 +276,7 @@ class MLAAttention(Attention):
     def _decode_latents(self, q: torch.Tensor, context: Context) -> torch.Tensor:
         """Attention over the cached latents as they are, so nothing expands.
 
-        A key's nope part is W_k c for latent c, and q . W_k c = W_k^T q . c, so the query moves
-        into latent space instead. Attention is linear in the values, so W_v applies after it.
+        q . W_k c = W_k^T q . c moves the query into latent space; W_v applies after, as attention is linear in values.
         """
         w_k, w_v = self.latent_projections()
         q_nope, q_pe = q.split([w_k.size(1), self.head_dim - w_k.size(1)], dim=-1)

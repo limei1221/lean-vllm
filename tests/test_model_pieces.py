@@ -58,7 +58,7 @@ fake_attention = FakeAttention()
 
 
 def reference(layer, positions, hidden_states, residual):
-    """The layer written out as it read before the split, module for module."""
+    """The unsplit layer, written out module for module."""
     if residual is None:
         hidden_states, residual = layer.input_layernorm(hidden_states), hidden_states
     else:

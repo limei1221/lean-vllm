@@ -1,8 +1,6 @@
 """Server-side metrics, as Prometheus text and as a JSON summary.
 
 Names mirror vLLM's under a `lean_vllm:` prefix, so one dashboard reads both.
-Hand-rolled, as that is less code than `prometheus_client`. One lock keeps a
-render from catching a histogram mid-update.
 """
 
 import threading
@@ -132,7 +130,7 @@ class Metrics:
 
     def __init__(self):
         self.start_time = perf_counter()
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()    # so a render never catches a histogram mid-update
 
         self.running = Gauge("lean_vllm:num_requests_running", "Requests in the running set.")
         self.waiting = Gauge("lean_vllm:num_requests_waiting", "Requests in the waiting queue.")
@@ -242,8 +240,7 @@ class Metrics:
             uptime = perf_counter() - self.start_time
             return {
                 "uptime_seconds": uptime,
-                # Fraction of wall clock in a forward pass. nvidia-smi counts any
-                # kernel as busy, so it reads high; it is only for comparison.
+                # Fraction of wall clock in a forward pass; nvidia-smi's figure reads higher.
                 "model_busy_fraction": _rate(self.model_busy.total, uptime),
                 "gpu_utilization_percent_nvidia_smi": gpu_utilization(),
                 "steps": self.steps.total,

@@ -165,11 +165,7 @@ def test_varlen_with_lse(backend, device, dtype, tol, causal):
 
 
 def test_prefill_of_a_cold_batch_with_pages(backend, device, block_size, dtype, tol):
-    """The shape a fresh prompt takes while serving: pages allocated, nothing cached in them.
-
-    Every key is in k and v, so a backend may answer from either place, and this
-    checks that both agree with the oracle.
-    """
+    """A fresh prompt while serving: pages allocated but empty, so k/v and the pages must agree."""
     seqlens = [5, block_size + 3]
     block_tables_list = [[0, 1, -1], [2, 3, 4]]
     k_cache, v_cache = make_cache(6, device, block_size, dtype)
@@ -406,10 +402,7 @@ def test_top_left_causal_alignment_would_be_wrong(backend, device, block_size, d
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
 def test_low_precision_no_worse_than_naive(backend, device, block_size, dtype):
-    """Backend error against fp32 oracle must not exceed naive arithmetic in the same dtype.
-
-    A fixed atol means nothing at bf16, so compare against naive precision loss instead.
-    """
+    """Backend error against the fp32 oracle must not exceed naive arithmetic's in the same dtype."""
     num_cached, num_new = 2 * block_size + 2, 6
     total = num_cached + num_new
     block_table = [0, 1, 2, 3]

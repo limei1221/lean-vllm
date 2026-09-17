@@ -53,9 +53,7 @@ def test_two_requests_finish_with_the_tokens_the_runner_sampled(make_engine):
 class TestAsyncScheduling:
 
     def test_the_flag_launches_before_the_last_step_is_reconciled(self, make_engine):
-        """Stopping on EOS costs one extra launched step, scheduled before the stop is known.
-
-        A pending count cannot show it, so count launched batches."""
+        """Stopping on EOS costs one extra launched step, scheduled before the stop is known."""
         runs = {}
         for async_scheduling in (False, True):
             engine = make_engine(eos_after={"r": 2}, async_scheduling=async_scheduling)

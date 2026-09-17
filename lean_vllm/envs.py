@@ -18,7 +18,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LEAN_VLLM_MOE_BACKEND": lambda: os.getenv("LEAN_VLLM_MOE_BACKEND") or None,
     # Enables the step-loop profiler, which writes its trace here.
     "LEAN_PROFILE_DIR": lambda: os.getenv("LEAN_PROFILE_DIR") or None,
-    # Steps passed before the capture, then steps captured.
+    # Steps skipped, then steps captured.
     "LEAN_PROFILE_SKIP": lambda: int(os.getenv("LEAN_PROFILE_SKIP", "200")),
     "LEAN_PROFILE_STEPS": lambda: int(os.getenv("LEAN_PROFILE_STEPS", "200")),
     # Adds CUDA activity to the trace; clean only for offline generate.

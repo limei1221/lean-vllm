@@ -99,8 +99,7 @@ class FlashAttention3Backend(AttentionBackend):
                 max_seqlen_q=context.max_seqlen_q, max_seqlen_k=context.max_seqlen_k,
                 softmax_scale=self.scale, causal=True,
             )
-        # Some row reads cached keys. FA3's varlen entry takes no page table, so use the
-        # kvcache one, with per-row key lengths from cu_seqlens_k as in the torch backend.
+        # Some row reads cached keys, and FA3's varlen entry takes no page table.
         cache_seqlens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
         return flash_attn_with_kvcache(
             q, k_cache, v_cache,

@@ -3,12 +3,8 @@ r"""Open-loop serving benchmark: Poisson arrivals against lean-vLLM or vLLM.
     uv run python benchmarks/bench_serving.py --model ~/workspace/huggingface/Qwen3-8B \
         --dataset lognormal --num-requests 500 --request-rate 8
 
-Open loop: requests go out on schedule whatever is outstanding. A 429 is never
-retried, and percentiles cover completed requests only, so every table shows the
-rejection rate beside them. Other failures are bugs and abort the run past a threshold.
-
+A 429 is never retried and percentiles cover completed requests only, so tables show the rejection rate too.
 Prompts are token ids on `/v1/completions`, so no chat template skews the counts.
-Only `ignore_eos` and `priority` go outside the OpenAI schema; both engines accept them.
 """
 
 import argparse
@@ -94,10 +90,7 @@ def lognormal_trace(rng: random.Random, args) -> list[Request]:
 
 
 def mixed_trace(rng: random.Random, args) -> list[Request]:
-    """Short prompts beside long ones; read the `short` label's TTFT.
-
-    `--long-priority 1` takes effect only under `--scheduling-policy priority`.
-    """
+    """Short prompts beside long ones; read the `short` label's TTFT."""
     trace = []
     for _ in range(args.num_requests):
         if rng.random() < args.long_fraction:

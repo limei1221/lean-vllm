@@ -1,7 +1,4 @@
-"""OpenAI-compatible request and response bodies.
-
-Only what the engine implements is accepted: silently ignoring a field is worse than a 400.
-"""
+"""OpenAI-compatible request and response bodies. Unimplemented fields are a 400, never ignored."""
 
 from time import time
 from typing import Any, Literal

@@ -1,7 +1,6 @@
-"""DeepSeek-V2 (MLA, MoE, YaRN) against transformers' implementation, on a tiny random checkpoint.
+"""DeepSeek-V2 (MLA, MoE, YaRN) against transformers on a tiny random checkpoint, fp32 on the torch backend.
 
-fp32 on the torch backend. Paged steps go through the runner's real batch preparation, so the
-latent cache, its key gather and mixed prefill/decode batches are all compared, not just a prompt.
+Paged steps go through the runner's real batch preparation, so mixed batches are compared too.
 """
 
 from einops import rearrange
@@ -210,7 +209,7 @@ def pieces(model) -> tuple:
 
 
 def unsplit(layer, positions, hidden_states, residual, attend):
-    """The layer written out as it read before the split, module for module."""
+    """The unsplit layer, written out module for module."""
     if residual is None:
         hidden_states, residual = layer.input_layernorm(hidden_states), hidden_states
     else:

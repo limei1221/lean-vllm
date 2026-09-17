@@ -1,8 +1,6 @@
 """The benchmark client against the HTTP layer and a fake engine, so no GPU.
 
-What is under test is the accounting: a 429 is a rejection and is never
-retried, a 503 is a failure, and the percentiles are computed over completed
-requests only.
+Under test: a 429 is a never-retried rejection, a 503 a failure, and percentiles cover completions only.
 """
 
 import sys

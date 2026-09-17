@@ -1,7 +1,4 @@
-"""The attention custom op: the seam torch.compile splits a graph on.
-
-These pin its contract: the schema, the fake, and the layer lookup by name.
-"""
+"""The attention custom op torch.compile splits on: its schema, fake, and layer lookup by name."""
 
 import pytest
 import torch

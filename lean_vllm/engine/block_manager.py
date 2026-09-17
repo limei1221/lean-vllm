@@ -23,11 +23,7 @@ class Block:
 
 
 class FreeBlockQueue:
-    """Free blocks in eviction order, least recently released first.
-
-    Free blocks keep their contents, so a prefix hit removes one from the middle:
-    hence an OrderedDict, not a deque.
-    """
+    """Free blocks, least recently released first. An OrderedDict, as a prefix hit takes one from the middle."""
 
     def __init__(self, block_ids: Iterable[int]):
         self._ids: OrderedDict[int, None] = OrderedDict.fromkeys(block_ids)
@@ -78,10 +74,7 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
-        """Cached blocks seq would get, or -1 if the rest does not fit.
-
-        The trailing block is always recomputed: attention needs at least one query token.
-        """
+        """Cached blocks seq would get, or -1 if the rest does not fit. The trailing block always recomputes."""
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
         for i in range(seq.num_blocks - 1) if self.enable_prefix_caching else ():
@@ -130,10 +123,7 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence, num_computed_tokens: int):
-        """Publish each full block once its KV is computed and its tokens are known.
-
-        These differ only when steps overlap and a reserved token runs the computed count ahead.
-        """
+        """Publish each full block once its KV is computed and its tokens are known (a reserved token can lag)."""
         if not self.enable_prefix_caching:
             return
         end = min(num_computed_tokens, seq.num_tokens) // self.block_size

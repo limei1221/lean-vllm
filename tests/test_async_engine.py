@@ -19,10 +19,7 @@ def prompt(n: int, start: int = 0) -> list[int]:
 
 
 class GatedModelRunner(FakeModelRunner):
-    """One forward pass per release(), so a test is never racing the engine.
-
-    A blocked runner holds the engine, so an add waits for the next release().
-    """
+    """One forward pass per release(), so a test is never racing the engine."""
 
     def __init__(self):
         super().__init__()
@@ -240,8 +237,7 @@ class TestAdmission:
         outputs = await engine.add_request(prompt(8), FOREVER, "twice")
 
         with pytest.raises(DuplicateRequestId):
-            # Refused here, not out at the engine: a gated step holds the engine, so waiting
-            # on admission for this one would hang rather than fail.
+            # Refused here: a gated step holds the engine, so waiting on admission would hang.
             await asyncio.wait_for(engine.add_request(prompt(8, 100), FOREVER, "twice"), timeout=1)
         assert set(engine._streams) == {"twice"}
 

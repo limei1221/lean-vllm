@@ -12,11 +12,7 @@ from lean_vllm.layers.linear import divide
 class FusedMoE(nn.Module):
     """Routed experts, stacked per projection and run as two grouped matrix multiplies.
 
-    On CUDA the Triton kernels in `fused_moe.py` run them, as vLLM does; elsewhere
-    `grouped_mm` does, which is also the reference the kernel is checked against.
-    Tokens are sorted by expert on the device either way, so routing never waits on
-    the host. Tensor parallelism shards each expert's intermediate size, as the dense
-    MLP does.
+    Triton kernels from `fused_moe.py` on CUDA, `grouped_mm` elsewhere. TP shards each expert's intermediate size.
     """
 
     def __init__(
