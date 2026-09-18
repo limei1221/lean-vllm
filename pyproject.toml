@@ -12,14 +12,19 @@ readme = "README.md"
 description = "a lightweight vLLM implementation for prototyping inference techniques and benchmarking them against vLLM"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "torch>=2.4.0",
-    "transformers>=4.51.0",
+    "einops",
+    "safetensors",
+    "tokenizers>=0.22",    # DecodeStream(ids=), for the fast detokenizer
+    "torch>=2.10",    # F.grouped_mm, which the routed experts fall back on, is public from 2.10
+    "tqdm",
+    "transformers>=4.56.0",    # the first release that allows tokenizers 0.22
     "xxhash",
 ]
 
 [project.optional-dependencies]
 serve = [
     "fastapi>=0.115",
+    "pydantic>=2",
     "uvicorn>=0.30",
 ]
 cuda = [
@@ -42,6 +47,7 @@ dev = [
     "pytest",
     "httpx",       # what the openai SDK speaks: the benchmark client and the ASGI tests
     "httpx2",      # starlette's testclient prefers it and warns when it falls back to httpx
+    "numpy",       # bench_serving's percentiles; only transformers pulled it in before
     # the server itself, so `uv run pytest tests/` runs the whole suite rather than
     # skipping the two modules that importorskip fastapi
     "lean-vllm[serve]",

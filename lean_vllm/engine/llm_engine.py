@@ -3,10 +3,11 @@ import os
 from dataclasses import dataclass, fields
 from time import perf_counter
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 import torch.multiprocessing as mp
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
+from lean_vllm import envs
 from lean_vllm.config import Config
 from lean_vllm.sampling_params import SamplingParams
 from lean_vllm.engine.output import RequestOutput
@@ -15,7 +16,7 @@ from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.scheduler import InvalidRequest, LaunchedRow, QueueFull, Scheduler, SchedulerOutput
 from lean_vllm.engine.model_runner import ModelRunner
-from lean_vllm.utils.detokenizer import IncrementalDetokenizer
+from lean_vllm.utils.detokenizer import FastIncrementalDetokenizer
 
 
 def validate_request(prompt: list[int], sampling_params: SamplingParams, vocab_size: int, max_model_len: int):
@@ -34,15 +35,18 @@ def validate_request(prompt: list[int], sampling_params: SamplingParams, vocab_s
         )
 
 
-class _StepProfiler:
-    """torch.profiler over a window of engine steps, enabled by environment.
+def load_tokenizer(model: str) -> PreTrainedTokenizerFast:
+    """Detokenization steps tokenizers' DecodeStream, so only a fast tokenizer will do."""
+    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
+    if not isinstance(tokenizer, PreTrainedTokenizerFast):
+        raise ValueError(f"{model} has no fast tokenizer (a tokenizer.json), which detokenization needs")
+    return tokenizer
 
-    ``LEAN_PROFILE_DIR`` enables it; ``LEAN_PROFILE_SKIP`` steps pass before
-    ``LEAN_PROFILE_STEPS`` steps are captured. ``record_function`` ranges label the
-    host phases; ``await_tokens`` is where the host waits on the device.
+
+class _StepProfiler:
+    """torch.profiler over a window of engine steps, set by the LEAN_PROFILE_* variables.
 
     CPU only by default, since kineto refuses CUDA activity from the engine thread.
-    ``LEAN_PROFILE_CUDA=1`` adds it, clean only for offline generate.
     """
 
     def __init__(self, out_dir: str, skip: int, steps: int, cuda: bool):
@@ -62,13 +66,9 @@ class _StepProfiler:
 
     @classmethod
     def from_env(cls) -> "_StepProfiler | None":
-        out_dir = os.environ.get("LEAN_PROFILE_DIR")
-        if not out_dir:
+        if not envs.LEAN_PROFILE_DIR:
             return None
-        skip = int(os.environ.get("LEAN_PROFILE_SKIP", "200"))
-        steps = int(os.environ.get("LEAN_PROFILE_STEPS", "200"))
-        cuda = os.environ.get("LEAN_PROFILE_CUDA", "0") not in ("", "0", "false", "False")
-        return cls(out_dir, skip, steps, cuda)
+        return cls(envs.LEAN_PROFILE_DIR, envs.LEAN_PROFILE_SKIP, envs.LEAN_PROFILE_STEPS, envs.LEAN_PROFILE_CUDA)
 
     def step(self):
         if self.started is False:
@@ -116,21 +116,18 @@ class LLMEngine:
         Sequence.block_size = config.kvcache_block_size
         Sequence.enable_prefix_caching = config.enable_prefix_caching
         Sequence.hash_algo = config.prefix_caching_hash_algo
+        self.tokenizer = load_tokenizer(config.model)    # before workers spawn, so a bad one fails fast
+        config.eos = self.tokenizer.eos_token_id
         self.ps = []
-        self.events = []
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process = ctx.Process(target=ModelRunner, args=(config, i))
             process.start()
             self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
+        self.model_runner = ModelRunner(config, 0)
         self.scheduler = Scheduler(config)
         self.metrics = Metrics()
-        self.detokenizers: dict[str, IncrementalDetokenizer] = {}
+        self.detokenizers: dict[str, FastIncrementalDetokenizer] = {}
         self.in_flight: _InFlight | None = None
         self.profiler = _StepProfiler.from_env()
         atexit.register(self.exit)
@@ -148,7 +145,7 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         validate_request(prompt, sampling_params, self.config.hf_config.vocab_size, self.config.max_model_len)
         seq = Sequence(prompt, sampling_params, request_id)
-        detokenizer = IncrementalDetokenizer(self.tokenizer, prompt, seq.skip_special_tokens)
+        detokenizer = FastIncrementalDetokenizer(self.tokenizer, prompt, seq.skip_special_tokens)
         try:
             self.scheduler.add(seq)    # last, so a refused request leaves nothing behind
         except QueueFull:
@@ -168,11 +165,7 @@ class LLMEngine:
         return aborted
 
     def step(self) -> tuple[list[RequestOutput], int, int]:
-        """Launch one step and drain the one launched before it.
-
-        With async_scheduling the launch goes first, so the GPU runs it while the
-        host drains the last; without it, only detokenization overlaps.
-        """
+        """Launch one step and drain the previous one; async_scheduling launches first so the two overlap."""
         started = perf_counter()
         draining, self.in_flight = self.in_flight, None
         if self.config.async_scheduling:

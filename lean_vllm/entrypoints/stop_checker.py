@@ -1,8 +1,5 @@
 class StopChecker:
-    """Applies `stop` strings to streamed text.
-
-    A stop string can span tokens, so a tail of its length minus one is held back.
-    """
+    """Applies `stop` strings to streamed text, holding back a tail a match could still start in."""
 
     def __init__(self, stop: list[str]):
         self.stop = [s for s in stop if s]

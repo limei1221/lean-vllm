@@ -3,6 +3,7 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+from lean_vllm.attention import get_attention_backend
 from lean_vllm.engine.sequence import HASH_ALGOS
 
 logger = logging.getLogger(__name__)
@@ -52,3 +53,8 @@ class Config:
             self.async_scheduling = False
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        if getattr(self.hf_config, "kv_lora_rank", None) is not None:    # an MLA model
+            block_size = get_attention_backend(mla=True).mla_block_size()
+            if block_size and block_size != self.kvcache_block_size:
+                logger.warning("kvcache_block_size is %d: the MLA decode kernel reads no other page size", block_size)
+                self.kvcache_block_size = block_size

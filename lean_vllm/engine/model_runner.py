@@ -1,23 +1,25 @@
 import logging
-import pickle
+import math
+from datetime import timedelta
 import torch
 import torch.distributed as dist
 from torch.profiler import record_function
-from multiprocessing.synchronize import Event
-from multiprocessing.shared_memory import SharedMemory
 
-from lean_vllm.attention import get_attention_backend
+from lean_vllm.attention import AttentionBackend, get_attention_backend
 from lean_vllm.config import Config, FULL_MODES, PIECEWISE_MODES
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.sequence import Sequence
-from lean_vllm.models.qwen3 import Qwen3ForCausalLM
-from lean_vllm.layers.attention import register_layers
+from lean_vllm.models import get_model_class
+from lean_vllm.layers.attention import Attention, MLAAttention, register_layers
 from lean_vllm.layers.sampler import Sampler
-from lean_vllm.utils.context import set_context, get_context, reset_context
+from lean_vllm.utils.context import set_context, get_context
 from lean_vllm.utils.loader import load_model
 from lean_vllm.utils import device as dev
 
 logger = logging.getLogger(__name__)
+
+# How long a TP worker may wait for its next call; gloo's 30-minute default would kill an idle server.
+CALL_TIMEOUT = timedelta(days=365)
 
 # Piecewise buckets: step sizes worth capturing, minimum gap, and maximum replay padding.
 PIECEWISE_MIN_TOKENS = 64
@@ -28,21 +30,26 @@ PIECEWISE_MAX_PAD = 0.25
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         Sequence.block_size = self.block_size    # spawned workers never run LLMEngine.__init__
         self.device = dev.get_device()
-        attention_backend = get_attention_backend()
+        mla = getattr(hf_config, "kv_lora_rank", None) is not None
+        attention_backend = get_attention_backend(mla=mla)
         if rank == 0:
             logger.info("attention backend: %s", attention_backend.get_name())
         self.step_kind = "enforced"    # how the last step ran: see _step_kind
         self._prev_tokens: SampledTokens | None = None    # the step still in flight, if any
         self._prev_rows: dict[int, int] | None = None       # seq_id -> its row in those tokens
+        model_cls = get_model_class(hf_config)
         self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
-                              or not attention_backend.supports_cuda_graph())
-        self.cudagraph_mode = "none" if self.enforce_eager else config.cudagraph_mode
+                              or not attention_backend.supports_cuda_graph() or not model_cls.supports_cuda_graph)
+        mode = "none" if self.enforce_eager else config.cudagraph_mode
+        self.cudagraph_mode = self._cudagraph_mode(mode, mla, attention_backend)
+        if rank == 0 and self.cudagraph_mode != mode:
+            logger.info("full CUDA graphs are off: %s has no MLA decode", attention_backend.get_name())
         self.graph_bs: list[int] = []          # captured batch sizes, full graphs
         self.piecewise_bs: list[int] = []      # captured token counts, piecewise graphs
         self.graphs: dict = {}
@@ -50,15 +57,21 @@ class ModelRunner:
         self.graph_pool = None                 # shared by both capture kinds
         self.world_size = config.tensor_parallel_size
         self.rank = rank
-        self.event = event
 
         dist.init_process_group(dev.dist_backend(self.device), "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if self.world_size > 1:
+            # Calls go to the workers on the host, whatever device the default group runs on.
+            self.call_group = dist.new_group(backend="gloo", timeout=CALL_TIMEOUT)
         dev.set_device(self.device, rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device(self.device)
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = model_cls(hf_config)
         register_layers(self.model)    # before warmup_model, which runs the op
+        for module in self.model.modules():
+            if isinstance(module, MLAAttention):
+                # Warmup expands a step's worth of new latents, so a chunk this size fits what it measured.
+                module.max_context_chunk = config.max_num_batched_tokens
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -70,21 +83,12 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="lean_vllm", create=True, size=2**20)
-                dist.barrier()
-            else:
-                dist.barrier()
-                self.shm = SharedMemory(name="lean_vllm")
-                self.loop()
+        if self.world_size > 1 and rank > 0:
+            self.loop()
 
     def exit(self):
         if self.world_size > 1:
-            self.shm.close()
             dist.barrier()
-            if self.rank == 0:
-                self.shm.unlink()
         if self.cudagraph_mode != "none":
             del self.graphs, self.piecewise_graphs, self.graph_pool
         dev.synchronize(self.device)
@@ -92,31 +96,16 @@ class ModelRunner:
 
     def loop(self):
         while True:
-            method_name, args = self.read_shm()
+            call = [None, None]
+            dist.broadcast_object_list(call, src=0, group=self.call_group)
+            method_name, args = call
             self.call(method_name, *args)
             if method_name == "exit":
                 break
 
-    def read_shm(self):
-        assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
-        n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
-        return method_name, args
-
-    def write_shm(self, method_name, *args):
-        assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
-        n = len(data)
-        self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
-        for event in self.event:
-            event.set()
-
     def call(self, method_name, *args):
         if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)
+            dist.broadcast_object_list([method_name, args], src=0, group=self.call_group)
         method = getattr(self, method_name, None)
         return method(*args)
 
@@ -134,20 +123,16 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # Each layer names its cache layout: keys and values per head, or one MLA latent.
+        layers = [module for module in self.model.modules() if isinstance(module, Attention)]
+        layer_shape = layers[0].kv_cache_shape(1, self.block_size)
+        block_bytes = len(layers) * math.prod(layer_shape) * config.hf_config.dtype.itemsize
         if config.num_kvcache_blocks <= 0:
             config.num_kvcache_blocks = dev.kvcache_bytes(self.device, config) // block_bytes
         assert config.num_kvcache_blocks > 0, "no memory left for the kv cache"
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        self.kv_cache = torch.empty(len(layers), *layers[0].kv_cache_shape(config.num_kvcache_blocks, self.block_size))
+        for layer, cache in zip(layers, self.kv_cache):
+            layer.bind_kv_cache(cache)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -156,7 +141,7 @@ class ModelRunner:
         return block_tables
 
     def prepare_batch(self, seqs: list[Sequence]):
-        """One batch for any mix of prompt chunks and decode rows."""
+        """One batch for any mix of prompt chunks and decode rows, and the context to run it in."""
         input_ids, positions, slot_mapping = [], [], []
         cu_seqlens_q, cu_seqlens_k = [0], [0]
         max_seqlen_q = max_seqlen_k = 0
@@ -202,12 +187,15 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
 
         block_tables = self.prepare_block_tables(seqs) if any(seq.block_table for seq in seqs) else None
-        set_context(
-            is_prefill,
+        context = dict(
+            is_prefill=is_prefill,
+            prefill_rows=[seq.is_prefill for seq in seqs],
             cu_seqlens_q=dev.make_tensor(cu_seqlens_q, torch.int32, self.device),
             cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, self.device),
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            cu_seqlens_q_host=cu_seqlens_q,
+            cu_seqlens_k_host=cu_seqlens_k,
             # Equal cumulative lengths: no row reads cached keys, so the cache can be skipped.
             keys_are_new=cu_seqlens_k == cu_seqlens_q,
             slot_mapping=dev.make_tensor(slot_mapping, torch.int32, self.device),
@@ -231,7 +219,7 @@ class ModelRunner:
         all_greedy = all(temperature == 0 for temperature in temperatures)
         temperatures = None if all_greedy else dev.make_tensor(temperatures, torch.float32, self.device)
         self._sampling_rows = sampling_rows
-        return input_ids, positions, temperatures, is_prefill
+        return input_ids, positions, temperatures, context
 
     def _prev_row(self, seq: Sequence) -> int:
         """Where this sequence sampled in the step still in flight."""
@@ -239,11 +227,15 @@ class ModelRunner:
         assert row is not None, "a pending token but no row in the launched step"
         return row
 
-    def _step_kind(self, is_prefill: bool, num_tokens: int) -> str:
-        """How this step runs: "graph", "piecewise", or why it must run eager.
+    @staticmethod
+    def _cudagraph_mode(mode: str, mla: bool, backend: type[AttentionBackend]) -> str:
+        """The mode these captures can serve. A full graph holds attention, so MLA needs a backend that attends latents."""
+        if mla and mode in FULL_MODES and not backend.supports_mla_decode():
+            return "piecewise" if mode in PIECEWISE_MODES else "none"
+        return mode
 
-        For pure decode num_tokens is the batch size. A mode whose graphs were never captured runs eager.
-        """
+    def _step_kind(self, is_prefill: bool, num_tokens: int) -> str:
+        """How this step runs: "graph", "piecewise", or why it must run eager. num_tokens is the batch size for decode."""
         if self.cudagraph_mode == "none":
             return "enforced"
         if not is_prefill and self.cudagraph_mode in FULL_MODES and self.graph_bs:
@@ -285,10 +277,7 @@ class ModelRunner:
         return None if bucket is None or num_tokens < self.piecewise_bs[0] else bucket
 
     def _replay_piecewise(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """A graph per piece, with attention run eager between them.
-
-        Pieces are per token, so pad rows never touch real ones; attention sees only real rows.
-        """
+        """A graph per piece, with attention run eager on the real rows between them."""
         num_tokens = input_ids.size(0)
         bucket = self._piecewise_bucket(num_tokens)
         graphs, buffers = self.piecewise_graphs[bucket], self.piecewise_vars
@@ -299,9 +288,7 @@ class ModelRunner:
         for layer, pre, post in zip(self.model.model.layers, graphs["pre"], graphs["post"]):
             pre.replay()
             # Real rows only: attention reads this step's sequence layout, which no graph can hold.
-            attn_out = layer.self_attn.attn(
-                buffers["q"][:num_tokens], buffers["k"][:num_tokens], buffers["v"][:num_tokens]
-            )
+            attn_out = layer.self_attn.attn(*(buffer[:num_tokens] for buffer in buffers["attn_in"]))
             buffers["attn_out"][:num_tokens] = attn_out
             post.replay()
         graphs["tail"].replay()
@@ -310,12 +297,12 @@ class ModelRunner:
     def run(self, seqs: list[Sequence]) -> SampledTokens | None:
         """Prepare, launch and sample. The tokens are not fetched here; the engine awaits them."""
         with record_function("prepare_batch"):
-            input_ids, positions, temperatures, is_prefill = self.prepare_batch(seqs)
-        with record_function("run_model"):
-            logits = self.run_model(input_ids, positions, is_prefill)
-        with record_function("sample"):
-            tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
-        reset_context()
+            input_ids, positions, temperatures, context = self.prepare_batch(seqs)
+        with set_context(**context):
+            with record_function("run_model"):
+                logits = self.run_model(input_ids, positions, context["is_prefill"])
+            with record_function("sample"):
+                tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
         if tokens is None:
             return None
         pending = SampledTokens(tokens, self.device)
@@ -324,10 +311,7 @@ class ModelRunner:
         return pending
 
     def _piecewise_buckets(self) -> list[int]:
-        """Token counts to capture at: small steps only, none padded past a quarter.
-
-        Capture pays off only where launch overhead rivals compute; larger steps run eager, as in vLLM.
-        """
+        """Token counts to capture at: small steps only, where launch overhead rivals compute, none padded past a quarter."""
         top = min(PIECEWISE_MAX_TOKENS, self.config.max_num_batched_tokens)
         sizes, size = [], PIECEWISE_MIN_TOKENS
         while size < top:
@@ -338,26 +322,22 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_piecewise(self):
-        """Capture the model either side of attention, one graph per piece per bucket.
-
-        Pieces use fixed buffers and touch no context or KV cache, which makes them capturable.
-        """
+        """Capture the model either side of attention, one graph per piece per bucket."""
         hf_config = self.config.hf_config
         layers = self.model.model.layers
         self.piecewise_bs = self._piecewise_buckets()
         largest = self.piecewise_bs[-1]
-        attn = layers[0].self_attn
         buffers = dict(
             input_ids=torch.zeros(largest, dtype=torch.int64),
             positions=torch.zeros(largest, dtype=torch.int64),
             hidden=torch.zeros(largest, hf_config.hidden_size),
             residual=torch.zeros(largest, hf_config.hidden_size),
             output=torch.zeros(largest, hf_config.hidden_size),
-            q=torch.zeros(largest, attn.num_heads, attn.head_dim),
-            k=torch.zeros(largest, attn.num_kv_heads, attn.head_dim),
-            v=torch.zeros(largest, attn.num_kv_heads, attn.head_dim),
-            attn_out=torch.zeros(largest, attn.num_heads, attn.head_dim),
+            attn_out=torch.zeros(layers[0].self_attn.attn.output_shape(largest)),
         )
+        # What attention takes is the model's own: q, k and v for Qwen3, a query and a latent for MLA.
+        *attn_inputs, _ = layers[0].pre_attention(buffers["positions"], buffers["hidden"], None)
+        buffers["attn_in"] = [torch.zeros_like(tensor) for tensor in attn_inputs]
         self.piecewise_vars = buffers
         self.piecewise_graphs = {}
 
@@ -383,10 +363,10 @@ class ModelRunner:
             def pre(layer, first, size=size):
                 # The first layer takes no residual in; its graph bakes that in.
                 carried = None if first else buffers["residual"][:size]
-                q, k, v, residual = layer.pre_attention(buffers["positions"][:size], buffers["hidden"][:size], carried)
-                buffers["q"][:size].copy_(q)
-                buffers["k"][:size].copy_(k)
-                buffers["v"][:size].copy_(v)
+                *attn_inputs, residual = layer.pre_attention(
+                    buffers["positions"][:size], buffers["hidden"][:size], carried)
+                for buffer, tensor in zip(buffers["attn_in"], attn_inputs):
+                    buffer[:size].copy_(tensor)
                 buffers["residual"][:size].copy_(residual)
 
             def post(layer, size=size):
@@ -417,15 +397,14 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            with set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs]):
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
             torch.cuda.synchronize()
-            reset_context()
 
         self.graph_vars = dict(
             input_ids=input_ids,

@@ -15,7 +15,7 @@ hardware.
 |---|---|---|
 | 0 | Attention backend abstraction | interface + Torch/FlashAttention backends done |
 | 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; numbers await a GPU |
-| 2 | DeepSeek-style model support: MLA + MoE + YaRN | |
+| 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite runs eager, checked against transformers; FlashMLA decode and the Triton MoE await a GPU run; graphs and numbers to come |
 | 3 | Speculative decoding | |
 | 4 | Disaggregated prefill / decode | |
 
@@ -33,6 +33,8 @@ Dao-AILab publishes no FlashAttention-3 wheel, so the `cuda` extra installs a
 third-party build of it, pinned by URL and hash. That build covers Linux on
 x86_64, against the torch pinned beside it. The kernels are Hopper's, so the
 backend reports itself unavailable on anything but an H100 or H200.
+DeepSeek-V2 also decodes with FlashMLA when it is built from source; see
+[docs/deepseek-v2.md](docs/deepseek-v2.md).
 
 Without it, and without Triton, the engine runs on CPU and Apple Silicon via the
 `torch` attention backend, at laptop speed — enough to develop and test the
@@ -60,7 +62,13 @@ outputs[0]["text"]
 ```
 
 The attention backend is picked automatically and can be forced with
-`LEAN_VLLM_ATTENTION_BACKEND`.
+`LEAN_VLLM_ATTENTION_BACKEND`. A MoE model's routed experts run a Triton kernel
+on CUDA, as vLLM's do, and `grouped_mm` elsewhere; `LEAN_VLLM_MOE_BACKEND`
+forces either.
+
+Qwen3 and DeepSeek-V2 checkpoints load, picked by `architectures` in
+`config.json`. [docs/deepseek-v2.md](docs/deepseek-v2.md) covers DeepSeek-V2-Lite:
+its latent KV cache, MoE layer and YaRN rope.
 
 ## Serving
 

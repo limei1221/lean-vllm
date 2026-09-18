@@ -1,3 +1,4 @@
+from einops import rearrange
 import torch
 
 from lean_vllm.attention.abstract import AttentionBackend
@@ -35,6 +36,24 @@ else:
         tl.store(v_cache_ptr + cache_offsets, value)
 
 
+    @triton.jit
+    def store_latents_kernel(
+        latent_ptr,
+        latent_stride,
+        cache_ptr,
+        slot_mapping_ptr,
+        D: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        idx = tl.program_id(0)
+        slot = tl.load(slot_mapping_ptr + idx)
+        if slot == -1: return
+        offsets = tl.arange(0, BLOCK)
+        mask = offsets < D    # a latent is 576 wide for V2-Lite, so the block overhangs it
+        latent = tl.load(latent_ptr + idx * latent_stride + offsets, mask=mask)
+        tl.store(cache_ptr + slot * D + offsets, latent, mask=mask)
+
+
 class FlashAttention3Backend(AttentionBackend):
     """FlashAttention-3 kernels with a Triton KV-cache scatter. Hopper only."""
 
@@ -63,6 +82,14 @@ class FlashAttention3Backend(AttentionBackend):
             key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, dim
         )
 
+    def store_latents(self, latent, latent_cache, slot_mapping) -> None:
+        num_tokens, dim = latent.shape
+        assert latent.stride(-1) == 1 and latent_cache.stride(-2) == dim
+        assert slot_mapping.numel() == num_tokens
+        store_latents_kernel[(num_tokens,)](
+            latent, latent.stride(0), latent_cache, slot_mapping, dim, triton.next_power_of_2(dim)
+        )
+
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
         if context.keys_are_new or context.block_tables is None:
             # k and v hold every key this batch attends (cold prompts), so skip the pages.
@@ -72,8 +99,7 @@ class FlashAttention3Backend(AttentionBackend):
                 max_seqlen_q=context.max_seqlen_q, max_seqlen_k=context.max_seqlen_k,
                 softmax_scale=self.scale, causal=True,
             )
-        # Some row reads cached keys. FA3's varlen entry takes no page table, so use the
-        # kvcache one, with per-row key lengths from cu_seqlens_k as in the torch backend.
+        # Some row reads cached keys, and FA3's varlen entry takes no page table.
         cache_seqlens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
         return flash_attn_with_kvcache(
             q, k_cache, v_cache,
@@ -82,10 +108,19 @@ class FlashAttention3Backend(AttentionBackend):
             softmax_scale=self.scale, causal=True,
         )
 
+    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal):
+        o, lse = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.scale, causal=causal, return_attn_probs=True,
+        )
+        return o, rearrange(lse, "h n -> n h")    # FA3's varlen lse is [heads, tokens]
+
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
         o = flash_attn_with_kvcache(
-            q.unsqueeze(1), k_cache, v_cache,
+            rearrange(q, "b h d -> b 1 h d"), k_cache, v_cache,
             cache_seqlens=context.context_lens, page_table=context.block_tables,
             softmax_scale=self.scale, causal=True,
         )
-        return o.squeeze(1)    # match the [batch, heads, dim] contract
+        return rearrange(o, "b 1 h d -> b h d")    # match the [batch, heads, dim] contract

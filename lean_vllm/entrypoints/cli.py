@@ -1,7 +1,4 @@
-"""`lean-vllm serve <model>`.
-
-Engine flags are generated from `Config`, since `LLMEngine.__init__` drops any other kwarg.
-"""
+"""`lean-vllm serve <model>`, with engine flags generated from `Config`."""
 
 import argparse
 from dataclasses import MISSING, fields

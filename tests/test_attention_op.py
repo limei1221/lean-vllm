@@ -1,7 +1,4 @@
-"""The attention custom op: the seam torch.compile splits a graph on.
-
-These pin its contract: the schema, the fake, and the layer lookup by name.
-"""
+"""The attention custom op torch.compile splits on: its schema, fake, and layer lookup by name."""
 
 import pytest
 import torch
@@ -35,17 +32,17 @@ def model():
 def decode_step():
     """One decoding row, reading three cached tokens out of block 0."""
     torch.manual_seed(0)
-    set_context(
+    with set_context(
         False,
         slot_mapping=torch.tensor([-1], dtype=torch.int32),    # -1 skips the cache write
         context_lens=torch.tensor([3], dtype=torch.int32),
         block_tables=torch.tensor([[0]], dtype=torch.int32),
-    )
-    return (
-        torch.randn(1, NUM_HEADS, HEAD_DIM),
-        torch.randn(1, NUM_KV_HEADS, HEAD_DIM),
-        torch.randn(1, NUM_KV_HEADS, HEAD_DIM),
-    )
+    ):
+        yield (
+            torch.randn(1, NUM_HEADS, HEAD_DIM),
+            torch.randn(1, NUM_KV_HEADS, HEAD_DIM),
+            torch.randn(1, NUM_KV_HEADS, HEAD_DIM),
+        )
 
 
 def test_layers_are_named_by_module_path(model):

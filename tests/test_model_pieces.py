@@ -3,6 +3,7 @@
 bf16 throughout, as in the runner: in fp32 RMSNorm's in-place arithmetic rewrites its input.
 """
 
+from einops import rearrange
 import pytest
 import torch
 import torch.distributed as dist
@@ -57,7 +58,7 @@ fake_attention = FakeAttention()
 
 
 def reference(layer, positions, hidden_states, residual):
-    """The layer written out as it read before the split, module for module."""
+    """The unsplit layer, written out module for module."""
     if residual is None:
         hidden_states, residual = layer.input_layernorm(hidden_states), hidden_states
     else:
@@ -65,14 +66,14 @@ def reference(layer, positions, hidden_states, residual):
     attn = layer.self_attn
     qkv = attn.qkv_proj(hidden_states)
     q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
-    q = q.view(-1, attn.num_heads, attn.head_dim)
-    k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-    v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+    q = rearrange(q, "n (h d) -> n h d", d=attn.head_dim)
+    k = rearrange(k, "n (h d) -> n h d", d=attn.head_dim)
+    v = rearrange(v, "n (h d) -> n h d", d=attn.head_dim)
     if not attn.qkv_bias:
         q = attn.q_norm(q)
         k = attn.k_norm(k)
     q, k = attn.rotary_emb(positions, q, k)
-    hidden_states = attn.o_proj(fake_attention(q, k, v).flatten(1, -1))
+    hidden_states = attn.o_proj(rearrange(fake_attention(q, k, v), "n h d -> n (h d)"))
     hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
     return layer.mlp(hidden_states), residual
 

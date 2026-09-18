@@ -180,7 +180,7 @@ class TestBatching:
         assert len(engine.model_runner.batches[0][1]) == 2
 
     def test_an_arriving_prefill_mixes_with_running_decodes(self, make_engine):
-        """The reason this project exists: an arrival no longer stalls decoding."""
+        """An arrival must not stall decoding."""
         engine = make_engine()
         running = engine.add(prompt(8), FOREVER)
         engine.step()
@@ -312,8 +312,7 @@ class TestPrefixCache:
 
     @pytest.mark.parametrize("algo", sorted(sequence.HASH_ALGOS))
     def test_every_hash_holds_across_processes(self, algo):
-        """A block cached before a restart has to still be found after one, and
-        the tensor-parallel workers have to agree with the parent."""
+        """Hashes survive a restart, and TP workers agree with the parent."""
         code = f"from lean_vllm.engine.sequence import {algo}_hash as h; print(h((1, 2, 3), -1))"
         seen = {
             subprocess.run(
@@ -645,10 +644,7 @@ class TestChunkedPrefillDisabled:
 class TestTokenLimitGuard:
 
     def test_a_row_at_its_limit_is_not_scheduled_again(self, make_engine):
-        """Its reserved tokens are already the last ones, so another step is wasted.
-
-        Each schedule() is paired with an advance(), so the asserts read its result.
-        """
+        """Its reserved tokens are already the last ones, so another step is wasted."""
         engine = make_engine()
         seq = engine.add(prompt(8), SamplingParams(max_tokens=2))
         engine.scheduler.advance(engine.scheduler.schedule().scheduled)    # prefill; reserves token 1

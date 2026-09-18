@@ -1,8 +1,9 @@
 # Attention Backend Abstraction
 
-Status: interface + `TorchAttention` + `FlashAttention3Backend` landed, and
-CUDA-graph capture is gated on `supports_cuda_graph()`.
-Not yet done: FlashInfer / FlashMLA.
+Status: interface + `TorchAttention` + `FlashAttention3Backend` +
+`FlashMLABackend` landed, and CUDA-graph capture is gated on
+`supports_cuda_graph()`, plus `supports_mla_decode()` for an MLA model's full
+graphs. Not yet done: FlashInfer.
 
 ## Problem
 
@@ -28,11 +29,13 @@ Qwen3Attention
 layers.attention.Attention        # owns the layer's KV cache slice
       |
       v
-AttentionBackend                  # store_kvcache / prefill / decode
+AttentionBackend                  # store_kvcache / prefill / decode / varlen_with_lse
       |
       +-- TorchAttention          # SDPA, any device, reference oracle
       |
       +-- FlashAttention3Backend  # flash-attn 3 + Triton scatter, Hopper only
+            |
+            +-- FlashMLABackend   # FA3, plus FlashMLA's decode over MLA latents
 ```
 
 `Attention.__init__` resolves a backend class once and instantiates it per
@@ -41,8 +44,9 @@ layer. `qwen3.py` did not change.
 The interface is deliberately three methods, not one. `store_kvcache` belongs
 to the backend because the *cache layout* is a backend concern — FlashInfer and
 FlashMLA want different layouts, which is why `get_kv_cache_shape` is on the
-interface too, ready for the model runner to consult once the device layer
-lands.
+interface too. The model runner asks each layer for its cache shape, and a
+plain `Attention` layer answers from the backend. `MLAAttention` answers with
+its own latent layout, covered in [deepseek-v2.md](deepseek-v2.md).
 
 ### Tensor contract
 
@@ -55,6 +59,28 @@ Identical across backends; sequences are packed, not padded.
 | `prefill` returns | `[num_tokens, num_heads, head_dim]` |
 | `decode` q | `[batch_size, num_heads, head_dim]` |
 | `decode` returns | `[batch_size, num_heads, head_dim]` |
+| `varlen_with_lse` k, v | `[num_keys, num_kv_heads, head_dim]`, no cache |
+| `varlen_with_lse` returns | output as `prefill`, and lse `[num_tokens, num_heads]` |
+| `mla_decode` q | `[batch_size, num_heads, latent_dim]` |
+| `mla_decode` returns | `[batch_size, num_heads, v_dim]` |
+| `store_latents` latent | `[num_tokens, latent_dim]`, slot `-1` skips |
+
+`varlen_with_lse` serves MLA, which attends its cached context in chunks and
+merges them by log-sum-exp. FA3 returns the lse through `return_attn_probs`, as
+`[num_heads, num_tokens]`, so the flash backend transposes it. SDPA returns no
+lse, so the torch backend writes that attention out.
+
+`mla_decode` is optional, reported by `supports_mla_decode()`. It attends a
+paged MLA latent cache as one key head, with each latent's first `v_dim` entries
+as the value. `TorchAttention` implements it as the reference and
+`FlashMLABackend` with FlashMLA's dense decode kernel, which reads 64-token
+pages only, so it reports `mla_block_size() == 64`.
+
+`store_latents` is the latent cache's scatter, the MLA counterpart of
+`store_kvcache` and split from it because one cache is written, not two. It
+takes the same `-1` for a row a CUDA graph padded: the flash backend masks that
+in the Triton kernel, whose block overhangs a latent width that is no power of
+two, and the torch backend pays a host sync to drop those rows.
 
 `flash_attn_with_kvcache` returns a singleton query axis in the decode shape;
 the flash backend squeezes it so both backends return the same rank. An
@@ -143,7 +169,10 @@ varlen path so that `logits_indices` decides whether it samples.
 `get_attention_backend()` resolves in order: explicit argument,
 `$LEAN_VLLM_ATTENTION_BACKEND`, then the first available entry of `BACKENDS`.
 `TorchAttention.is_available()` is unconditionally true and sits last, so
-resolution cannot fail. Requesting an unavailable backend by name raises rather
+resolution cannot fail. MLA layers pass `mla=True`, which tries `MLA_BACKENDS`
+first, so `FlashMLABackend` is picked for DeepSeek-V2 when it is built and never
+reported for Qwen3. `Config` switches an MLA model's `kvcache_block_size` to the
+page size that backend requires, with a warning. Requesting an unavailable backend by name raises rather
 than silently falling back — a silent downgrade to a 50x slower backend during a
 benchmark is worse than a crash.
 
@@ -193,8 +222,6 @@ are published.
 
 ## Next
 
-1. Have `allocate_kv_cache` call `get_kv_cache_shape`; the hook exists but the
-   model runner still hardcodes the FlashAttention layout.
-2. Batch the per-sequence loop in `TorchAttention` before publishing any
+1. Batch the per-sequence loop in `TorchAttention` before publishing any
    Torch-vs-Flash crossover numbers.
-3. FlashInfer / FlashMLA backends, then per-layer dispatch.
+2. A FlashInfer backend, then per-layer dispatch.
