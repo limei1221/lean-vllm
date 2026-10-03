@@ -78,10 +78,7 @@ class Fcfs(SchedulingPolicy):
 
 
 class Priority(SchedulingPolicy):
-    """Client-supplied priority, lower first, arrival time breaking ties.
-
-    A preempted sequence re-enters by priority; there is no front to jump.
-    """
+    """Client-supplied priority, lower first, then arrival. Preempted sequences re-enter by priority too."""
 
     name = "priority"
 

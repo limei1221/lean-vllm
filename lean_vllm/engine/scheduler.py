@@ -131,10 +131,7 @@ class Scheduler:
         return output
 
     def _expire_waiting(self) -> list[Sequence]:
-        """Drop requests that waited past request_timeout without ever running.
-
-        Preempted sequences are kept: shedding them would waste their work.
-        """
+        """Drop requests that waited past request_timeout without ever running. Preempted ones are kept."""
         if not self.request_timeout:
             return []
         deadline = perf_counter() - self.request_timeout
@@ -198,10 +195,7 @@ class Scheduler:
         return num_tokens
 
     def _make_room(self, seq: Sequence, still_running: deque[Sequence], output: SchedulerOutput) -> bool:
-        """Free blocks for one more decoded token. False if seq itself gave way.
-
-        A prefill chunk needs none: its blocks were all taken at admission.
-        """
+        """Free blocks for one more decoded token. False if seq itself gave way."""
         while not self.block_manager.can_append(seq):
             if self.running:
                 victim = self.waiting.victim(self.running)
@@ -242,10 +236,7 @@ class Scheduler:
             output.dropped.append(seq)    # the caller is still owed a final output
 
     def advance(self, seqs: list[Sequence]) -> list[LaunchedRow]:
-        """Move bookkeeping forward with no token values. Returns the sampling rows.
-
-        Rows follow the sampler's order, so reconcile() can zip them with token ids.
-        """
+        """Move bookkeeping forward with no token values. Returns the sampling rows, in the sampler's order."""
         rows = []
         for seq in seqs:
             seq.num_cached_tokens += seq.num_scheduled_tokens

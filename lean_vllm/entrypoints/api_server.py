@@ -10,6 +10,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 from lean_vllm.engine.async_engine import AsyncLLMEngine, EngineDeadError
 from lean_vllm.engine.output import RequestOutput
@@ -116,7 +117,6 @@ async def _serve(
         raise HTTPException(404, f"the model {body.model!r} does not exist")
     if engine.is_dead:
         raise HTTPException(503, f"the engine thread died: {engine.error!r}")
-    _check_length(engine, body, len(prompt_token_ids))
     request_id = f"{'chatcmpl' if chat else 'cmpl'}-{uuid4().hex}"
     sampling_params = SamplingParams(
         temperature=body.temperature,
@@ -167,18 +167,6 @@ async def _disconnected(request: Request):
         pass
 
 
-def _check_length(engine: AsyncLLMEngine, body: BaseRequest, num_prompt_tokens: int):
-    """Refused here rather than asserted deep in the runner."""
-    limit = engine.max_model_len
-    if num_prompt_tokens >= limit:
-        raise HTTPException(400, f"prompt is {num_prompt_tokens} tokens, over the {limit}-token context")
-    if num_prompt_tokens + body.max_tokens > limit:
-        raise HTTPException(
-            400,
-            f"prompt ({num_prompt_tokens}) plus max_tokens ({body.max_tokens}) is over the {limit}-token context",
-        )
-
-
 async def _deltas(
     outputs: AsyncIterator[RequestOutput], checker: StopChecker, engine: AsyncLLMEngine, request_id: str,
 ):
@@ -209,38 +197,51 @@ async def _collect(deltas, request_id: str, model: str, num_prompt_tokens: int, 
     async for delta, reason, num_tokens in deltas:
         text += delta
         finish_reason = reason or finish_reason
-    build = protocol.chat_body if chat else protocol.completion_body
-    return build(request_id, model, text, finish_reason, protocol.usage(num_prompt_tokens, num_tokens))
+    usage = protocol.usage(num_prompt_tokens, num_tokens)
+    if chat:
+        message = protocol.ChatMessage(role="assistant", content=text)
+        choice = protocol.ChatCompletionResponseChoice(index=0, message=message, finish_reason=finish_reason)
+        return protocol.ChatCompletionResponse(id=request_id, model=model, choices=[choice], usage=usage)
+    choice = protocol.CompletionResponseChoice(index=0, text=text, finish_reason=finish_reason, logprobs=None)
+    return protocol.CompletionResponse(id=request_id, model=model, choices=[choice], usage=usage)
 
 
 async def _stream(deltas, request_id: str, model: str, body: BaseRequest, num_prompt_tokens: int, chat: bool):
+    created = int(time())
+    if chat:
+        response, kind = protocol.ChatCompletionStreamResponse, "chat.completion.chunk"
+    else:
+        response, kind = protocol.CompletionStreamResponse, "text_completion"
+
+    def chunk(choices: list, **extra) -> str:
+        return _event(response(id=request_id, object=kind, created=created, model=model, choices=choices, **extra))
+
+    def choice(text: str, reason: str | None, role: str | None = None):
+        if not chat:
+            return protocol.CompletionResponseChoice(index=0, text=text, finish_reason=reason, logprobs=None)
+        delta = protocol.DeltaMessage(role=role, content=text) if role else protocol.DeltaMessage(content=text)
+        return protocol.ChatCompletionResponseStreamChoice(index=0, delta=delta, finish_reason=reason)
+
     async with aclosing(deltas):
-        created = int(time())
         num_tokens = 0
         if chat:
-            yield _event(protocol.chat_chunk(request_id, model, created, {"role": "assistant", "content": ""}, None))
+            yield chunk([choice("", None, role="assistant")])
         try:
             async for delta, reason, num_tokens in deltas:
-                if chat:
-                    yield _event(protocol.chat_chunk(request_id, model, created, {"content": delta}, reason))
-                else:
-                    yield _event(protocol.completion_chunk(request_id, model, created, delta, reason))
+                yield chunk([choice(delta, reason)])
         except (EngineDeadError, HTTPException) as error:
             # The 200 is already sent, so the error rides in the stream.
             yield _event(_error("server_error", str(getattr(error, "detail", error))))
             yield DONE
             return
         if body.include_usage:
-            chunk = protocol.chat_chunk if chat else protocol.completion_chunk
-            body_dict = chunk(request_id, model, created, {} if chat else "", None)
-            body_dict["choices"] = []
-            body_dict["usage"] = protocol.usage(num_prompt_tokens, num_tokens).model_dump()
-            yield _event(body_dict)
+            yield chunk([], usage=protocol.usage(num_prompt_tokens, num_tokens))
         yield DONE
 
 
-def _event(payload: dict) -> str:
-    return f"data: {json.dumps(payload)}\n\n"
+def _event(payload: BaseModel | dict) -> str:
+    data = payload.model_dump_json(exclude_unset=True) if isinstance(payload, BaseModel) else json.dumps(payload)
+    return f"data: {data}\n\n"
 
 
 def _error(kind: str, message: str) -> dict:

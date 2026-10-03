@@ -3,12 +3,8 @@ r"""Open-loop serving benchmark: Poisson arrivals against lean-vLLM or vLLM.
     uv run python benchmarks/bench_serving.py --model ~/workspace/huggingface/Qwen3-8B \
         --dataset lognormal --num-requests 500 --request-rate 8
 
-Open loop: requests go out on schedule whatever is outstanding. A 429 is never
-retried, and percentiles cover completed requests only, so every table shows the
-rejection rate beside them. Other failures are bugs and abort the run past a threshold.
-
+A 429 is never retried and percentiles cover completed requests only, so tables show the rejection rate too.
 Prompts are token ids on `/v1/completions`, so no chat template skews the counts.
-Only `ignore_eos` and `priority` go outside the OpenAI schema; both engines accept them.
 """
 
 import argparse
@@ -21,10 +17,11 @@ from dataclasses import asdict, dataclass, field
 from time import perf_counter
 
 import httpx
+import numpy as np
 import openai
 from openai import AsyncOpenAI
 
-QUANTILES = (0.5, 0.9, 0.95, 0.99)
+PERCENTILES = (50, 90, 95, 99)
 
 
 @dataclass
@@ -93,10 +90,7 @@ def lognormal_trace(rng: random.Random, args) -> list[Request]:
 
 
 def mixed_trace(rng: random.Random, args) -> list[Request]:
-    """Short prompts beside long ones; read the `short` label's TTFT.
-
-    `--long-priority 1` takes effect only under `--scheduling-policy priority`.
-    """
+    """Short prompts beside long ones; read the `short` label's TTFT."""
     trace = []
     for _ in range(args.num_requests):
         if rng.random() < args.long_fraction:
@@ -310,23 +304,15 @@ async def server_summary(http: httpx.AsyncClient, base_url: str) -> dict | None:
 # ---------------------------------------------------------------- reporting
 
 
-def percentile(values: list[float], quantile: float) -> float:
-    position = (len(values) - 1) * quantile
-    low, high = math.floor(position), math.ceil(position)
-    if low == high:
-        return values[low]
-    return values[low] + (values[high] - values[low]) * (position - low)
-
-
 def distribution(values) -> dict | None:
-    values = sorted(value for value in values if value is not None)
+    values = [value for value in values if value is not None]
     if not values:
         return None
     return {
         "count": len(values),
-        "mean": sum(values) / len(values),
-        **{f"p{quantile * 100:g}": percentile(values, quantile) for quantile in QUANTILES},
-        "max": values[-1],
+        "mean": float(np.mean(values)),
+        **{f"p{p}": float(value) for p, value in zip(PERCENTILES, np.percentile(values, PERCENTILES))},
+        "max": max(values),
     }
 
 

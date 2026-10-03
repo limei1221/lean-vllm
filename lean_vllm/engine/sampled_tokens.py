@@ -2,11 +2,7 @@ import torch
 
 
 class SampledTokens:
-    """One launched step's sampled tokens, fetched without awaiting later steps.
-
-    tolist() would wait on the default stream, including the next launched step,
-    so the copy runs on its own stream and the wait is on its event.
-    """
+    """One launched step's sampled tokens, copied on a side stream so the fetch never waits on later steps."""
 
     _copy_stream: torch.cuda.Stream | None = None
 

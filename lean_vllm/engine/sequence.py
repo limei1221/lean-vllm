@@ -117,10 +117,7 @@ class Sequence:
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
     def _extend_block_hashes(self):
-        """Hash every block that has just become full, chaining on the one before.
-
-        A full block's hash is final, so it is computed once rather than on every cache lookup.
-        """
+        """Hash every block that has just become full, chaining on the one before. Computed once, as it is final."""
         if not self.enable_prefix_caching:
             return
         algo = HASH_ALGOS[self.hash_algo]

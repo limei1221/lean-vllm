@@ -1,17 +1,26 @@
 import logging
 import os
+import socket
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+from lean_vllm.attention import LayerSpec, get_attention_backend
 from lean_vllm.engine.sequence import HASH_ALGOS
+from lean_vllm.models import get_model_class
 
 logger = logging.getLogger(__name__)
 
 
-# Which steps may replay a graph: full for pure decode, piecewise for prefill and mixed.
+# Which steps may replay a graph: full for pure decode, piecewise for any step within its token buckets.
 FULL_MODES = ("full", "full_and_piecewise")
 PIECEWISE_MODES = ("piecewise", "full_and_piecewise")
 CUDAGRAPH_MODES = ("none",) + FULL_MODES + ("piecewise",)
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
 
 
 @dataclass(slots=True)
@@ -24,6 +33,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     kvcache_memory_gb: float = 2.0    # cpu/mps only; cuda uses gpu_memory_utilization
     tensor_parallel_size: int = 1
+    enable_expert_parallel: bool = False    # MoE layers hold whole experts per rank, not slices of each; as vLLM
     enforce_eager: bool = False
     cudagraph_mode: str = "full_and_piecewise"    # none | full | piecewise | full_and_piecewise
     hf_config: AutoConfig | None = None
@@ -38,6 +48,7 @@ class Config:
     max_waiting_requests: int = 0      # 0 is unlimited
     request_timeout: float = 0.0       # seconds a request may wait unscheduled; 0 is none
     long_prefill_token_threshold: int = 0    # per-step token cap for one prompt; 0 is none
+    dist_port: int = 0    # rendezvous port for the ranks; 0 picks a free one
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -50,5 +61,23 @@ class Config:
             # Ranks above zero never see the sampled tokens, so they could not follow.
             logger.warning("async_scheduling is off: tensor_parallel_size > 1 does not support it")
             self.async_scheduling = False
+        if not self.dist_port:    # resolved here, so spawned workers get the same one
+            self.dist_port = _free_port()
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.enable_expert_parallel and not get_model_class(self.hf_config).supports_expert_parallel:
+            raise ValueError(f"enable_expert_parallel needs a MoE model, and {self.hf_config.architectures} has none")
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        if getattr(self.hf_config, "kv_lora_rank", None) is not None:    # an MLA model
+            block_size = get_attention_backend(self._mla_layer_spec()).mla_block_size()
+            if block_size and block_size != self.kvcache_block_size:
+                logger.warning("kvcache_block_size is %d: the MLA decode kernel reads no other page size", block_size)
+                self.kvcache_block_size = block_size
+
+    def _mla_layer_spec(self) -> LayerSpec:
+        """What each MLA layer of one rank will ask of a backend, so the page size follows the one it gets."""
+        hf_config = self.hf_config
+        num_heads = hf_config.num_attention_heads // self.tensor_parallel_size
+        return LayerSpec(
+            hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim, num_heads, num_heads, hf_config.dtype,
+            latent_dim=hf_config.kv_lora_rank + hf_config.qk_rope_head_dim,
+        )

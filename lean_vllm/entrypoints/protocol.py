@@ -1,7 +1,4 @@
-"""OpenAI-compatible request and response bodies.
-
-Only what the engine implements is accepted: silently ignoring a field is worse than a 400.
-"""
+"""OpenAI-compatible request and response bodies. Unimplemented fields are a 400, never ignored."""
 
 from time import time
 from typing import Any, Literal
@@ -70,7 +67,7 @@ class BaseRequest(BaseModel):
     @model_validator(mode="after")
     def _check(self) -> "BaseRequest":
         if self.n != 1:
-            raise ValueError("n > 1 is not supported")
+            raise ValueError("n must be 1")
         if self.max_tokens < 1:
             raise ValueError("max_tokens must be at least 1")
         if self.temperature < 0:
@@ -129,47 +126,63 @@ def usage(num_prompt_tokens: int, num_completion_tokens: int) -> UsageInfo:
     )
 
 
-def completion_body(request_id: str, model: str, text: str, finish_reason: str, usage_info: UsageInfo) -> dict:
-    return {
-        "id": request_id,
-        "object": "text_completion",
-        "created": int(time()),
-        "model": model,
-        "choices": [{"index": 0, "text": text, "finish_reason": finish_reason, "logprobs": None}],
-        "usage": usage_info.model_dump(),
-    }
+# Chunks serialize with exclude_unset, so wire fields they carry have no defaults: one left out fails loudly.
+
+class CompletionResponseChoice(BaseModel):
+    index: int
+    text: str
+    finish_reason: str | None
+    logprobs: None
 
 
-def chat_body(request_id: str, model: str, text: str, finish_reason: str, usage_info: UsageInfo) -> dict:
-    return {
-        "id": request_id,
-        "object": "chat.completion",
-        "created": int(time()),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": finish_reason,
-        }],
-        "usage": usage_info.model_dump(),
-    }
+class CompletionResponse(BaseModel):
+    id: str
+    object: Literal["text_completion"] = "text_completion"
+    created: int = Field(default_factory=lambda: int(time()))
+    model: str
+    choices: list[CompletionResponseChoice]
+    usage: UsageInfo
 
 
-def completion_chunk(request_id: str, model: str, created: int, text: str, finish_reason: str | None) -> dict:
-    return {
-        "id": request_id,
-        "object": "text_completion",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "text": text, "finish_reason": finish_reason, "logprobs": None}],
-    }
+class CompletionStreamResponse(BaseModel):
+    id: str
+    object: Literal["text_completion"]
+    created: int
+    model: str
+    choices: list[CompletionResponseChoice]
+    usage: UsageInfo | None = None
 
 
-def chat_chunk(request_id: str, model: str, created: int, delta: dict, finish_reason: str | None) -> dict:
-    return {
-        "id": request_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-    }
+class ChatCompletionResponseChoice(BaseModel):
+    index: int
+    message: ChatMessage
+    finish_reason: str | None
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time()))
+    model: str
+    choices: list[ChatCompletionResponseChoice]
+    usage: UsageInfo
+
+
+class DeltaMessage(BaseModel):
+    role: Literal["assistant"] | None = None
+    content: str | None = None
+
+
+class ChatCompletionResponseStreamChoice(BaseModel):
+    index: int
+    delta: DeltaMessage
+    finish_reason: str | None
+
+
+class ChatCompletionStreamResponse(BaseModel):
+    id: str
+    object: Literal["chat.completion.chunk"]
+    created: int
+    model: str
+    choices: list[ChatCompletionResponseStreamChoice]
+    usage: UsageInfo | None = None

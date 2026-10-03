@@ -37,7 +37,7 @@ class VocabParallelEmbedding(nn.Module):
             x = mask * (x - self.vocab_start_idx)
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
-            y = mask.unsqueeze(1) * y
+            y = mask.unsqueeze(-1) * y
             dist.all_reduce(y)
         return y
 
@@ -57,6 +57,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         context = get_context()
         if context.logits_indices is not None:
             # A chunk that has not finished its prompt has no token to sample.
+            # [num_batch_tokens, hidden_dim] -> [num_sampling_rows, hidden_dim]
             x = x[context.logits_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:

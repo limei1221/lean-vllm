@@ -1,13 +1,9 @@
-r"""Runs `bench_serving` across arms and rates, restarting the server per run.
+r"""Runs `bench_serving` across arms and rates, with a fresh server per run.
 
     uv run python benchmarks/sweep.py --model ~/workspace/huggingface/Qwen3-8B \
         --suite rate --rates 1,2,4,8,16 --kvcache-tokens 131072 --out results/8b
 
-An arm is one server configuration. A fresh server per run keeps each run's
-`/metrics.json` and block pool its own. Runs go one at a time, since
-`init_process_group` binds a fixed port.
-
-Pin `--kvcache-tokens`: otherwise the profiled cache size moves with the token budget.
+Pin `--kvcache-tokens`, or the profiled cache size moves with the token budget.
 """
 
 import argparse
@@ -41,10 +37,7 @@ def rate_suite(args) -> list[Arm]:
 
 
 def chunked_suite(args) -> list[Arm]:
-    """Chunking on and off, each eager and with graphs.
-
-    Chunking changes which steps graphs cover, so the eager pair isolates scheduling.
-    """
+    """Chunking on and off, each eager and with graphs; the eager pair isolates scheduling."""
     return [
         Arm(f"chunked={chunked}-eager={eager}", {"enable-chunked-prefill": chunked, "enforce-eager": eager})
         for chunked in (True, False)

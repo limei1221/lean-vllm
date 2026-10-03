@@ -13,9 +13,9 @@ hardware.
 
 | | Project | Status |
 |---|---|---|
-| 0 | Attention backend abstraction | interface + Torch/FlashAttention backends done |
-| 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; numbers await a GPU |
-| 2 | DeepSeek-style model support: MLA + MoE + YaRN | |
+| 0 | Attention backend abstraction | interface, per-layer selection, decode/prefill split; Torch, FlashAttention-3 and FlashInfer backends done (FlashInfer not yet run on a GPU) |
+| 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; [H100 numbers against vLLM](docs/benchmark-2026-09-13.md) |
+| 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite checked against transformers; served on an H100 with FlashMLA decode, the Triton MoE and both graph modes ([numbers](docs/benchmark-2026-09-20.md)); GPU reference checks still to record |
 | 3 | Speculative decoding | |
 | 4 | Disaggregated prefill / decode | |
 
@@ -25,14 +25,17 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                  # deps, dev tools, the server and the package, into .venv
-uv sync --extra cuda     # add FlashAttention-3, Triton and the torch vLLM pins (NVIDIA only)
+uv sync --extra cuda     # add FlashAttention-3, FlashInfer, Triton and the torch vLLM pins (NVIDIA only)
 uv sync --extra serve    # the server deps alone, for installing without the dev group
 ```
 
 Dao-AILab publishes no FlashAttention-3 wheel, so the `cuda` extra installs a
 third-party build of it, pinned by URL and hash. That build covers Linux on
 x86_64, against the torch pinned beside it. The kernels are Hopper's, so the
-backend reports itself unavailable on anything but an H100 or H200.
+backend reports itself unavailable on anything but an H100 or H200. The extra
+also installs FlashInfer, which runs on Ampere and newer and compiles its
+kernels on first use, so it needs `nvcc`. DeepSeek-V2 also decodes with FlashMLA when it is built from source; see
+[docs/deepseek-v2.md](docs/deepseek-v2.md).
 
 Without it, and without Triton, the engine runs on CPU and Apple Silicon via the
 `torch` attention backend, at laptop speed — enough to develop and test the
@@ -59,8 +62,15 @@ outputs = llm.generate(["Hello, lean-vLLM."], sampling_params)
 outputs[0]["text"]
 ```
 
-The attention backend is picked automatically and can be forced with
-`LEAN_VLLM_ATTENTION_BACKEND`.
+Each attention layer picks its backend automatically, and
+`LEAN_VLLM_ATTENTION_BACKEND` forces one. A MoE model's routed experts run a Triton kernel
+on CUDA, as vLLM's do, and `grouped_mm` elsewhere; `LEAN_VLLM_MOE_BACKEND`
+forces either. The kernel's tile sizes come from a config tuned offline by
+`benchmarks/tune_moe.py`, or from vLLM's defaults.
+
+Qwen3 and DeepSeek-V2 checkpoints load, picked by `architectures` in
+`config.json`. [docs/deepseek-v2.md](docs/deepseek-v2.md) covers DeepSeek-V2-Lite:
+its latent KV cache, MoE layer and YaRN rope.
 
 ## Serving
 
@@ -122,13 +132,17 @@ and stopping the server for each.
 
 ```bash
 uv run python benchmarks/sweep.py --model ~/workspace/huggingface/Qwen3-8B \
-    --suite rate --rates 1,2,4,8,16 --num-kvcache-blocks 8192 --out results/8b
+    --suite rate --rates 1,2,4,8,16 --kvcache-tokens 131072 --out results/8b
 ```
 
-No benchmark numbers are published yet. The backends were verified for
-numerical correctness against a dense reference on an A100 back when the CUDA
-one was FlashAttention-2; the FlashAttention-3 backend that replaced it awaits
-its first H100.
+Published reports, each against vLLM 0.26.0 on one H100:
+
+- [13 September](docs/benchmark-2026-09-13.md), Qwen3-8B: at parity below
+  saturation, 5–7% behind on goodput at the plateau.
+- [20 September](docs/benchmark-2026-09-20.md), DeepSeek-V2-Lite-Chat: median
+  TPOT 7.0 ms against vLLM's 4.4 ms at low load, and plateaus at about 20
+  requests/s where vLLM reaches 31.8.
+
 [docs/benchmark-runbook.md](docs/benchmark-runbook.md) is the step-by-step for
 producing numbers on a rented H100.
 

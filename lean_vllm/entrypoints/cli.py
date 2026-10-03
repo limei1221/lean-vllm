@@ -1,14 +1,11 @@
-"""`lean-vllm serve <model>`.
-
-Engine flags are generated from `Config`, since `LLMEngine.__init__` drops any other kwarg.
-"""
+"""`lean-vllm serve <model>`, with engine flags generated from `Config`."""
 
 import argparse
 from dataclasses import MISSING, fields
 
 from lean_vllm.config import Config
 
-# Not flags: the positional and what the tokenizer decides.
+# Not flags: the positional, and what the engine reads from the checkpoint.
 INTERNAL = {"model", "hf_config", "eos"}
 
 

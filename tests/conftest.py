@@ -46,10 +46,7 @@ class FakeSampledTokens:
 
 
 class FakeModelRunner:
-    """Stands in for ModelRunner: same call() surface, deterministic tokens, no torch.
-
-    Records every batch, so tests can assert what the scheduler decided.
-    """
+    """Stands in for ModelRunner: same call() surface, deterministic tokens, every batch recorded."""
 
     def __init__(self, eos_after: dict[str, int] | None = None):
         self.eos_after = eos_after or {}
@@ -69,10 +66,7 @@ class FakeModelRunner:
 
     @staticmethod
     def _completion_index(seq: Sequence) -> int:
-        """Which completion token this row is about to produce.
-
-        Read off the batch: tokens commit a step later, and a recomputed suffix must repeat its ids.
-        """
+        """Which completion token this row is about to produce, read off the batch so a recomputed suffix repeats."""
         return seq.num_cached_tokens + seq.num_scheduled_tokens - seq.num_prompt_tokens
 
     def _token(self, seq: Sequence) -> int:
