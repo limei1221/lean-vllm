@@ -44,7 +44,8 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 16
     num_kvcache_blocks: int = -1
-    enable_chunked_prefill: bool = True  # off never mixes prefill and decode, kept for the A/B
+    # Allow prompt chunking and mixed prefill/decode batches; off uses whole-prompt prefill-only batches.
+    enable_chunked_prefill: bool = True
     enable_prefix_caching: bool = True  # off recomputes every prompt, kept for the A/B
     async_scheduling: bool = True  # schedule the next step before awaiting the last
     seed: int = 0  # every rank samples, so all must draw the same random numbers

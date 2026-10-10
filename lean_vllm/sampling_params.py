@@ -18,5 +18,5 @@ class SamplingParams:
         assert self.max_tokens >= 1
         assert 0 < self.top_p <= 1
         assert self.top_k >= -1
-        if self.temperature == 0:  # greedy takes the argmax, whatever the truncation
+        if self.temperature == 0:
             self.top_p, self.top_k = 1.0, 0

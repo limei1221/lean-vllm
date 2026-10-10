@@ -58,9 +58,9 @@ def load_tokenizer(model: str) -> PreTrainedTokenizerFast:
 
 
 class _StepProfiler:
-    """torch.profiler over a window of engine steps, set by the LEAN_PROFILE_* variables.
+    """Profile engine steps using torch.profiler, configured by LEAN_PROFILE_*.
 
-    CPU only by default, since kineto refuses CUDA activity from the engine thread.
+    Default to CPU profiling because the profiling backend rejects CUDA collection from the engine thread.
     """
 
     def __init__(self, out_dir: str, skip: int, steps: int, cuda: bool):
@@ -86,7 +86,7 @@ class _StepProfiler:
 
     def step(self):
         if self.started is False:
-            self.profile.start()  # lazy, so kineto skips model load and warmup
+            self.profile.start()  # lazy, so the trace skips model load and warmup
             self.started = True
         self.profile.step()
 
@@ -102,7 +102,7 @@ class _StepProfiler:
             return
         self.closed = True
         try:
-            self.profile.stop()  # flushes the window, partial or complete
+            self.profile.stop()  # save what was collected, even if the run ended early
         except RuntimeError:
             pass  # the window already completed and saved mid-run
         if not self.exported:
@@ -124,7 +124,7 @@ class _InFlight:
 
 class LLMEngine:
     def __init__(self, model, detokenize: bool = True, **kwargs):
-        """detokenize=False leaves text empty, for a client that detokenizes itself, as an engine core's does."""
+        """detokenize=False leaves text empty for a client that detokenizes itself, like the engine core."""
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         self.config = config = Config(model, **config_kwargs)
@@ -149,7 +149,7 @@ class LLMEngine:
 
     def exit(self):
         if not hasattr(self, "model_runner"):
-            return  # already exited, and atexit calls it again
+            return  # already exited; atexit calls it again
         if self.profiler is not None:
             self.profiler.close()
         self.model_runner.call("exit")
@@ -184,7 +184,7 @@ class LLMEngine:
         return aborted
 
     def step(self) -> tuple[list[RequestOutput], int, int]:
-        """Launch one step and drain the previous one; async_scheduling launches first so the two overlap."""
+        """Process the previous step's results and start the next; async_scheduling starts first to overlap them."""
         started = perf_counter()
         draining, self.in_flight = self.in_flight, None
         if self.config.async_scheduling:
@@ -216,7 +216,7 @@ class LLMEngine:
             output = self.scheduler.schedule()
         if output.kv_connector_metadata is not None:
             with record_function("kv_connector"):
-                # Every step, scheduled or not, so loads start and finished transfers come back while idle.
+                # start KV loads and collect finished transfers even when nothing is scheduled
                 kv_output = self.model_runner.call("kv_connector_step", output.kv_connector_metadata)
                 self.scheduler.update_from_kv_connector_output(kv_output)
                 self.metrics.record_kv_transfer(kv_output)
@@ -278,7 +278,7 @@ class LLMEngine:
             for prompt, sp in zip(prompts, sampling_params):
                 request_ids.append(self.add_request(prompt, sp))
         except BaseException:
-            for request_id in request_ids:  # else a later call gets their outputs
+            for request_id in request_ids:  # else a later generate() call gets their outputs
                 self.abort_request(request_id)
             raise
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
