@@ -47,7 +47,7 @@ class TestGeneration:
         engine.run_to_completion()
         block_manager = engine.scheduler.block_manager
         assert not block_manager.used_block_ids
-        assert len(block_manager.free_block_ids) == engine.config.num_kvcache_blocks
+        assert block_manager.free_block_queue.num_free_blocks == engine.config.num_kvcache_blocks
 
 
 class TestStreaming:

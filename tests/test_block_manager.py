@@ -2,7 +2,7 @@
 
 import pytest
 
-from lean_vllm.engine.block_manager import BlockManager, FreeBlockQueue
+from lean_vllm.engine.block_manager import Block, BlockManager, FreeKVCacheBlockQueue
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.sampling_params import SamplingParams
 
@@ -28,18 +28,20 @@ def cache(manager: BlockManager, token_ids: list[int]) -> list[int]:
 class TestFreeQueue:
     def test_taking_a_block_out_of_the_middle_leaves_the_order_alone(self):
         """A prefix hit takes its blocks back from wherever they sit."""
-        queue = FreeBlockQueue(range(5))
-        queue.remove(2)
-        assert list(queue) == [0, 1, 3, 4]
-        queue.append(2)
-        assert list(queue) == [0, 1, 3, 4, 2]
-        assert queue.popleft() == 0
+        blocks = [Block(i) for i in range(5)]
+        queue = FreeKVCacheBlockQueue(blocks)
+        queue.remove(blocks[2])
+        assert [b.block_id for b in queue.get_all_free_blocks()] == [0, 1, 3, 4]
+        queue.append(blocks[2])
+        assert [b.block_id for b in queue.get_all_free_blocks()] == [0, 1, 3, 4, 2]
+        assert queue.popleft() is blocks[0]
+        assert queue.num_free_blocks == 4
 
 
 class TestEvictionOrder:
     def test_blocks_that_cache_nothing_are_spent_first(self, manager):
         cache(manager, list(range(12)))  # blocks 0, 1 and 2, then released
-        assert list(manager.free_block_ids) == [3, 4, 5, 2, 1, 0]
+        assert [b.block_id for b in manager.free_block_queue.get_all_free_blocks()] == [3, 4, 5, 2, 1, 0]
 
     def test_a_sequence_gives_up_its_deepest_block_first(self, manager):
         """Which is what makes a shared prefix outlive the suffixes built on it."""

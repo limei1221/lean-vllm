@@ -1,6 +1,3 @@
-from collections import OrderedDict
-from typing import Iterable
-
 from lean_vllm.engine.sequence import Sequence
 
 
@@ -10,6 +7,9 @@ class Block:
         self.ref_count = 0
         self.hash = -1
         self.token_ids = []
+        # Links in the free queue, only touched by FreeKVCacheBlockQueue.
+        self.prev_free_block: Block | None = None
+        self.next_free_block: Block | None = None
 
     def update(self, hash: int, token_ids: list[int]):
         self.hash = hash
@@ -21,26 +21,50 @@ class Block:
         self.token_ids = []
 
 
-class FreeBlockQueue:
-    """Free blocks, least recently released first. An OrderedDict, as a prefix hit takes one from the middle."""
+class FreeKVCacheBlockQueue:
+    """Free blocks, least recently released first, as vLLM's doubly linked list through the blocks themselves.
 
-    def __init__(self, block_ids: Iterable[int]):
-        self._ids: OrderedDict[int, None] = OrderedDict.fromkeys(block_ids)
+    A prefix hit takes a block out of the middle in O(1).
+    """
 
-    def popleft(self) -> int:
-        return self._ids.popitem(last=False)[0]
+    def __init__(self, blocks: list[Block]):
+        self.num_free_blocks = len(blocks)
+        # The fake head and tail are never popped, so every free block has both neighbors.
+        self.fake_free_list_head = Block(-1)
+        self.fake_free_list_tail = Block(-1)
+        chain = [self.fake_free_list_head, *blocks, self.fake_free_list_tail]
+        for prev_block, next_block in zip(chain, chain[1:]):
+            prev_block.next_free_block = next_block
+            next_block.prev_free_block = prev_block
 
-    def append(self, block_id: int):
-        self._ids[block_id] = None
+    def popleft(self) -> Block:
+        block = self.fake_free_list_head.next_free_block
+        assert block is not self.fake_free_list_tail, "no free blocks"
+        self.remove(block)
+        return block
 
-    def remove(self, block_id: int):
-        del self._ids[block_id]
+    def remove(self, block: Block):
+        assert block.prev_free_block is not None and block.next_free_block is not None
+        block.prev_free_block.next_free_block = block.next_free_block
+        block.next_free_block.prev_free_block = block.prev_free_block
+        block.prev_free_block = block.next_free_block = None
+        self.num_free_blocks -= 1
 
-    def __len__(self) -> int:
-        return len(self._ids)
+    def append(self, block: Block):
+        last_block = self.fake_free_list_tail.prev_free_block
+        last_block.next_free_block = block
+        block.prev_free_block = last_block
+        block.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = block
+        self.num_free_blocks += 1
 
-    def __iter__(self):
-        return iter(self._ids)
+    def get_all_free_blocks(self) -> list[Block]:
+        blocks = []
+        block = self.fake_free_list_head.next_free_block
+        while block is not self.fake_free_list_tail:
+            blocks.append(block)
+            block = block.next_free_block
+        return blocks
 
 
 class BlockManager:
@@ -54,7 +78,7 @@ class BlockManager:
         self.recompute_last_hit = recompute_last_hit
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids = FreeBlockQueue(range(num_blocks))
+        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
         self.used_block_ids: set[int] = set()
 
     @property
@@ -62,8 +86,8 @@ class BlockManager:
         return len(self.used_block_ids) / len(self.blocks) if self.blocks else 0.0
 
     def _allocate_block(self) -> int:
-        block_id = self.free_block_ids.popleft()
-        block = self.blocks[block_id]
+        block = self.free_block_queue.popleft()
+        block_id = block.block_id
         assert block.ref_count == 0
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
@@ -74,7 +98,7 @@ class BlockManager:
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
+        self.free_block_queue.append(self.blocks[block_id])
 
     def _num_blocks(self, seq: Sequence, num_lookahead: int) -> int:
         """Blocks seq needs once every reserved token lands and num_lookahead more slots are written."""
@@ -96,7 +120,7 @@ class BlockManager:
         if self.recompute_last_hit and num_cached_blocks:
             num_cached_blocks -= 1
             num_new_blocks += last_hit_held
-        if len(self.free_block_ids) < num_new_blocks:
+        if self.free_block_queue.num_free_blocks < num_new_blocks:
             return -1
         return num_cached_blocks
 
@@ -109,7 +133,7 @@ class BlockManager:
                 block.ref_count += 1
             else:
                 block.ref_count = 1
-                self.free_block_ids.remove(block_id)
+                self.free_block_queue.remove(block)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
         for _ in range(num_cached_blocks, self._num_blocks(seq, num_lookahead)):
@@ -132,7 +156,7 @@ class BlockManager:
 
     def can_append(self, seq: Sequence, num_lookahead: int = 0) -> bool:
         """Whether the blocks for seq's next token, and num_lookahead slots past it (drafts), are free."""
-        return len(self.free_block_ids) >= self._num_missing_blocks(seq, num_lookahead)
+        return self.free_block_queue.num_free_blocks >= self._num_missing_blocks(seq, num_lookahead)
 
     def may_append(self, seq: Sequence, num_lookahead: int = 0):
         for _ in range(self._num_missing_blocks(seq, num_lookahead)):
