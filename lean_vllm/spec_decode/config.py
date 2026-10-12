@@ -1,33 +1,25 @@
-import json
-from dataclasses import dataclass
+from typing import Annotated, Literal
 
-# vLLM's names for a checkpoint's own multi-token prediction layers.
-MTP_METHODS = ("mtp", "deepseek_mtp")
+from pydantic import ConfigDict, Field, TypeAdapter
+from pydantic.dataclasses import dataclass
+
 PLACEHOLDER_TOKEN_ID = -1  # past a row's last token, and a draft the host does not know yet
 
 
-@dataclass(slots=True)
+@dataclass(config=ConfigDict(extra="forbid"), slots=True)
 class SpeculativeConfig:
     """vLLM's --speculative-config, as JSON. Only a checkpoint's own MTP layers draft."""
 
-    method: str = "mtp"
-    num_speculative_tokens: int = 1  # drafts per request per step; past the MTP layers' count they repeat
-
-    def __post_init__(self):
-        if self.method not in MTP_METHODS:
-            raise ValueError(f"speculative_config method {self.method!r} is not one of {list(MTP_METHODS)}")
-        if self.num_speculative_tokens < 1:
-            raise ValueError("speculative_config num_speculative_tokens must be at least 1")
+    method: Literal["mtp", "deepseek_mtp"] = "mtp"  # vLLM's names for a checkpoint's own MTP layers
+    # Drafts per request per step; past the MTP layers' count they repeat.
+    num_speculative_tokens: Annotated[int, Field(ge=1)] = 1
 
     @classmethod
     def parse(cls, value: "str | dict | SpeculativeConfig") -> "SpeculativeConfig":
         if isinstance(value, SpeculativeConfig):
             return value
-        fields = json.loads(value or "{}") if isinstance(value, str) else dict(value)
-        unknown = set(fields) - set(cls.__dataclass_fields__)
-        if unknown:
-            raise ValueError(f"unknown speculative_config keys {sorted(unknown)}")
-        return cls(**fields)
+        adapter = TypeAdapter(cls)
+        return adapter.validate_json(value or "{}") if isinstance(value, str) else adapter.validate_python(value)
 
 
 def split_sampled(rows: list[list[int]], num_speculative_tokens: int) -> tuple[list[list[int]], list[list[int]]]:

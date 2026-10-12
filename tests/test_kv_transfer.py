@@ -333,9 +333,9 @@ class TestConfig:
     @pytest.mark.parametrize(
         "value, message",
         [
-            ('{"kv_role": "decoder"}', "unknown kv_role"),
+            ('{"kv_role": "decoder"}', "kv_role\n  Input should be 'kv_producer'"),
             ('{"kv_connector": "NixlConnector"}', "unknown kv_connector"),
-            ('{"kv_buffer_size": 1}', "unknown kv_transfer_config keys"),
+            ('{"kv_buffer_size": 1}', "kv_buffer_size\n  Unexpected keyword argument"),
         ],
     )
     def test_a_bad_flag_is_named(self, value, message):
@@ -367,9 +367,9 @@ class TestRequestParams:
             ({"do_remote_decode": True}, None, "needs an engine started with kv_transfer_config"),
             ({"do_remote_decode": True}, "kv_consumer", "do_remote_decode needs kv_role"),
             (PULL, "kv_producer", "do_remote_prefill needs kv_role"),
-            (PULL | {"remote_port": "1"}, "kv_both", "remote_port, a int"),
-            (PULL | {"remote_block_ids": ["x"]}, "kv_both", "remote_block_ids must be integers"),
-            ({k: v for k, v in PULL.items() if k != "remote_host"}, "kv_both", "remote_host"),
+            (PULL | {"remote_port": "1"}, "kv_both", "remote_port: Input should be a valid integer"),
+            (PULL | {"remote_block_ids": ["x"]}, "kv_both", "remote_block_ids.0: Input should be a valid integer"),
+            ({k: v for k, v in PULL.items() if k != "remote_host"}, "kv_both", "remote_host: Field required"),
         ],
     )
     def test_what_the_engine_cannot_honour_is_named(self, params, kv_role, message):

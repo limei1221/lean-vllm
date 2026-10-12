@@ -4,38 +4,32 @@ The scheduler half decides which requests load or hand over KV and holds their b
 the worker halves a KVConnectorMetadata, and they answer with the transfers that finished since.
 """
 
-import json
 import uuid
 from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass, field
+from typing import Literal
 
-KV_ROLES = ("kv_producer", "kv_consumer", "kv_both")
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
+from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 
-@dataclass(slots=True)
+@pydantic_dataclass(config=ConfigDict(extra="forbid"), slots=True)
 class KVTransferConfig:
     """vLLM's --kv-transfer-config, as JSON. A producer serves prefilled KV, a consumer loads it, both does either."""
 
     kv_connector: str = "TcpConnector"
-    kv_role: str = "kv_both"
+    kv_role: Literal["kv_producer", "kv_consumer", "kv_both"] = "kv_both"
     kv_ip: str = "127.0.0.1"  # where a producer listens, and what it tells consumers to dial
     kv_port: int = 14579  # rank r listens on kv_port + r
     engine_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-
-    def __post_init__(self):
-        if self.kv_role not in KV_ROLES:
-            raise ValueError(f"unknown kv_role {self.kv_role!r}, expected one of {list(KV_ROLES)}")
 
     @classmethod
     def parse(cls, value: "str | dict | KVTransferConfig") -> "KVTransferConfig":
         if isinstance(value, KVTransferConfig):
             return value
-        fields = json.loads(value) if isinstance(value, str) else dict(value)
-        unknown = set(fields) - set(cls.__dataclass_fields__)
-        if unknown:
-            raise ValueError(f"unknown kv_transfer_config keys {sorted(unknown)}")
-        return cls(**fields)
+        adapter = TypeAdapter(cls)
+        return adapter.validate_json(value) if isinstance(value, str) else adapter.validate_python(value)
 
     @property
     def is_producer(self) -> bool:
@@ -46,14 +40,16 @@ class KVTransferConfig:
         return self.kv_role in ("kv_consumer", "kv_both")
 
 
-# What a decode instance needs to pull a remote prefill's blocks, as the producer's request_finished returns it.
-REMOTE_PREFILL_FIELDS = {
-    "remote_block_ids": list,
-    "remote_request_id": str,
-    "remote_engine_id": str,
-    "remote_host": str,
-    "remote_port": int,
-}
+class _RemotePrefill(BaseModel):
+    """What a decode instance needs to pull a remote prefill's blocks, as the producer's request_finished returns it."""
+
+    model_config = ConfigDict(strict=True)  # wire input: "1" is not a port
+
+    remote_block_ids: list[int]
+    remote_request_id: str
+    remote_engine_id: str
+    remote_host: str
+    remote_port: int
 
 
 def check_kv_transfer_params(params, kv_transfer: KVTransferConfig | None) -> str | None:
@@ -67,11 +63,11 @@ def check_kv_transfer_params(params, kv_transfer: KVTransferConfig | None) -> st
     if params.get("do_remote_prefill"):
         if not kv_transfer.is_consumer:
             return f"do_remote_prefill needs kv_role kv_consumer or kv_both, not {kv_transfer.kv_role}"
-        for name, kind in REMOTE_PREFILL_FIELDS.items():
-            if not isinstance(params.get(name), kind):
-                return f"do_remote_prefill needs {name}, a {kind.__name__}"
-        if not all(isinstance(block_id, int) for block_id in params["remote_block_ids"]):
-            return "remote_block_ids must be integers"
+        try:
+            _RemotePrefill.model_validate(params)
+        except ValidationError as error:
+            first = error.errors()[0]
+            return f"do_remote_prefill needs {'.'.join(map(str, first['loc']))}: {first['msg']}"
     return None
 
 

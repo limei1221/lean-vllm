@@ -271,9 +271,9 @@ class TestConfig:
     @pytest.mark.parametrize(
         "value, message",
         [
-            ('{"method": "ngram"}', "not one of"),
-            ('{"num_speculative_tokens": 0}', "at least 1"),
-            ('{"model": "x"}', "unknown"),
+            ('{"method": "ngram"}', "method\n  Input should be 'mtp' or 'deepseek_mtp'"),
+            ('{"num_speculative_tokens": 0}', "greater than or equal to 1"),
+            ('{"model": "x"}', "model\n  Unexpected keyword argument"),
         ],
     )
     def test_a_bad_speculative_config_is_refused(self, make_config, value, message):
