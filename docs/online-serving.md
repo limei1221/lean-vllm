@@ -63,7 +63,7 @@ client that disconnects frees its KV blocks straight away.
 | --- | --- | --- |
 | Chunked prefill, mixed prefill + decode steps | On | Off runs whole prompts, never mixed with decode |
 | Prefix caching | On | Reuses cached prompt blocks |
-| Async scheduling | On | Schedules the next step while the GPU runs the current one; turns itself off under tensor parallelism |
+| Async scheduling | On | Schedules the next step while the GPU runs the current one |
 | CUDA graphs | `full_and_piecewise` | Full graphs for decode, piecewise for small prefill and mixed steps |
 | `torch.compile` | On, unless graphs are off | Inductor compiles the model between attention ops, as vLLM does |
 | Priority scheduling | Off (`fcfs`) | `--scheduling-policy priority` |
@@ -222,8 +222,11 @@ Batch preparation, like vLLM's `_prepare_inputs`, touches each row once in
 Python and computes everything per token with numpy: positions, sequence
 offsets, slot mapping and which rows sample.
 
-Tensor parallelism turns it off, because the other ranks never see the sampled
-tokens. On an H100 it cuts offline GPU idle time from 22.4% to 3.2%.
+Under tensor parallelism every rank all-gathers the logits and samples with the
+same seed, as vLLM does, so each rank can prepare its next step without waiting
+for rank 0. This has passed on CPU but not yet run on GPUs. On an H100 async
+scheduling cuts offline GPU idle time from 26.5% to 2.9%
+([3 October report](benchmark-2026-10-03-Qwen3-8B.md#offline-pipelining-removes-the-gpu-idle)).
 
 ### CUDA graphs
 

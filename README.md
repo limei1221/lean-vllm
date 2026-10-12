@@ -7,7 +7,7 @@ features and includes benchmarks against vLLM. Runs on CPU or NVIDIA GPUs with C
 
 ## Beyond nano-vLLM
 
-Building on [nano-vLLM's foundation](#credit), lean-vLLM adds these vLLM concepts:
+On top of [nano-vLLM](#credit), lean-vLLM adds these vLLM features:
 
 - [Online serving](docs/online-serving.md): OpenAI-compatible streaming APIs,
   a separate engine process, cancellation, and Prometheus metrics.
@@ -90,5 +90,5 @@ For detailed analysis, see the 3 October reports for
 
 Forked from [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm) by Xingkai Yu
 at [`bb823b3`](https://github.com/GeeeekExplorer/nano-vllm/commit/bb823b3e06983d71485a8e1f23715ebd87d98ef8).
-Its scheduler, block manager, paged KV cache, and Qwen3 implementation form
-the foundation of this project. Both projects use the [MIT license](LICENSE).
+This project started from its scheduler, block manager, paged KV cache and
+Qwen3 implementation. Both projects use the [MIT license](LICENSE).

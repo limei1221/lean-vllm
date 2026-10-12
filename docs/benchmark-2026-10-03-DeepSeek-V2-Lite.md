@@ -1,4 +1,4 @@
-# Online serving benchmark — 3 October 2026
+# DeepSeek-V2-Lite serving benchmark, 3 October 2026
 
 lean-vLLM against vLLM 0.26.0 on DeepSeek-V2-Lite-Chat (16B total, 2.4B active,
 MLA + MoE + YaRN), one H100, with chunked prefill, full + piecewise CUDA
@@ -6,35 +6,36 @@ graphs, and Inductor compilation on both engines. Both engines ran with async
 scheduling on. Results are in
 [`results/20261003T164448Z/`](../results/20261003T164448Z/).
 
-All ten serving runs completed — five offered loads per engine, 1,000 requests
-each, no rejections, failures, or preemptions — replaying the same lognormal
-trace (~661k prompt, ~177k generated tokens).
+All ten serving runs completed: five offered loads per engine, 1,000 requests
+each, with no rejections, failures or preemptions. Every run replayed the same
+lognormal trace (~661k prompt, ~177k generated tokens).
 
 This run follows the addition of Inductor compilation to lean-vLLM; the earlier
 report on the pre-Inductor baseline, `benchmark-2026-09-20.md`, was retired in
 bbade78 and is in the git history.
-The main findings are:
 
-- **Inductor compilation lifted lean-vLLM's plateau from ~20 to ~23
-  requests/s.** At load 48 goodput is 23.18 requests/s, up from 20.20 in
+The main findings:
+
+- Inductor compilation lifted lean-vLLM's plateau from ~20 to ~23
+  requests/s. At load 48 goodput is 23.18 requests/s, up from 20.20 in
   the pre-Inductor run, narrowing the gap with vLLM from 32.5% to 23.1%.
   At load 24 the gap is just 3.6%.
-- **lean-vLLM's load-1 TPOT improved to 6.5 ms (1.42× vLLM's 4.6 ms).**
-  Down from 7.0 ms (1.6×) pre-Inductor. The decode step replays a captured
+- lean-vLLM's load-1 TPOT improved to 6.5 ms (1.42× vLLM's 4.6 ms), from
+  7.0 ms (1.6×) pre-Inductor. The decode step replays a captured
   graph on both engines; the remaining difference is in the non-attention
   piecewise pieces and per-step overhead.
-- **lean-vLLM's goodput drops past load 48.** At load 64 goodput falls to
+- lean-vLLM's goodput drops past load 48. At load 64 goodput falls to
   21.14 requests/s, 9% below its load-48 peak, while vLLM keeps climbing to
   31.21. GPU utilization drops from 78% to 68% for lean-vLLM at these loads
-  while vLLM holds 91–92%, pointing to host-side bottlenecks in the large
-  compiled-but-ungraphed prefill steps.
-- **Compiled prefill steps still dominate the plateau.** Steps outside the
+  while vLLM holds 91–92%. The likely bottleneck is host dispatch in the
+  large compiled-but-ungraphed prefill steps.
+- Compiled prefill steps still dominate the plateau. Steps outside the
   64–512-token piecewise grid now run through Inductor rather than eager, but
   they are still 55–63% of step time at loads 48–64, at 56–70 ms each. Captured
   graph steps run at 9–10 ms.
-- **vLLM now ran fresh alongside lean-vLLM.** The earlier report reused a vLLM
-  curve from a prior session; this run includes a fresh vLLM curve on the same
-  day, with GPU metrics for both engines.
+- vLLM ran fresh alongside lean-vLLM. The earlier report reused a vLLM
+  curve from a prior session; this one ran vLLM the same day, with GPU metrics
+  for both engines.
 
 ## Setup
 
@@ -133,10 +134,10 @@ falls to 3,739 tok/s while vLLM reaches 5,519.
 
 lean-vLLM peaks at load 48 and then declines: load 64's goodput (21.14) is 9%
 below load 48's (23.18). vLLM keeps climbing to load 64, so the gap widens from
-23% to 32%. The decline is visible in the GPU metrics too — lean-vLLM's
-utilization drops from 78% to 68% at loads 48–64 while vLLM holds 91–92%
-(section 3), suggesting the bottleneck is in the host dispatch of compiled-but-
-ungraphed prefill steps, which grow from 56 ms to 70 ms as the queue deepens.
+23% to 32%. The GPU metrics show the decline too: lean-vLLM's utilization
+drops from 78% to 68% at loads 48–64 while vLLM holds 91–92% (section 3). My
+guess is host dispatch of the compiled-but-ungraphed prefill steps, which grow
+from 56 ms to 70 ms as the queue deepens.
 
 Compared with the pre-Inductor run, lean-vLLM's plateau moved up from ~20 to
 ~23 requests/s. The gap at load 24 narrowed from 12% to 3.6%, and at load 48
@@ -163,8 +164,8 @@ Under load, median TPOT is 1.3–2.0× vLLM's. The TTFT tail blows out once
 lean-vLLM passes its knee: p99 TTFT is 6.83 s at load 48 against vLLM's 1.51 s,
 because requests queue behind a plateau that cannot drain them. At loads 24–32
 lean-vLLM's p99 TTFT is tighter than vLLM's (0.27–0.55 s vs 0.46–3.94 s);
-vLLM's load-32 p99 TTFT of 3.94 s is a noisy point — its own p99 drops to
-1.51 s at load 48.
+vLLM's load-32 p99 TTFT of 3.94 s looks like noise, since its own p99 drops
+to 1.51 s at load 48.
 
 ## 3. GPU utilization and clock conditions
 
@@ -180,10 +181,9 @@ Sampled once per second and aligned to each run's recorded start and finish:
 
 lean-vLLM's utilization peaks at loads 24–32 (85–86%) and drops at loads 48–64
 (78% → 68%), matching the throughput decline. vLLM holds 91–92% at loads 48–64,
-consistent with its still-rising goodput. The drop in lean-vLLM's utilization
-suggests that the compiled-but-ungraphed prefill steps, which grow longer and
-more numerous under heavier load, involve more host-side dispatch time during
-which the GPU is idle.
+in line with its still-rising goodput. The compiled-but-ungraphed prefill steps
+grow longer and more numerous under heavier load, and the GPU probably sits
+idle while the host dispatches them.
 
 Power draw reflects the utilization gap: lean-vLLM draws 393–434 W at loads
 24–64 while vLLM draws 475–525 W. DeepSeek-V2-Lite activates only 2.4B
@@ -201,8 +201,8 @@ loads. The GPU peaked at 55 °C.
 
 Both engines run at or near the 1,980 MHz clock lock. vLLM's clocks dip
 slightly at loads 32–64 as it draws more power; lean-vLLM holds steady because
-it draws less. Clock conditions do not explain the throughput gap — lean-vLLM
-runs at higher clocks and still trails.
+it draws less. Clocks do not explain the throughput gap: lean-vLLM runs at
+higher clocks and still trails.
 
 ## 4. Where the step time goes
 
@@ -231,51 +231,51 @@ past the 512-token grid. At loads 48–64 these compiled prefill steps carry
 dispatches more Inductor-compiled ops through the host, and the mean step time
 rises from 50 ms at load 24 to 70 ms at load 64.
 
-The goodput drop at load 64 correlates with this: the compiled prefill steps are
-10 ms more expensive than at load 32, and they now take 63% of step time, up
-from 40%. The captured graph steps are steady at 9–11 ms and decline as a share
-because the engine spends proportionally more of its time on compiled prefill.
+The goodput drop at load 64 lines up with this. The compiled prefill steps cost
+16 ms more than at load 32, and they now take 63% of step time, up from 40%.
+The captured graph steps hold steady at 9–11 ms; their share falls only because
+compiled prefill takes more of the engine's time.
 
 Compared with the pre-Inductor run, compiled prefill steps are faster than
 the eager ones they replaced (~50–56 ms at loads 24–48 vs ~60–69 ms), and
 lean-vLLM's plateau has risen by ~3 requests/s. The captured graph steps are
-unchanged, as expected — the full graph replay path did not change.
+unchanged, which is expected, since the full graph replay path did not change.
 
 ## Measurement limits
 
-- **One run per point.** No point was repeated, so differences of a few percent
+- One run per point. No point was repeated, so differences of a few percent
   between neighbouring loads are within run-to-run noise until repeated. vLLM's
   load-32 p99 TTFT (3.94 s, worse than its load-48 value) is one such noisy
   point.
-- **No async-off curve.** Only async scheduling on was run, so the pipelining
+- No async-off curve. Only async scheduling on was run, so the pipelining
   gain is not measured this session.
-- **No offline CUDA trace or host trace.** The GPU busy/idle split inside steps
+- No offline CUDA trace or host trace. The GPU busy/idle split inside steps
   and the per-phase host breakdown are not measured; the step breakdown rests on
   server counters and client latencies alone.
-- **Neither engine tuned its MoE.** Both use default tile sizes for the routed
+- Neither engine tuned its MoE. Both use default tile sizes for the routed
   experts; tuning could change the absolute numbers but likely affects both
   engines equally.
-- **vLLM exposes no server counters here.** The step breakdown by kind is
+- vLLM exposes no server counters here. The step breakdown by kind is
   lean-vLLM only; vLLM's per-step cost is inferred from load-1 latency and its
   configuration, not measured.
-- **vLLM is not the latest release.** 0.26.0 is the last release that pins torch
+- vLLM is not the latest release. 0.26.0 is the last release that pins torch
   2.11, which the FlashAttention-3 wheel links against; matching torch was
   chosen over a newer vLLM.
 
 ## Next experiments, in priority order
 
-1. **Cut the cost of compiled prefill steps past 512 tokens.** They are 55–63%
+1. Cut the cost of compiled prefill steps past 512 tokens. They are 55–63%
    of step time at the plateau at 56–70 ms each, and their growth causes
    lean-vLLM's goodput to drop at load 64. Extending the piecewise capture range
    past 512, or adding more capture sizes between 64 and 512 (lean-vLLM captures
    13 vs vLLM's 51), would move more of these steps into graph replay. Then
    rerun loads 48 and 64.
-2. **Tune the MoE kernels.** Neither engine ran with tuned tile sizes for
+2. Tune the MoE kernels. Neither engine ran with tuned tile sizes for
    DeepSeek-V2-Lite's E=64, N=1408 experts on this H100. Tune both and rerun to
    see whether the gap changes.
-3. **Recenter the load bracket.** lean-vLLM now saturates around load 32–48, so
+3. Recenter the load bracket. lean-vLLM now saturates around load 32–48, so
    add loads between 32 and 48 to place the knee precisely and measure whether
    the goodput decline past the knee is a consistent pattern.
-4. **Capture an offline CUDA trace and host trace.** Measure the GPU busy/idle
+4. Capture an offline CUDA trace and host trace. Measure the GPU busy/idle
    fraction inside steps and the host per-phase breakdown, now that both Inductor
    compilation and the captured decode graph are in place.

@@ -1,4 +1,4 @@
-# Online serving benchmark — 3 October 2026
+# Qwen3-8B serving benchmark, 3 October 2026
 
 lean-vLLM against vLLM 0.26.0 on Qwen3-8B, one H100, with chunked prefill,
 full + piecewise CUDA graphs, and Inductor compilation on both engines.
@@ -10,25 +10,25 @@ All fifteen serving runs completed: five offered loads per curve, 1,000 requests
 each, no rejections, failures, or preemptions. Every run replayed the same trace
 of 659,770 prompt tokens and 176,838 generated tokens.
 
-The main findings are:
+The main findings:
 
-- **Below saturation the engines are at parity.** At load 1 goodput is identical
+- Below saturation the engines are at parity. At load 1 goodput is identical
   and lean-vLLM's median TPOT is 0.2 ms (3%) above vLLM's. At load 24 lean-vLLM
   is 0.1% behind on goodput, and TTFT and TPOT are within 5%.
-- **At the plateau lean-vLLM trails by 3.7–3.9%.** With async scheduling on it
+- At the plateau lean-vLLM trails by 3.7–3.9%. With async scheduling on it
   reaches 24.81 requests/s at load 48 and 25.06 at load 64, against vLLM's 25.76
   and 26.09.
-- **Inductor compilation halved the gap.** The previous benchmark's eager prefill
+- Inductor compilation narrowed the gap. The previous benchmark's eager prefill
   steps now run through Inductor-compiled pieces. Their share of step time at
   load 48 dropped from 52% to 43%, and the throughput gap narrowed from 5–7% to
   3.7–3.9%.
-- **Async scheduling is worth 1.5–6.7%.** It adds 1.5% at load 24, 6.3% at
+- Async scheduling is worth 1.5–6.7%. It adds 1.5% at load 24, 6.3% at
   load 48, and 6.7% at load 64 over the off curve, and lifts GPU utilization
   under load from 84–89% to 92–98%.
-- **Pipelining removes almost all offline GPU idle.** The offline CUDA trace
+- Pipelining removes almost all offline GPU idle. The offline CUDA trace
   shows the GPU idle 26.5% of the step window with async scheduling off and 2.9%
   with it on, with the same kernel time in both.
-- **Latency is within 5–12% of vLLM past load 1.** Median TPOT is 1.05–1.12×
+- Latency is within 5–12% of vLLM past load 1. Median TPOT is 1.05–1.12×
   vLLM's from load 24 up, and p99 TTFT tracks within 6% up to load 32. At the
   plateau, p99 TTFT is 1.17–1.27× vLLM's.
 
@@ -64,8 +64,7 @@ The main findings are:
 | Maximum model length | 4,096 |
 | Offered loads | 1, 24, 32, 48, 64 requests/s |
 
-vLLM's async scheduling was confirmed on in every server log,
-so the like-for-like pair is lean-vLLM's `async-scheduling=True` curve against
+Every vLLM server log confirmed async scheduling was on, so the like-for-like pair is lean-vLLM's `async-scheduling=True` curve against
 vLLM. vLLM also ran with prefix caching on, its default. lean-vLLM recorded a
 0.0 prefix-cache hit rate on this trace, so prefix caching should not favour
 either engine.
@@ -115,8 +114,8 @@ and 4,432 tok/s, lean-vLLM off 4,129 and 4,152, and vLLM 4,556 and 4,614.
 
 Both lean-vLLM curves level off from load 48: at 23.4 requests/s with async
 scheduling off and at 24.8–25.1 with it on. vLLM is still climbing slightly at
-load 64. The gap therefore opens only once the engines are capacity-bound, and
-widens as vLLM's extra capacity is used.
+load 64. So the gap opens only once the engines are capacity-bound, and widens
+as vLLM uses its extra capacity.
 
 Compared with the 13 September benchmark, the plateau gap narrowed from 5–7% to
 3.7–3.9%. The 13 September run's prefill steps outside the piecewise graph range
@@ -140,7 +139,7 @@ on every metric, but much less than in the 13 September run. Median TPOT is
 is within 6% of vLLM up to load 32, and 1.17–1.27× at the plateau, down from
 3.3–3.7× at loads 24–32.
 
-Async scheduling helps latency as much as throughput. Against the off curve at
+Async scheduling helps latency too. Against the off curve at
 load 48 it cuts p50 TTFT from 2.22 s to 1.68 s and p99 TPOT from 80 ms to
 76 ms. At load 24 it cuts p50 TPOT by 14%, from 15.5 ms to 13.3 ms.
 
@@ -220,10 +219,10 @@ rather than eager. Async scheduling shortens them by 13%, from 52.0 ms to
 stay near 11 ms.
 
 Both engines compile these large steps with Inductor and neither captures them
-in graphs above 512 tokens. The plateau gap is no longer explained by an eager
-versus compiled difference; it now sits in the graph steps and the number of
-piecewise capture sizes: lean-vLLM captures 13 sizes (64–512) against vLLM's 51
-(1–512), so lean-vLLM pads more when a step falls between sizes.
+in graphs above 512 tokens, so eager versus compiled no longer explains the
+plateau gap. I think it now sits in the graph steps and the number of piecewise
+capture sizes. lean-vLLM captures 13 sizes (64–512) against vLLM's 51 (1–512),
+so it pads more when a step falls between sizes.
 
 ### Online host trace at load 48
 
@@ -255,30 +254,30 @@ already overlap the GPU.
 
 ## Measurement limits
 
-- **One run per point.** No point was repeated, so differences of a few percent
+- One run per point. No point was repeated, so differences of a few percent
   between neighbouring loads are within run-to-run noise until repeated.
-- **The GPU busy/idle split is offline, on Qwen3-0.6B.** CUPTI cannot collect
+- The GPU busy/idle split is offline, on Qwen3-0.6B. CUPTI cannot collect
   device activity from the online engine thread. The online 8B idle is inferred
   from sampled utilization, not measured.
-- **The online host trace distorts what it measures.** In-process
+- The online host trace distorts what it measures. In-process
   `record_function` tracing cost 9–10% of goodput and roughly doubled the
   traced step, and it inflates compiled-but-ungraphed steps most because they
   dispatch the most ops.
-- **vLLM exposes no server counters here.** The step breakdown by kind is
+- vLLM exposes no server counters here. The step breakdown by kind is
   lean-vLLM only; vLLM's large-step cost is inferred from its configuration,
   not measured.
-- **vLLM is not the latest release.** 0.26.0 is the last release that pins
+- vLLM is not the latest release. 0.26.0 is the last release that pins
   torch 2.11, which the FlashAttention-3 wheel links against; matching torch
   was chosen over a newer vLLM.
 
 ## Next experiments, in priority order
 
-1. **Narrow the piecewise capture gap.** lean-vLLM captures 13 piecewise sizes
+1. Narrow the piecewise capture gap. lean-vLLM captures 13 piecewise sizes
    (64–512) against vLLM's 51 (1–512). Adding sizes below 64 and closing the
    gaps between buckets would reduce padding waste in piecewise steps. Then
    rerun loads 48 and 64.
-2. **Repeat every plateau point.** This puts error bars on the 3.7–3.9% gap and
+2. Repeat every plateau point. This puts error bars on the 3.7–3.9% gap and
    confirms the improvement over the 13 September run is real.
-3. **Profile the online loop with less overhead.** Record per-phase timings
+3. Profile the online loop with less overhead. Record per-phase timings
    with `perf_counter` counters instead of `record_function`, so the online
    host split can be read without the 9–10% distortion.

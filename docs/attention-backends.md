@@ -197,7 +197,7 @@ cannot quietly stop telling them apart.
 ### Mixed batches, and the split into decode and prefill
 
 A step can hold prompt chunks and decode rows together. `prefill` already takes
-packed rows with fewer queries than keys, so a decode row is simply a row with
+packed rows with fewer queries than keys, so a decode row is just a row with
 one query, and the bottom-right mask already fits it. FA3 runs a mixed step that
 way, in one call, as vLLM's FlashAttention backend does.
 
@@ -325,8 +325,9 @@ Decode gathers the block table's full width, so it reads no lengths back either.
 The padding and the gathered copy cost memory traffic that grows with batch
 size and context length, and a step that mixes long chunks with decode rows
 spends compute on padding. Each key head's query heads fold into its query axis
-rather than going through `enable_gqa`. The backend still reports no CUDA graph support. That is the right
-trade for a reference and for laptop development, and the wrong one for speed.
+rather than going through `enable_gqa`. The backend still reports no CUDA graph
+support. That is the right trade for a reference and for laptop development, and
+the wrong one for speed.
 
 ## Next steps
 
