@@ -71,9 +71,6 @@ class Fcfs(SchedulingPolicy):
     def remove(self, seq):
         self.queue.remove(seq)
 
-    def victim(self, running):
-        return running[-1]  # newest, so the oldest work is preserved
-
     def __len__(self):
         return len(self.queue)
 
@@ -82,6 +79,9 @@ class Fcfs(SchedulingPolicy):
 
     def __contains__(self, seq):
         return seq in self.queue
+
+    def victim(self, running):
+        return running[-1]  # newest, so the oldest work is preserved
 
 
 class Priority(SchedulingPolicy):
@@ -111,6 +111,15 @@ class Priority(SchedulingPolicy):
         self.heap.remove(self._key(seq))
         heapq.heapify(self.heap)
 
+    def __len__(self):
+        return len(self.heap)
+
+    def __iter__(self):
+        return (entry[-1] for entry in self.heap)
+
+    def __contains__(self, seq):
+        return any(entry[-1] is seq for entry in self.heap)
+
     @staticmethod
     def _urgency(seq: Sequence):
         return (seq.priority, seq.arrival_time)
@@ -120,12 +129,3 @@ class Priority(SchedulingPolicy):
 
     def by_urgency(self, running):
         return deque(sorted(running, key=self._urgency))
-
-    def __len__(self):
-        return len(self.heap)
-
-    def __iter__(self):
-        return (entry[-1] for entry in self.heap)
-
-    def __contains__(self, seq):
-        return any(entry[-1] is seq for entry in self.heap)

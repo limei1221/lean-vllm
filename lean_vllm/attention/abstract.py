@@ -60,11 +60,6 @@ class AttentionBackend(ABC):
         """False if decode cannot be captured in a full graph, e.g. it is planned on the host each step."""
         return True
 
-    @classmethod
-    def before_full_graph_replay(cls, context: Context, batch_size: int) -> None:
-        """Refresh what the full graph captured at batch_size reads but cannot compute itself, from this step's
-        pure-decode context, before it replays."""
-
     @staticmethod
     def split_decodes() -> bool:
         """True if forward sends a step's one-query rows to decode and the rest to prefill, as vLLM's backends with
@@ -126,64 +121,6 @@ class AttentionBackend(ABC):
     ) -> None:
         """Scatter new keys/values into the paged cache in place. Slot -1 skips."""
 
-    def store_latents(
-        self,
-        latent: torch.Tensor,
-        latent_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """Scatter latents [num_tokens, latent_dim] into the paged cache in place. Slot -1 skips."""
-        raise NotImplementedError(f"the {self.get_name()} backend stores no MLA latents")
-
-    @abstractmethod
-    def prefill(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        context: Context,
-        out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Causal attention over packed varlen sequences, bottom-right aligned.
-
-        q is [num_tokens, num_heads, head_dim], and q, k and v hold only this step's prefill tokens. With
-        context.block_tables set, the caller has stored k and v, and every key is read from the pages; without it,
-        k and v hold every key. Writes into out, if given, and returns it.
-        """
-
-    def varlen_with_lse(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
-        causal: bool,
-        host_cu_seqlens: tuple[list[int], list[int]] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Uncached attention, bottom-right aligned, plus its log-sum-exp [num_tokens, num_heads] for merging.
-
-        Only MLA layers call it, to merge chunks of expanded latents. host_cu_seqlens, the two on the host, spares
-        a backend that plans on the host a sync.
-        """
-        raise NotImplementedError(f"the {self.get_name()} backend has no varlen_with_lse, so serves no MLA layer")
-
-    @abstractmethod
-    def decode(
-        self,
-        q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        context: Context,
-        out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Single-query attention against the paged cache. q is [batch_size, num_heads, head_dim]. Writes into out, if
-        given."""
-
     def forward(
         self,
         q: torch.Tensor,
@@ -214,6 +151,64 @@ class AttentionBackend(ABC):
         self.prefill(q[n:], k[n:], v[n:], k_cache, v_cache, prefills, out=out[n:])
         return out
 
+    @abstractmethod
+    def prefill(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        context: Context,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Causal attention over packed varlen sequences, bottom-right aligned.
+
+        q is [num_tokens, num_heads, head_dim], and q, k and v hold only this step's prefill tokens. With
+        context.block_tables set, the caller has stored k and v, and every key is read from the pages; without it,
+        k and v hold every key. Writes into out, if given, and returns it.
+        """
+
+    @abstractmethod
+    def decode(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        context: Context,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Single-query attention against the paged cache. q is [batch_size, num_heads, head_dim]. Writes into out, if
+        given."""
+
+    def store_latents(
+        self,
+        latent: torch.Tensor,
+        latent_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Scatter latents [num_tokens, latent_dim] into the paged cache in place. Slot -1 skips."""
+        raise NotImplementedError(f"the {self.get_name()} backend stores no MLA latents")
+
+    def varlen_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        causal: bool,
+        host_cu_seqlens: tuple[list[int], list[int]] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Uncached attention, bottom-right aligned, plus its log-sum-exp [num_tokens, num_heads] for merging.
+
+        Only MLA layers call it, to merge chunks of expanded latents. host_cu_seqlens, the two on the host, spares
+        a backend that plans on the host a sync.
+        """
+        raise NotImplementedError(f"the {self.get_name()} backend has no varlen_with_lse, so serves no MLA layer")
+
     def mla_decode(
         self,
         q: torch.Tensor,
@@ -228,3 +223,8 @@ class AttentionBackend(ABC):
         Values are each latent's first v_dim entries, so this returns [batch_size * queries, num_heads, v_dim].
         """
         raise NotImplementedError(f"the {self.get_name()} backend has no MLA decode")
+
+    @classmethod
+    def before_full_graph_replay(cls, context: Context, batch_size: int) -> None:
+        """Refresh what the full graph captured at batch_size reads but cannot compute itself, from this step's
+        pure-decode context, before it replays."""

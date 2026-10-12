@@ -82,17 +82,6 @@ class Sequence:
         self.finish_time: float | None = None
         self._extend_block_hashes()
 
-    def metrics(self) -> RequestMetrics:
-        return RequestMetrics(
-            arrival_time=self.arrival_time,
-            num_prompt_tokens=self.num_prompt_tokens,
-            num_completion_tokens=self.num_completion_tokens,
-            num_preemptions=self.num_preemptions,
-            first_scheduled_time=self.first_scheduled_time,
-            first_token_time=self.first_token_time,
-            finish_time=self.finish_time,
-        )
-
     def __len__(self):
         return self.num_tokens
 
@@ -156,6 +145,17 @@ class Sequence:
     def drop_pending(self):
         """Clear token reservations on preemption, abort or finish."""
         self.num_pending_tokens = 0
+
+    def metrics(self) -> RequestMetrics:
+        return RequestMetrics(
+            arrival_time=self.arrival_time,
+            num_prompt_tokens=self.num_prompt_tokens,
+            num_completion_tokens=self.num_completion_tokens,
+            num_preemptions=self.num_preemptions,
+            first_scheduled_time=self.first_scheduled_time,
+            first_token_time=self.first_token_time,
+            finish_time=self.finish_time,
+        )
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids

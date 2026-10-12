@@ -149,11 +149,6 @@ class Scheduler:
 
         return self._with_connector_meta(output)
 
-    def _with_connector_meta(self, output: SchedulerOutput) -> SchedulerOutput:
-        if self.connector is not None:
-            output.kv_connector_metadata = self.connector.build_connector_meta()
-        return output
-
     def _schedule_whole_prompts(self) -> SchedulerOutput:
         """Chunked prefill disabled: whole prompts only, and never mixed with decode."""
         output = SchedulerOutput()
@@ -262,6 +257,11 @@ class Scheduler:
         self.waiting.requeue(seq)
         output.preempted.append(seq)
 
+    def _with_connector_meta(self, output: SchedulerOutput) -> SchedulerOutput:
+        if self.connector is not None:
+            output.kv_connector_metadata = self.connector.build_connector_meta()
+        return output
+
     def _finish(self, seq: Sequence, reason: str):
         seq.status = SequenceStatus.FINISHED
         seq.finish_reason = reason
@@ -273,6 +273,15 @@ class Scheduler:
         del self.seqs[seq.request_id]
         if output is not None:
             output.dropped.append(seq)  # notify the caller that the request has finished, even though it was dropped
+
+    def _free(self, seq: Sequence):
+        """Release a finished request's blocks, unless the connector holds them for a decode instance to read."""
+        if self.connector is not None:
+            hold, seq.kv_transfer_result = self.connector.request_finished(seq)
+            if hold:
+                self.sending[seq.request_id] = seq
+                return
+        self.block_manager.deallocate(seq)
 
     def advance(self, seqs: list[Sequence]) -> list[LaunchedRow]:
         """Update token counts before sampled values reach the host. Return sampling rows in the sampler's order."""
@@ -340,15 +349,6 @@ class Scheduler:
             self._drop(seq, reason)
             self._free(seq)
         return stepped
-
-    def _free(self, seq: Sequence):
-        """Release a finished request's blocks, unless the connector holds them for a decode instance to read."""
-        if self.connector is not None:
-            hold, seq.kv_transfer_result = self.connector.request_finished(seq)
-            if hold:
-                self.sending[seq.request_id] = seq
-                return
-        self.block_manager.deallocate(seq)
 
     def update_from_kv_connector_output(self, kv_output: KVConnectorOutput):
         """Release sent blocks and resume requests after KV loads. Failed loads prefill from the local cached prefix."""

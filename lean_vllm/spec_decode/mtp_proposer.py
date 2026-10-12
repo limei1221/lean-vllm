@@ -75,10 +75,9 @@ class MTPProposer:
         self.buffers = InputBuffers(device)  # its own, so a draft pass never rewrites the target's inputs
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}  # by MTP layer and batch size
 
-    def _draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Greedy drafts; rejection sampling then needs no draft probabilities. Every rank
-        gathers the logits and takes the argmax itself, so no rank waits on another's tokens."""
-        return self.compute_logits(hidden_states).argmax(dim=-1)
+    def compile(self, pool) -> None:
+        """Compile the first pass piecewise, into the target's graph pool; its next call traces."""
+        self.compile_backend = compile_piecewise(self.first_pass, pool)
 
     @torch.inference_mode()
     def propose(
@@ -135,6 +134,11 @@ class MTPProposer:
                 drafts.append(self._draft(hidden_states))
         return torch.stack(drafts, dim=1)
 
+    def _draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy drafts; rejection sampling then needs no draft probabilities. Every rank
+        gathers the logits and takes the argmax itself, so no rank waits on another's tokens."""
+        return self.compute_logits(hidden_states).argmax(dim=-1)
+
     def _run_first_pass(
         self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor, context: Context
     ) -> torch.Tensor:
@@ -159,9 +163,63 @@ class MTPProposer:
             mark_dynamic_tokens(input_ids, positions, hidden_states)
         return self.first_pass(input_ids, positions, hidden_states)
 
-    def compile(self, pool) -> None:
-        """Compile the first pass piecewise, into the target's graph pool; its next call traces."""
-        self.compile_backend = compile_piecewise(self.first_pass, pool)
+    def _step_context(
+        self,
+        sample_positions: torch.Tensor,
+        table: torch.Tensor | None,
+        cu_seqlens_q: torch.Tensor,
+        max_position: int,
+        step: int,
+    ) -> tuple[torch.Tensor, dict]:
+        """One token per sampling row, step positions past its last kept one; as a decode step's context, built on
+        the device, as vLLM's eagle_step_update_slot_mapping_and_metadata. Key lengths have only a bound on the host."""
+        cu_q = list(range(cu_seqlens_q.numel()))
+        # Past max_model_len only for drafts no step would schedule; clamped so the rope cache covers them.
+        positions = (sample_positions + step).clamp_(max=self.max_model_len - 1)
+        context: dict = dict(is_prefill=False, max_seqlen_q=1, cu_seqlens_q=cu_seqlens_q, cu_seqlens_q_host=cu_q)
+        if table is None:  # warmup: no cache, so each token attends itself alone
+            context.update(cu_seqlens_k=cu_seqlens_q, max_seqlen_k=1, cu_seqlens_k_host=cu_q)
+        else:
+            lens = positions + 1
+            blocks = table.gather(1, (positions // self.block_size).unsqueeze(1)).squeeze(1).long()
+            context.update(
+                cu_seqlens_k=torch.nn.functional.pad(lens.cumsum(0), (1, 0)).int(),
+                max_seqlen_k=min(max_position + step, self.max_model_len - 1) + 1,
+                slot_mapping=(blocks * self.block_size + positions % self.block_size).int(),
+                context_lens=lens.int(),
+                block_tables=table,
+            )
+        return positions, context
+
+    def _replay(
+        self,
+        layer: int,
+        bs: int,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        context: Context,
+    ) -> torch.Tensor:
+        """The pass for these rows from the graph of bs rows, as the target's _replay_full; padding rows write no
+        slot and attend nothing."""
+        assert context.slot_mapping is not None and context.context_lens is not None
+        assert context.block_tables is not None
+        graph_vars = self.graph_vars
+        n = input_ids.size(0)
+        graph_vars["input_ids"][:n] = input_ids
+        graph_vars["positions"][:n] = positions
+        graph_vars["hidden_states"][:n] = hidden_states
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:n] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:n] = context.context_lens
+        # Positions stop short of max_model_len, so blocks past the buffer's width are lookahead no pass reads.
+        width = min(context.block_tables.size(1), graph_vars["block_tables"].size(1))
+        graph_vars["block_tables"][:n, :width] = context.block_tables[:, :width]
+        for backend in self.graph_backends:
+            backend.before_full_graph_replay(context, bs)
+        self.graphs[(layer, bs)].replay()
+        return graph_vars["outputs"][:n]
 
     @torch.inference_mode()
     def capture_piecewise(self, size: int) -> None:
@@ -228,61 +286,3 @@ class MTPProposer:
             run()  # a fresh context, so FlashMLA's schedule holder lands in the graph's pool
         torch.cuda.synchronize()
         return graph
-
-    def _replay(
-        self,
-        layer: int,
-        bs: int,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        context: Context,
-    ) -> torch.Tensor:
-        """The pass for these rows from the graph of bs rows, as the target's _replay_full; padding rows write no
-        slot and attend nothing."""
-        assert context.slot_mapping is not None and context.context_lens is not None
-        assert context.block_tables is not None
-        graph_vars = self.graph_vars
-        n = input_ids.size(0)
-        graph_vars["input_ids"][:n] = input_ids
-        graph_vars["positions"][:n] = positions
-        graph_vars["hidden_states"][:n] = hidden_states
-        graph_vars["slot_mapping"].fill_(-1)
-        graph_vars["slot_mapping"][:n] = context.slot_mapping
-        graph_vars["context_lens"].zero_()
-        graph_vars["context_lens"][:n] = context.context_lens
-        # Positions stop short of max_model_len, so blocks past the buffer's width are lookahead no pass reads.
-        width = min(context.block_tables.size(1), graph_vars["block_tables"].size(1))
-        graph_vars["block_tables"][:n, :width] = context.block_tables[:, :width]
-        for backend in self.graph_backends:
-            backend.before_full_graph_replay(context, bs)
-        self.graphs[(layer, bs)].replay()
-        return graph_vars["outputs"][:n]
-
-    def _step_context(
-        self,
-        sample_positions: torch.Tensor,
-        table: torch.Tensor | None,
-        cu_seqlens_q: torch.Tensor,
-        max_position: int,
-        step: int,
-    ) -> tuple[torch.Tensor, dict]:
-        """One token per sampling row, step positions past its last kept one; as a decode step's context, built on
-        the device, as vLLM's eagle_step_update_slot_mapping_and_metadata. Key lengths have only a bound on the host."""
-        cu_q = list(range(cu_seqlens_q.numel()))
-        # Past max_model_len only for drafts no step would schedule; clamped so the rope cache covers them.
-        positions = (sample_positions + step).clamp_(max=self.max_model_len - 1)
-        context: dict = dict(is_prefill=False, max_seqlen_q=1, cu_seqlens_q=cu_seqlens_q, cu_seqlens_q_host=cu_q)
-        if table is None:  # warmup: no cache, so each token attends itself alone
-            context.update(cu_seqlens_k=cu_seqlens_q, max_seqlen_k=1, cu_seqlens_k_host=cu_q)
-        else:
-            lens = positions + 1
-            blocks = table.gather(1, (positions // self.block_size).unsqueeze(1)).squeeze(1).long()
-            context.update(
-                cu_seqlens_k=torch.nn.functional.pad(lens.cumsum(0), (1, 0)).int(),
-                max_seqlen_k=min(max_position + step, self.max_model_len - 1) + 1,
-                slot_mapping=(blocks * self.block_size + positions % self.block_size).int(),
-                context_lens=lens.int(),
-                block_tables=table,
-            )
-        return positions, context

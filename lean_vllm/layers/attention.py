@@ -229,12 +229,12 @@ class MLAAttention(Attention):
     def output_shape(self, num_tokens: int) -> tuple[int, ...]:
         return (num_tokens, self.num_heads, self.v_head_dim)
 
-    def use_cascade_attention(self, common_prefix_len: int, query_lens: np.ndarray) -> bool:
-        return False  # it attends through mla_decode and _prefill, which have no cascade path
-
     def supports_full_cudagraph(self) -> bool:
         # Decode must attend latents, as expanding them needs the step's host plan, and be safe to replay.
         return self.backend.supports_mla_decode() and self.backend.supports_full_cudagraph_mla_decode()
+
+    def use_cascade_attention(self, common_prefix_len: int, query_lens: np.ndarray) -> bool:
+        return False  # it attends through mla_decode and _prefill, which have no cascade path
 
     def forward(self, q: torch.Tensor, latent: torch.Tensor):  # type: ignore[override]
         out = q.new_empty(self.output_shape(q.size(0)))

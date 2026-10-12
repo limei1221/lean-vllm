@@ -65,6 +65,18 @@ class FlashInferBackend(AttentionBackend):
     def decode(self, q, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
         return self._planned("decode", q, k_cache.dtype, context, k_cache.size(1)).run(q, (k_cache, v_cache), out=out)
 
+    @classmethod
+    def before_full_graph_replay(cls, context: Context, batch_size: int) -> None:
+        """Re-plan the decode wrappers the graph at batch_size captured, for this step's rows.
+        Their page tables are the graph's buffers, so the replay reads the new plan."""
+        pages = {}
+        for key, wrapper in cls._wrappers.items():
+            if key[0] == "decode" and key[-1] == batch_size:
+                page_size = key[7]
+                if page_size not in pages:
+                    pages[page_size] = cls._pages(context, page_size, batch_size)
+                _plan_decode(wrapper, key, pages[page_size])
+
     def _planned_ragged(self, q: torch.Tensor, k: torch.Tensor, context: Context):
         """A causal ragged wrapper per layer shape, re-planned only when this step's lengths differ from its plan's."""
         cu_q = _host_cumulative(context.cu_seqlens_q_host, context.cu_seqlens_q)
@@ -122,18 +134,6 @@ class FlashInferBackend(AttentionBackend):
             wrapper.plan(qo_indptr, indptr, indices, last_page_len, *shape, page_size, causal=True, **options)
         context.attn_metadata[key] = wrapper
         return wrapper
-
-    @classmethod
-    def before_full_graph_replay(cls, context: Context, batch_size: int) -> None:
-        """Re-plan the decode wrappers the graph at batch_size captured, for this step's rows.
-        Their page tables are the graph's buffers, so the replay reads the new plan."""
-        pages = {}
-        for key, wrapper in cls._wrappers.items():
-            if key[0] == "decode" and key[-1] == batch_size:
-                page_size = key[7]
-                if page_size not in pages:
-                    pages[page_size] = cls._pages(context, page_size, batch_size)
-                _plan_decode(wrapper, key, pages[page_size])
 
     @staticmethod
     def _workspace_for(device: torch.device) -> torch.Tensor:

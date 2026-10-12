@@ -196,51 +196,16 @@ class ModelRunner:
         if self.world_size > 1 and rank > 0:
             self.loop()
 
-    def exit(self):
-        if self.kv_connector is not None:
-            self.kv_connector.shutdown()
-        if self.world_size > 1:
-            dist.barrier()  # sync ranks
-        if self.cudagraph_mode != "none":
-            for piece in self.compile_backend.pieces:
-                piece.graphs.clear()
-            if self.proposer is not None:
-                self.proposer.graphs.clear()
-                if self.proposer.compile_backend is not None:
-                    for piece in self.proposer.compile_backend.pieces:
-                        piece.graphs.clear()
-            del self.graphs, self.graph_pool
-        dev.synchronize(self.device)  # wait for pending device work
-        dist.destroy_process_group()  # close distributed communication
+    @staticmethod
+    def _cudagraph_mode(mode: str, layers: list[Attention]) -> str:
+        """Choose a graph mode supported by every attention layer.
 
-    def loop(self):
-        while True:
-            call = [None, None]
-            dist.broadcast_object_list(call, src=0, group=self.call_group)
-            method_name, args = call
-            self.call(method_name, *args)
-            if method_name == "exit":
-                break
-
-    def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
-            dist.broadcast_object_list([method_name, args], src=0, group=self.call_group)
-        method = getattr(self, method_name, None)
-        return method(*args)
-
-    def kv_connector_step(self, metadata: KVConnectorMetadata) -> KVConnectorOutput | None:
-        """Start KV loads, make outgoing blocks available, and collect completed transfers across ranks.
-
-        Rank 0 reports transfers completed on every rank; other ranks return None.
+        Full graphs include attention. If any layer cannot be captured, use piecewise graphs when the requested
+        mode allows them; otherwise disable graphs. Piecewise graphs leave attention outside graph capture.
         """
-        assert self.kv_connector is not None
-        self.kv_connector.start_load_kv(metadata)
-        output = self.kv_connector.get_finished()
-        if self.world_size == 1:
-            return output
-        outputs: list | None = [None] * self.world_size if self.rank == 0 else None
-        dist.gather_object(output, outputs, dst=0, group=self.call_group)
-        return self.kv_aggregator.aggregate(outputs) if outputs is not None else None
+        if mode in FULL_MODES and not all(layer.supports_full_cudagraph() for layer in layers):
+            return "piecewise" if mode in PIECEWISE_MODES else "none"
+        return mode
 
     def compile_model(self):
         """Set up whole-model tracing and Inductor compilation for pieces split at attention ops.
@@ -311,6 +276,66 @@ class ModelRunner:
         ]
         for layer, cache in zip(layers, self.kv_cache):
             layer.bind_kv_cache(cache)
+
+    def loop(self):
+        while True:
+            call = [None, None]
+            dist.broadcast_object_list(call, src=0, group=self.call_group)
+            method_name, args = call
+            self.call(method_name, *args)
+            if method_name == "exit":
+                break
+
+    def call(self, method_name, *args):
+        if self.world_size > 1 and self.rank == 0:
+            dist.broadcast_object_list([method_name, args], src=0, group=self.call_group)
+        method = getattr(self, method_name, None)
+        return method(*args)
+
+    def exit(self):
+        if self.kv_connector is not None:
+            self.kv_connector.shutdown()
+        if self.world_size > 1:
+            dist.barrier()  # sync ranks
+        if self.cudagraph_mode != "none":
+            for piece in self.compile_backend.pieces:
+                piece.graphs.clear()
+            if self.proposer is not None:
+                self.proposer.graphs.clear()
+                if self.proposer.compile_backend is not None:
+                    for piece in self.proposer.compile_backend.pieces:
+                        piece.graphs.clear()
+            del self.graphs, self.graph_pool
+        dev.synchronize(self.device)  # wait for pending device work
+        dist.destroy_process_group()  # close distributed communication
+
+    def run(self, seqs: list[Sequence]) -> SampledTokens:
+        """Prepare inputs, run the model, and sample tokens. Return SampledTokens for the engine to fetch later."""
+        with record_function("prepare_batch"):
+            input_ids, positions, temperatures, context = self.prepare_batch(seqs)
+        with set_context(**context):
+            with record_function("run_model"):
+                logits = self.run_model(input_ids, positions, context["is_prefill"])
+            with record_function("sample"):
+                if self.proposer is not None:
+                    verified = self._verify(logits, temperatures)
+                    tokens = None
+                else:
+                    # Every rank samples, from the same logits and seed, so each can feed the next step itself.
+                    tokens = self.sampler(logits, temperatures, *self._top_k_top_p)
+        if self.proposer is not None:
+            with record_function("propose"):
+                num_accepted = (verified >= 0).sum(dim=1) - 1
+                next_token_ids = verified.gather(1, num_accepted.unsqueeze(1)).squeeze(1)
+                drafts = self.proposer.propose(
+                    self._draft_inputs, context, self._hidden_states, num_accepted, next_token_ids
+                )
+            self.in_flight_drafts = InFlightDrafts(next_token_ids, drafts, self._spec_inputs[1] - num_accepted)
+            tokens = torch.cat([verified, drafts], dim=1)
+        pending = SampledTokens(tokens, self.device)
+        self._prev_tokens = pending
+        self._prev_rows = {seq.seq_id: i for i, seq in enumerate(self._sampling_rows)}
+        return pending
 
     @property
     def input_buffers(self) -> InputBuffers:
@@ -492,6 +517,12 @@ class ModelRunner:
         self._sampling_rows = sampling_rows
         return input_ids, positions_t, temperatures, context
 
+    def _prev_row(self, seq: Sequence) -> int:
+        """Return this sequence's sampling row in the previous step."""
+        row = self._prev_rows.get(seq.seq_id) if self._prev_rows else None
+        assert row is not None, "a pending token but no row in the launched step"
+        return row
+
     def _move_back(
         self,
         context: dict,
@@ -546,23 +577,6 @@ class ModelRunner:
         lens = np.array([seq.num_scheduled_tokens for seq in seqs], np.int64)
         query_len = decode_query_len(lens, num_speculative_tokens)
         return sorted(seqs, key=lambda seq: seq.num_scheduled_tokens != query_len)
-
-    def _prev_row(self, seq: Sequence) -> int:
-        """Return this sequence's sampling row in the previous step."""
-        row = self._prev_rows.get(seq.seq_id) if self._prev_rows else None
-        assert row is not None, "a pending token but no row in the launched step"
-        return row
-
-    @staticmethod
-    def _cudagraph_mode(mode: str, layers: list[Attention]) -> str:
-        """Choose a graph mode supported by every attention layer.
-
-        Full graphs include attention. If any layer cannot be captured, use piecewise graphs when the requested
-        mode allows them; otherwise disable graphs. Piecewise graphs leave attention outside graph capture.
-        """
-        if mode in FULL_MODES and not all(layer.supports_full_cudagraph() for layer in layers):
-            return "piecewise" if mode in PIECEWISE_MODES else "none"
-        return mode
 
     def _step_kind(self, is_prefill: bool, num_tokens: int, cascade: bool = False, query_len: int = 1) -> str:
         """Return "graph", "piecewise", or a label explaining why this step runs without a graph.
@@ -637,34 +651,6 @@ class ModelRunner:
         context.piecewise_size, context.num_actual_tokens = bucket, num_tokens
         return self.model(buffers["input_ids"][:bucket], buffers["positions"][:bucket])[:num_tokens]
 
-    def run(self, seqs: list[Sequence]) -> SampledTokens:
-        """Prepare inputs, run the model, and sample tokens. Return SampledTokens for the engine to fetch later."""
-        with record_function("prepare_batch"):
-            input_ids, positions, temperatures, context = self.prepare_batch(seqs)
-        with set_context(**context):
-            with record_function("run_model"):
-                logits = self.run_model(input_ids, positions, context["is_prefill"])
-            with record_function("sample"):
-                if self.proposer is not None:
-                    verified = self._verify(logits, temperatures)
-                    tokens = None
-                else:
-                    # Every rank samples, from the same logits and seed, so each can feed the next step itself.
-                    tokens = self.sampler(logits, temperatures, *self._top_k_top_p)
-        if self.proposer is not None:
-            with record_function("propose"):
-                num_accepted = (verified >= 0).sum(dim=1) - 1
-                next_token_ids = verified.gather(1, num_accepted.unsqueeze(1)).squeeze(1)
-                drafts = self.proposer.propose(
-                    self._draft_inputs, context, self._hidden_states, num_accepted, next_token_ids
-                )
-            self.in_flight_drafts = InFlightDrafts(next_token_ids, drafts, self._spec_inputs[1] - num_accepted)
-            tokens = torch.cat([verified, drafts], dim=1)
-        pending = SampledTokens(tokens, self.device)
-        self._prev_tokens = pending
-        self._prev_rows = {seq.seq_id: i for i, seq in enumerate(self._sampling_rows)}
-        return pending
-
     def _verify(self, logits: torch.Tensor, temperatures: torch.Tensor | None) -> torch.Tensor:
         """Return accepted drafts and the next token for each sampling row, padded with -1.
 
@@ -677,25 +663,25 @@ class ModelRunner:
             logits, draft_token_ids, num_draft_tokens, temperatures, self.num_speculative_tokens, *self._top_k_top_p
         )
 
-    @torch.inference_mode()
-    def capture_piecewise(self):
-        """Run each bucket from largest to smallest, capturing each piece's graph for that bucket."""
-        self.piecewise_bs = cudagraph_capture_sizes(self.config.max_num_seqs, self.config.max_num_batched_tokens)
-        largest = self.piecewise_bs[-1]
-        input_ids = torch.zeros(largest, dtype=torch.int64)
-        positions = torch.zeros(largest, dtype=torch.int64)
-        self.piecewise_vars = dict(input_ids=input_ids, positions=positions)
-        for size in reversed(self.piecewise_bs):
-            # Run attention eagerly between graph pieces, using a fresh prompt with cache writes disabled.
-            seq = Sequence([0] * size)
-            seq.num_scheduled_tokens = size
-            _, _, _, context = self.prepare_batch([seq])
-            context["slot_mapping"] = torch.full((size,), -1, dtype=torch.int32)
-            with set_context(**context, piecewise_size=size):
-                self.model(input_ids[:size], positions[:size])
-                if self.proposer is not None:  # the drafter's first pass uses the target's batch and bucket sizes
-                    self.proposer.capture_piecewise(size)
-            torch.cuda.synchronize()
+    def kv_connector_step(self, metadata: KVConnectorMetadata) -> KVConnectorOutput | None:
+        """Start KV loads, make outgoing blocks available, and collect completed transfers across ranks.
+
+        Rank 0 reports transfers completed on every rank; other ranks return None.
+        """
+        assert self.kv_connector is not None
+        self.kv_connector.start_load_kv(metadata)
+        output = self.kv_connector.get_finished()
+        if self.world_size == 1:
+            return output
+        outputs: list | None = [None] * self.world_size if self.rank == 0 else None
+        dist.gather_object(output, outputs, dst=0, group=self.call_group)
+        return self.kv_aggregator.aggregate(outputs) if outputs is not None else None
+
+    def _decode_graph_sizes(self) -> list[int]:
+        """Return candidate full decode graph sizes in sequence rows, capped at max_num_seqs."""
+        config = self.config
+        sizes = cudagraph_capture_sizes(config.max_num_seqs, config.max_num_batched_tokens)
+        return [size for size in sizes if size <= config.max_num_seqs]
 
     def _max_num_blocks(self) -> int:
         """Return the block-table width needed for max_model_len plus speculative token slots.
@@ -703,12 +689,6 @@ class ModelRunner:
         Include the extra slots because a row may still hold blocks allocated for rejected drafts.
         """
         return (self.config.max_model_len + self.num_speculative_tokens + self.block_size - 1) // self.block_size
-
-    def _decode_graph_sizes(self) -> list[int]:
-        """Return candidate full decode graph sizes in sequence rows, capped at max_num_seqs."""
-        config = self.config
-        sizes = cudagraph_capture_sizes(config.max_num_seqs, config.max_num_batched_tokens)
-        return [size for size in sizes if size <= config.max_num_seqs]
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -768,3 +748,23 @@ class ModelRunner:
             run()
         torch.cuda.synchronize()
         return graph
+
+    @torch.inference_mode()
+    def capture_piecewise(self):
+        """Run each bucket from largest to smallest, capturing each piece's graph for that bucket."""
+        self.piecewise_bs = cudagraph_capture_sizes(self.config.max_num_seqs, self.config.max_num_batched_tokens)
+        largest = self.piecewise_bs[-1]
+        input_ids = torch.zeros(largest, dtype=torch.int64)
+        positions = torch.zeros(largest, dtype=torch.int64)
+        self.piecewise_vars = dict(input_ids=input_ids, positions=positions)
+        for size in reversed(self.piecewise_bs):
+            # Run attention eagerly between graph pieces, using a fresh prompt with cache writes disabled.
+            seq = Sequence([0] * size)
+            seq.num_scheduled_tokens = size
+            _, _, _, context = self.prepare_batch([seq])
+            context["slot_mapping"] = torch.full((size,), -1, dtype=torch.int32)
+            with set_context(**context, piecewise_size=size):
+                self.model(input_ids[:size], positions[:size])
+                if self.proposer is not None:  # the drafter's first pass uses the target's batch and bucket sizes
+                    self.proposer.capture_piecewise(size)
+            torch.cuda.synchronize()
