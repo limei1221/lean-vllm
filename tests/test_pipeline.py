@@ -1,6 +1,7 @@
 """The pipelined step loop: one step in flight, the previous one draining."""
 
 import pytest
+from conftest import by_label, total
 
 from lean_vllm.sampling_params import SamplingParams
 
@@ -106,7 +107,7 @@ class TestAsyncScheduling:
             for i in range(3):
                 engine.add(list(range(24)), params, request_id=f"r{i}")
                 engine.run_to_completion()
-            rates.append((engine.metrics.prefix_cache_hits.total, engine.metrics.prefix_cache_queries.total))
+            rates.append((total(engine.metrics.prefix_cache_hits), total(engine.metrics.prefix_cache_queries)))
         assert rates[0] == rates[1]
 
 
@@ -128,7 +129,7 @@ def test_a_capacity_drop_after_a_token_finishes_once(make_engine, async_scheduli
     while not engine.is_finished():
         finals += [output for output in engine.step() if output.finished]
     assert [output.finish_reason for output in finals] == ["capacity"]
-    assert engine.metrics.requests_finished.values == {"capacity": 1}
+    assert by_label(engine.metrics.requests_finished) == {"capacity": 1}
     assert seq.num_completion_tokens == 2
 
 

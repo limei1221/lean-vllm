@@ -1,6 +1,7 @@
 """Disaggregated prefill in the scheduler: what each side admits, holds and frees, with the transfers faked."""
 
 import pytest
+from conftest import observed, total
 
 from lean_vllm.engine.scheduler import DuplicateRequestId
 from lean_vllm.engine.sequence import SequenceStatus
@@ -245,7 +246,7 @@ def test_a_load_counts_as_waiting(make_disagg_engine):
     engine = make_disagg_engine()
     engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params=remote_prefill()), "d-1")
     engine.step()
-    assert engine.metrics.waiting.value == 1 and engine.metrics.running.value == 0
+    assert total(engine.metrics.waiting) == 1 and total(engine.metrics.running) == 0
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
@@ -295,7 +296,7 @@ class TestMetrics:
         )
         engine.step()
         metrics = engine.metrics
-        assert metrics.kv_transfers.total == 1
-        assert (metrics.kv_transfer_failures.total, metrics.kv_transfer_expired.total) == (1, 1)
-        assert (metrics.kv_transfer_time.sum, metrics.kv_transfer_bytes.sum) == (0.25, 4096)
+        assert total(metrics.kv_transfers) == 1
+        assert (total(metrics.kv_transfer_failures), total(metrics.kv_transfer_expired)) == (1, 1)
+        assert (observed(metrics.kv_transfer_time, "_sum"), observed(metrics.kv_transfer_bytes, "_sum")) == (0.25, 4096)
         assert "lean_vllm:kv_transfers_total 1" in metrics.render()

@@ -19,6 +19,7 @@ from time import perf_counter
 import httpx
 import numpy as np
 from openai import AsyncOpenAI
+from prometheus_client.parser import text_string_to_metric_families
 
 PERCENTILES = (50, 90, 95, 99)
 
@@ -301,10 +302,10 @@ async def server_metrics(http: httpx.AsyncClient, base_url: str) -> dict[str, fl
     if response.status_code != 200:
         return None
     samples = {}
-    for line in response.text.splitlines():
-        if line and not line.startswith("#"):
-            name, _, value = line.rpartition(" ")
-            samples[name] = float(value)
+    for family in text_string_to_metric_families(response.text):
+        for sample in family.samples:
+            labels = ",".join(f'{key}="{value}"' for key, value in sample.labels.items())
+            samples[f"{sample.name}{{{labels}}}" if labels else sample.name] = sample.value
     return samples
 
 

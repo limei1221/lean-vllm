@@ -6,6 +6,10 @@ count blocks where vLLM's count tokens, so only their ratio compares.
 
 import threading
 
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, disable_created_metrics, generate_latest
+
+disable_created_metrics()  # no _created series beside each counter and histogram
+
 INF = float("inf")
 
 # Step kinds that replayed a graph; the rest ran without one, as "prefill", "decode" or "enforced".
@@ -21,160 +25,86 @@ TRANSFER_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.2, 0.3, 0.5, 0.75, 1
 BYTE_BUCKETS = tuple(2 ** (10 + i) for i in range(1, 25, 2)) + (INF,)
 
 
-def _number(value: float) -> str:
-    if value == INF:
-        return "+Inf"
-    return str(int(value)) if float(value).is_integer() else repr(value)
-
-
-class _Metric:
-    kind = ""
-
-    def __init__(self, name: str, documentation: str):
-        self.name = name
-        self.documentation = documentation
-
-    def render(self) -> list[str]:
-        raise NotImplementedError
-
-    def _header(self) -> list[str]:
-        return [f"# HELP {self.name} {self.documentation}", f"# TYPE {self.name} {self.kind}"]
-
-
-class Counter(_Metric):
-    """A monotonic total, optionally broken out by one label."""
-
-    kind = "counter"
-
-    def __init__(self, name: str, documentation: str, label: str | None = None):
-        super().__init__(name, documentation)
-        self.label = label
-        self.values: dict[str | None, float] = {} if label else {None: 0}
-
-    def inc(self, amount: float = 1, label_value: str | None = None):
-        self.values[label_value] = self.values.get(label_value, 0) + amount
-
-    @property
-    def total(self) -> float:
-        return sum(self.values.values())
-
-    def render(self) -> list[str]:
-        lines = self._header()
-        for label_value, value in sorted(self.values.items(), key=lambda kv: kv[0] or ""):
-            suffix = f'{{{self.label}="{label_value}"}}' if label_value is not None else ""
-            lines.append(f"{self.name}{suffix} {_number(value)}")
-        return lines
-
-
-class Gauge(_Metric):
-    kind = "gauge"
-
-    def __init__(self, name: str, documentation: str):
-        super().__init__(name, documentation)
-        self.value: float = 0.0
-
-    def set(self, value: float):
-        self.value = value
-
-    def render(self) -> list[str]:
-        return self._header() + [f"{self.name} {_number(self.value)}"]
-
-
-class Histogram(_Metric):
-    kind = "histogram"
-
-    def __init__(self, name: str, documentation: str, buckets: tuple[float, ...]):
-        super().__init__(name, documentation)
-        self.buckets = buckets
-        self.counts = [0] * len(buckets)
-        self.sum = 0.0
-        self.count = 0
-
-    def observe(self, value: float):
-        self.sum += value
-        self.count += 1
-        for i, bound in enumerate(self.buckets):
-            if value <= bound:
-                self.counts[i] += 1
-
-    def render(self) -> list[str]:
-        lines = self._header()
-        for bound, count in zip(self.buckets, self.counts):
-            lines.append(f'{self.name}_bucket{{le="{_number(bound)}"}} {count}')
-        lines.append(f"{self.name}_sum {self.sum!r}")
-        lines.append(f"{self.name}_count {self.count}")
-        return lines
-
-
 class Metrics:
     def __init__(self):
-        self.lock = threading.Lock()  # so a render never catches a histogram mid-update
+        self.lock = threading.Lock()  # so a render never catches a step half recorded
+        self.registry = CollectorRegistry()  # one per engine, so several in one process do not clash
+        registry = self.registry
 
-        self.running = Gauge("lean_vllm:num_requests_running", "Requests in the running set.")
-        self.waiting = Gauge("lean_vllm:num_requests_waiting", "Requests in the waiting queue.")
-        self.kv_usage = Gauge("lean_vllm:kv_cache_usage_perc", "Fraction of KV blocks in use.")
+        def counter(name: str, documentation: str, label: str | None = None) -> Counter:
+            return Counter(name, documentation, [label] if label else (), registry=registry)
 
-        self.requests_received = Counter("lean_vllm:num_requests_received_total", "Requests admitted.")
-        self.requests_aborted = Counter("lean_vllm:num_requests_aborted_total", "Requests cancelled by their client.")
-        self.requests_finished = Counter(
+        def gauge(name: str, documentation: str) -> Gauge:
+            return Gauge(name, documentation, registry=registry)
+
+        def histogram(name: str, documentation: str, buckets: tuple[float, ...]) -> Histogram:
+            return Histogram(name, documentation, buckets=buckets, registry=registry)
+
+        self.running = gauge("lean_vllm:num_requests_running", "Requests in the running set.")
+        self.waiting = gauge("lean_vllm:num_requests_waiting", "Requests in the waiting queue.")
+        self.kv_usage = gauge("lean_vllm:kv_cache_usage_perc", "Fraction of KV blocks in use.")
+
+        self.requests_received = counter("lean_vllm:num_requests_received_total", "Requests admitted.")
+        self.requests_aborted = counter("lean_vllm:num_requests_aborted_total", "Requests cancelled by their client.")
+        self.requests_finished = counter(
             "lean_vllm:request_success_total", "Requests that ran to a finish.", label="finished_reason"
         )
-        self.preemptions = Counter("lean_vllm:num_preemptions_total", "Sequences preempted to free blocks.")
+        self.preemptions = counter("lean_vllm:num_preemptions_total", "Sequences preempted to free blocks.")
 
-        self.prompt_tokens = Counter("lean_vllm:prompt_tokens_total", "Prompt tokens of finished requests.")
-        self.generation_tokens = Counter("lean_vllm:generation_tokens_total", "Tokens generated by finished requests.")
-        self.prefill_tokens = Counter("lean_vllm:prefill_tokens_total", "Prompt tokens run through the model.")
-        self.decode_tokens = Counter(
+        self.prompt_tokens = counter("lean_vllm:prompt_tokens_total", "Prompt tokens of finished requests.")
+        self.generation_tokens = counter("lean_vllm:generation_tokens_total", "Tokens generated by finished requests.")
+        self.prefill_tokens = counter("lean_vllm:prefill_tokens_total", "Prompt tokens run through the model.")
+        self.decode_tokens = counter(
             "lean_vllm:decode_tokens_total", "Decode tokens run through the model, drafts included."
         )
 
-        self.prefix_cache_queries = Counter("lean_vllm:prefix_cache_queries_total", "Blocks looked up at admission.")
-        self.prefix_cache_hits = Counter("lean_vllm:prefix_cache_hits_total", "Blocks the prefix cache supplied.")
+        self.prefix_cache_queries = counter("lean_vllm:prefix_cache_queries_total", "Blocks looked up at admission.")
+        self.prefix_cache_hits = counter("lean_vllm:prefix_cache_hits_total", "Blocks the prefix cache supplied.")
 
-        self.steps = Counter("lean_vllm:num_steps_total", "Forward passes.")
-        self.graph_steps = Counter("lean_vllm:num_graph_steps_total", "Forward passes replayed from a CUDA graph.")
-        self.eager_steps = Counter(
+        self.steps = counter("lean_vllm:num_steps_total", "Forward passes.")
+        self.graph_steps = counter("lean_vllm:num_graph_steps_total", "Forward passes replayed from a CUDA graph.")
+        self.eager_steps = counter(
             "lean_vllm:num_eager_steps_total", "Forward passes no CUDA graph covered.", label="reason"
         )
         # Share of the clock, not the count: eager steps take longer each.
-        self.step_seconds = Counter("lean_vllm:step_seconds_total", "Time in forward passes.", label="kind")
-        self.model_busy = Counter("lean_vllm:model_busy_seconds_total", "Wall seconds spent inside a step.")
+        self.step_seconds = counter("lean_vllm:step_seconds_total", "Time in forward passes.", label="kind")
+        self.model_busy = counter("lean_vllm:model_busy_seconds_total", "Wall seconds spent inside a step.")
 
-        self.ttft = Histogram("lean_vllm:time_to_first_token_seconds", "Arrival to first token.", LATENCY_BUCKETS)
-        self.tpot = Histogram(
+        self.ttft = histogram("lean_vllm:time_to_first_token_seconds", "Arrival to first token.", LATENCY_BUCKETS)
+        self.tpot = histogram(
             "lean_vllm:request_time_per_output_token_seconds", "Mean seconds per token after the first.", TPOT_BUCKETS
         )
-        self.queue_time = Histogram(
+        self.queue_time = histogram(
             "lean_vllm:request_queue_time_seconds", "Arrival to first schedule.", LATENCY_BUCKETS
         )
-        self.e2e = Histogram("lean_vllm:e2e_request_latency_seconds", "Arrival to finish.", LATENCY_BUCKETS)
-        self.request_prompt_tokens = Histogram("lean_vllm:request_prompt_tokens", "Prompt length.", TOKEN_BUCKETS)
-        self.request_generation_tokens = Histogram(
+        self.e2e = histogram("lean_vllm:e2e_request_latency_seconds", "Arrival to finish.", LATENCY_BUCKETS)
+        self.request_prompt_tokens = histogram("lean_vllm:request_prompt_tokens", "Prompt length.", TOKEN_BUCKETS)
+        self.request_generation_tokens = histogram(
             "lean_vllm:request_generation_tokens", "Completion length.", TOKEN_BUCKETS
         )
-        self.step_duration = Histogram("lean_vllm:step_duration_seconds", "Wall time of one step.", STEP_BUCKETS)
-        self.iteration_tokens = Histogram(
+        self.step_duration = histogram("lean_vllm:step_duration_seconds", "Wall time of one step.", STEP_BUCKETS)
+        self.iteration_tokens = histogram(
             "lean_vllm:iteration_tokens_total", "Tokens in one step's batch.", BATCH_BUCKETS
         )
 
         # Disaggregated prefill: the decode instance's loads, and the prefill instance's blocks nobody read.
-        self.kv_transfers = Counter("lean_vllm:kv_transfers_total", "KV loads finished.")
-        self.kv_transfer_failures = Counter(
+        self.kv_transfers = counter("lean_vllm:kv_transfers_total", "KV loads finished.")
+        self.kv_transfer_failures = counter(
             "lean_vllm:kv_transfer_failures_total", "KV loads that failed, so the prompt prefilled here."
         )
-        self.kv_transfer_expired = Counter(
+        self.kv_transfer_expired = counter(
             "lean_vllm:kv_transfer_expired_total", "Held KV blocks freed with no decode instance reading them."
         )
-        self.kv_transfer_time = Histogram(
+        self.kv_transfer_time = histogram(
             "lean_vllm:kv_transfer_time_seconds", "Read to blocks landed, per load, slowest rank.", TRANSFER_BUCKETS
         )
-        self.kv_transfer_bytes = Histogram("lean_vllm:kv_transfer_bytes", "Bytes per load, all ranks.", BYTE_BUCKETS)
+        self.kv_transfer_bytes = histogram("lean_vllm:kv_transfer_bytes", "Bytes per load, all ranks.", BYTE_BUCKETS)
 
         # Speculative decoding: a draft is one row's drafts in one step.
-        self.spec_drafts = Counter("lean_vllm:spec_decode_num_drafts_total", "Rows that verified drafts.")
-        self.spec_draft_tokens = Counter("lean_vllm:spec_decode_num_draft_tokens_total", "Draft tokens verified.")
-        self.spec_accepted_tokens = Counter("lean_vllm:spec_decode_num_accepted_tokens_total", "Draft tokens kept.")
-        self.spec_accepted_per_pos = Counter(
+        self.spec_drafts = counter("lean_vllm:spec_decode_num_drafts_total", "Rows that verified drafts.")
+        self.spec_draft_tokens = counter("lean_vllm:spec_decode_num_draft_tokens_total", "Draft tokens verified.")
+        self.spec_accepted_tokens = counter("lean_vllm:spec_decode_num_accepted_tokens_total", "Draft tokens kept.")
+        self.spec_accepted_per_pos = counter(
             "lean_vllm:spec_decode_num_accepted_tokens_per_pos_total", "Draft tokens kept, by place.", label="position"
         )
 
@@ -196,8 +126,8 @@ class Metrics:
                 if step_kind in GRAPH_KINDS:
                     self.graph_steps.inc()
                 else:
-                    self.eager_steps.inc(label_value=step_kind)
-                self.step_seconds.inc(duration, label_value=step_kind)
+                    self.eager_steps.labels(step_kind).inc()
+                self.step_seconds.labels(step_kind).inc(duration)
                 self.model_busy.inc(duration)
                 self.step_duration.observe(duration)
                 self.iteration_tokens.observe(output.num_prefill_tokens + output.num_decode_tokens)
@@ -234,10 +164,10 @@ class Metrics:
                 self.spec_draft_tokens.inc(row.num_draft_tokens)
                 self.spec_accepted_tokens.inc(num_accepted)
                 for position in range(num_accepted):
-                    self.spec_accepted_per_pos.inc(label_value=str(position))
+                    self.spec_accepted_per_pos.labels(str(position)).inc()
 
     def _record_finished(self, request_output):
-        self.requests_finished.inc(label_value=request_output.finish_reason)
+        self.requests_finished.labels(request_output.finish_reason).inc()
         metrics = request_output.metrics
         if metrics is None:
             return
@@ -257,8 +187,4 @@ class Metrics:
     def render(self) -> str:
         """Prometheus text exposition format."""
         with self.lock:
-            lines = []
-            for metric in vars(self).values():
-                if isinstance(metric, _Metric):
-                    lines += metric.render()
-            return "\n".join(lines) + "\n"
+            return generate_latest(self.registry).decode()

@@ -14,6 +14,7 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "einops",
     "numpy",    # the runner's batch preparation
+    "prometheus-client",    # the engine's /metrics
     "safetensors",
     "tokenizers>=0.22",    # DecodeStream(ids=), for the fast detokenizer
     "torch>=2.10",    # F.grouped_mm, which the routed experts fall back on, is public from 2.10

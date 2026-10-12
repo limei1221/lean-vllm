@@ -5,7 +5,7 @@ from itertools import count
 
 import pytest
 import torch
-from conftest import EOS, FakeConfig, FakeEngine, FakeModelRunner, FakeSampledTokens
+from conftest import EOS, FakeConfig, FakeEngine, FakeModelRunner, FakeSampledTokens, total
 
 from lean_vllm.config import Config
 from lean_vllm.engine.block_manager import BlockManager
@@ -173,8 +173,8 @@ class TestScheduler:
         assert len(engine.model_runner.batches) < len(plain.model_runner.batches)
         assert engine.model_runner.lookahead_short == 0
         if num_kvcache_blocks == 9:
-            assert engine.metrics.preemptions.total
-        assert 0 < engine.metrics.spec_accepted_tokens.total < engine.metrics.spec_draft_tokens.total
+            assert total(engine.metrics.preemptions)
+        assert 0 < total(engine.metrics.spec_accepted_tokens) < total(engine.metrics.spec_draft_tokens)
 
     def test_a_stop_among_the_kept_drafts_ends_the_request_there(self, make_engine, async_scheduling):
         engine = make_drafting_engine(3, eos_after={"req-0": 6}, async_scheduling=async_scheduling)

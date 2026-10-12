@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("zmq", reason="the serve extra is not installed")
 
-from conftest import FakeConfig, FakeLLMEngine, FakeModelRunner, asyncio_test
+from conftest import FakeConfig, FakeLLMEngine, FakeModelRunner, asyncio_test, by_label, observed, total
 
 from lean_vllm.engine.async_llm import AsyncLLM
 from lean_vllm.engine.exceptions import EngineDeadError
@@ -253,7 +253,7 @@ class TestAbort:
         assert not engine.output_processor.request_states
         assert not fake_of(engine).scheduler.seqs
         assert blocks.free_block_queue.num_free_blocks == free_before
-        assert fake_of(engine).metrics.requests_aborted.total == 1
+        assert total(fake_of(engine).metrics.requests_aborted) == 1
 
     @asyncio_test
     async def test_closing_the_generator_frees_the_blocks(self, make_async_engine):
@@ -329,9 +329,9 @@ class TestAbort:
         await outputs.aclose()  # its own abort lands after, on a finished request
         runner_of(engine).release()
         await settle(engine)
-        assert fake_of(engine).metrics.requests_aborted.total == 0
-        assert fake_of(engine).metrics.requests_finished.values == {"stop": 1}
-        assert fake_of(engine).metrics.ttft.count == 1
+        assert total(fake_of(engine).metrics.requests_aborted) == 0
+        assert by_label(fake_of(engine).metrics.requests_finished) == {"stop": 1}
+        assert observed(fake_of(engine).metrics.ttft) == 1
 
 
 class TestAdmission:

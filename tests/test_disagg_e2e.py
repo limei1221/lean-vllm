@@ -11,6 +11,7 @@ import socket
 from time import sleep
 
 import pytest
+from conftest import total
 
 MODEL = os.path.expanduser(os.getenv("LEAN_VLLM_TEST_MODEL", "~/workspace/huggingface/Qwen3-0.6B"))
 pytestmark = pytest.mark.skipif(not os.path.isdir(MODEL), reason=f"no model at {MODEL}")
@@ -60,7 +61,7 @@ def _decode(conn):
     params = conn.recv()
     sampling_params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS, kv_transfer_params=params)
     outputs = engine.generate([PROMPT], sampling_params, use_tqdm=False)
-    conn.send((outputs[0]["token_ids"], engine.metrics.prefill_tokens.total))
+    conn.send((outputs[0]["token_ids"], total(engine.metrics.prefill_tokens)))
 
 
 def test_the_decode_engine_continues_from_the_prefill_engine_s_kv():

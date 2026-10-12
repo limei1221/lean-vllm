@@ -210,6 +210,24 @@ class FakeLLMEngine(FakeEngine):
         return outputs, self.last_output.num_prefill_tokens, self.last_output.num_decode_tokens
 
 
+def by_label(metric) -> dict:
+    """A counter's or gauge's value per label value; None keys the one value of an unlabelled metric."""
+    (family,) = metric.collect()
+    names = (family.name, family.name + "_total")
+    return {next(iter(s.labels.values()), None): s.value for s in family.samples if s.name in names}
+
+
+def total(metric) -> float:
+    """A counter's total over its labels, or a gauge's value."""
+    return sum(by_label(metric).values())
+
+
+def observed(histogram, suffix: str = "_count") -> float:
+    """A histogram's observation count, or with suffix "_sum" their sum."""
+    (family,) = histogram.collect()
+    return next(s.value for s in family.samples if s.name == family.name + suffix)
+
+
 def asyncio_test(test):
     """No async plugin in the dev group, so each test drives its own loop."""
 
