@@ -685,6 +685,7 @@ dependencies = [
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "prometheus-client" },
     { name = "pydantic" },
+    { name = "pyzmq" },
     { name = "safetensors" },
     { name = "tokenizers" },
     { name = "torch" },
@@ -703,7 +704,6 @@ cuda = [
 serve = [
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "pyzmq" },
     { name = "uvicorn" },
 ]
 
@@ -731,7 +731,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "prometheus-client" },
     { name = "pydantic", specifier = ">=2" },
-    { name = "pyzmq", marker = "extra == 'serve'", specifier = ">=25" },
+    { name = "pyzmq", specifier = ">=26.4" },
     { name = "safetensors" },
     { name = "tokenizers", specifier = ">=0.22" },
     { name = "torch", specifier = ">=2.10" },

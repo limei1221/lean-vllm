@@ -16,6 +16,7 @@ dependencies = [
     "numpy",    # the runner's batch preparation
     "prometheus-client",    # the engine's /metrics
     "pydantic>=2",    # the kv transfer and speculative configs; the server's request bodies
+    "pyzmq>=26.4",    # the engine core process's sockets and the KV side channel; recv_into, for the KV layers
     "safetensors",
     "tokenizers>=0.22",    # DecodeStream(ids=), for the fast detokenizer
     "torch>=2.10",    # F.grouped_mm, which the routed experts fall back on, is public from 2.10
@@ -28,7 +29,6 @@ dependencies = [
 serve = [
     "fastapi>=0.115",
     "httpx",    # the disaggregated proxy's client
-    "pyzmq>=25",    # the engine core process's sockets
     "uvicorn>=0.30",
 ]
 cuda = [

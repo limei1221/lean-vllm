@@ -6,6 +6,7 @@ from time import monotonic, sleep
 
 import pytest
 import torch
+import zmq
 
 from lean_vllm.kv_transfer import (
     KVConnectorMetadata,
@@ -161,7 +162,8 @@ class TestStats:
         block_bytes = sum(cache[:, 0].numel() * cache.element_size() for cache in consumer.kv_caches)
         assert stats.num_bytes == 2 * block_bytes and stats.seconds > 0
 
-    def test_a_failed_load_reports_none(self, make_worker):
+    def test_a_failed_load_reports_none(self, make_worker, monkeypatch):
+        monkeypatch.setattr(tcp_connector, "HANDSHAKE_TIMEOUT", 0.2)
         consumer = make_worker("kv_consumer", make_caches(1))
         req = ReqToRecv([0], [0], "p-1", "engine", "127.0.0.1", free_port())
         consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={"d-1": req}))
@@ -223,7 +225,8 @@ class TestFailures:
         consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={"d-1": recv(producer, [0, 1], [4, 5])}))
         assert wait_for(consumer).failed_recving == {"d-1"}
 
-    def test_no_producer_listening_fails_the_load(self, make_worker):
+    def test_no_producer_listening_fails_the_load(self, make_worker, monkeypatch):
+        monkeypatch.setattr(tcp_connector, "HANDSHAKE_TIMEOUT", 0.2)
         consumer = make_worker("kv_consumer", make_caches(1))
         req = ReqToRecv([0], [0], "p-1", "engine", "127.0.0.1", free_port())
         consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={"d-1": req}))
@@ -259,6 +262,19 @@ class TestFailures:
         sleep(0.01)
         assert producer.get_finished() == KVConnectorOutput(finished_sending={"p-1"}, expired_sending={"p-1"})
         assert "which no decode instance read" in caplog.text
+
+    def test_a_consumer_that_leaves_mid_read_does_not_stop_the_server(self, make_worker):
+        """One thread serves every consumer, so a vanished one must not take it down."""
+        producer = make_worker("kv_producer", make_caches(0))
+        consumer = make_worker("kv_consumer", make_caches(1))
+        producer.start_load_kv(KVConnectorMetadata(reqs_to_send={"p-1": [1], "p-2": [2]}))
+        with zmq.Context() as context:
+            gone = context.socket(zmq.DEALER)
+            gone.connect(f"tcp://127.0.0.1:{producer.kv_transfer.kv_port}")
+            tcp_connector.send_message(gone, dict(op="read", request_id="p-1", block_ids=[1]))
+            gone.close(linger=1000)  # delivered, then gone before the layers are
+        consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={"d-2": recv(producer, [5], [2], "p-2")}))
+        assert wait_for(consumer).finished_recving == {"d-2"}
 
     def test_a_taken_port_is_named(self, make_worker):
         with socket.socket() as taken:

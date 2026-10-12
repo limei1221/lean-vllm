@@ -1,23 +1,21 @@
-"""NixlConnector's protocol over TCP: the decode instance pulls a finished prefill's blocks, then releases them.
+"""NixlConnector's protocol over ZMQ: the decode instance pulls a finished prefill's blocks, then releases them.
 
-A producer holds a request's prompt blocks once it has sampled its one token, and serves them from kv_port + rank.
-A consumer reads them into blocks it allocated, on a thread of its own, then sends "done" so the producer frees
-them; blocks no consumer reads are freed after LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT. NIXL moves the same blocks GPU
-to GPU over RDMA; this stages them through host memory, one layer at a time.
+A producer holds a request's prompt blocks once it has sampled its one token, and serves them from a ROUTER socket on
+kv_port + rank. A consumer reads them into blocks it allocated, over a DEALER socket on a thread of its own, then sends
+"done" so the producer frees them; blocks no consumer reads are freed after LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT. NIXL
+moves the same blocks GPU to GPU over RDMA; this stages them through host memory, one message per layer.
 """
 
 import json
 import logging
 import queue
-import socket
-import socketserver
-import struct
 import threading
 from collections import Counter
 from contextlib import nullcontext
 from time import monotonic
 
 import torch
+import zmq
 
 from lean_vllm import envs
 from lean_vllm.kv_transfer.base import (
@@ -31,36 +29,27 @@ from lean_vllm.kv_transfer.base import (
 
 logger = logging.getLogger(__name__)
 
-_HEADER = struct.Struct("!IQ")  # JSON length, then payload length
 REGISTRATION_WAIT = 30.0  # how long a read waits for the engine to hand its request's blocks over
+HANDSHAKE_TIMEOUT = 5.0  # ZMQ never refuses a connect, so an absent producer is one that does not answer
 SOCKET_TIMEOUT = 60.0
+POLL_MS = 50  # how often the server retries reads that arrived before their blocks
+LAYERS_IN_FLIGHT = 2  # high-water mark, in layer messages, so a read holds a few layers in host memory, not all
 
 
 def _cdiv(a: int, b: int) -> int:
     return -(-a // b)
 
 
-def send_message(sock: socket.socket, message: dict, nbytes: int = 0):
-    """A JSON header announcing nbytes of payload, which the caller sends next."""
-    header = json.dumps(message).encode()
-    sock.sendall(_HEADER.pack(len(header), nbytes) + header)
+def send_message(sock: zmq.Socket, message: dict, *identity: bytes):
+    """A JSON message; a ROUTER prefixes the peer it answers."""
+    sock.send_multipart([*identity, json.dumps(message).encode()])
 
 
-def recv_message(sock: socket.socket) -> tuple[dict, int]:
-    """A header and the payload bytes still to read."""
-    header_len, nbytes = _HEADER.unpack(recv_exact(sock, _HEADER.size))
-    return json.loads(recv_exact(sock, header_len)), nbytes
-
-
-def recv_exact(sock: socket.socket, n: int) -> bytearray:
-    buf = bytearray(n)
-    view, got = memoryview(buf), 0
-    while got < n:
-        k = sock.recv_into(view[got:])
-        if not k:
-            raise ConnectionError("the peer closed the connection")
-        got += k
-    return buf
+def recv_message(sock: zmq.Socket) -> dict:
+    try:
+        return json.loads(sock.recv())
+    except zmq.Again:
+        raise ConnectionError("the peer did not reply in time") from None
 
 
 class TcpConnectorScheduler(KVConnectorScheduler):
@@ -125,11 +114,6 @@ class TcpConnectorScheduler(KVConnectorScheduler):
         )
 
 
-class _Server(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-
 class TcpConnectorWorker(KVConnectorWorker):
     def __init__(self, config, rank: int):
         self.kv_transfer = config.kv_transfer
@@ -137,13 +121,15 @@ class TcpConnectorWorker(KVConnectorWorker):
         self.block_size = config.kvcache_block_size
         self.kv_caches: list[torch.Tensor] = []
         self.layout: dict = {}
-        self._lock = threading.Condition()  # guards the three below, shared with the server and loader threads
+        self._lock = threading.Lock()  # guards the three below, shared with the server and loader threads
         self._reqs_to_send: dict[str, tuple[set[int], float]] = {}  # request -> (its blocks, when to give up)
         self._reading: Counter[str] = Counter()  # reads in progress, which expiry must wait out
         self._finished = KVConnectorOutput()
         self._recv_queue: queue.Queue = queue.Queue()
-        self._peers: dict[tuple[str, int], tuple[socket.socket, str]] = {}  # loader thread only
-        self._server: _Server | None = None
+        self._context = zmq.Context()
+        self._context.setsockopt(zmq.LINGER, 0)  # a socket closes at once, with nobody left to read it
+        self._peers: dict[tuple[str, int], tuple[zmq.Socket, str]] = {}  # loader thread only
+        self._server: zmq.Socket | None = None  # server thread only, once started
         self._threads: list[threading.Thread] = []
 
     def register_kv_caches(self, kv_caches: list[torch.Tensor]):
@@ -156,11 +142,17 @@ class TcpConnectorWorker(KVConnectorWorker):
         kv = self.kv_transfer
         if kv.is_producer:
             port = kv.kv_port + self.rank
+            server = self._context.socket(zmq.ROUTER)
+            server.sndhwm = LAYERS_IN_FLIGHT
+            server.sndtimeo = int(SOCKET_TIMEOUT * 1000)
+            server.router_mandatory = True  # a full or vanished peer raises rather than drops a layer
             try:
-                self._server = _Server((kv.kv_ip, port), self._handler())
-            except OSError as error:
+                server.bind(f"tcp://{kv.kv_ip}:{port}")
+            except zmq.ZMQError as error:
+                server.close()
                 raise RuntimeError(f"cannot serve KV on {kv.kv_ip}:{port}: {error}; pick another kv_port") from error
-            self._start(self._server.serve_forever, "kv-server")
+            self._server = server
+            self._start(self._serve_loop, "kv-server")
         if kv.is_consumer:
             self._start(self._load_loop, "kv-loader")
 
@@ -175,7 +167,6 @@ class TcpConnectorWorker(KVConnectorWorker):
             with self._lock:
                 for request_id, block_ids in metadata.reqs_to_send.items():
                     self._reqs_to_send[request_id] = (set(block_ids), deadline)
-                self._lock.notify_all()
         if metadata.reqs_to_recv:
             # Freshly allocated blocks may still be written by a step in flight; the loads wait for it.
             ready = torch.cuda.current_stream().record_event() if self._on_cuda else None
@@ -198,14 +189,13 @@ class TcpConnectorWorker(KVConnectorWorker):
         return finished
 
     def shutdown(self):
-        if self._server is not None:
-            self._server.shutdown()
-            self._server.server_close()
+        if self._context.closed:
+            return
         self._recv_queue.put(None)
+        # Wakes a thread blocked on a socket with ETERM; returns once each has closed its own.
+        self._context.term()
         for thread in self._threads:
             thread.join(timeout=5)
-        for sock, _ in self._peers.values():
-            sock.close()
 
     @property
     def _on_cuda(self) -> bool:
@@ -226,57 +216,73 @@ class TcpConnectorWorker(KVConnectorWorker):
         if self._reqs_to_send.pop(request_id, None) is not None:
             self._finished.finished_sending.add(request_id)
 
-    # Producer: one server thread per connected consumer.
+    # Producer: one server thread, answering every consumer in turn.
 
-    def _handler(self):
-        worker = self
-
-        class Handler(socketserver.BaseRequestHandler):
-            def handle(self):
-                self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                stream = worker._thread_stream()
-                while True:
+    def _serve_loop(self):
+        server = self._server
+        assert server is not None
+        stream = self._thread_stream()
+        pending = []  # (peer, message, when a read stops waiting for its blocks)
+        try:
+            while True:
+                if server.poll(POLL_MS):
+                    while True:
+                        try:
+                            identity, raw = server.recv_multipart(zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
+                        pending.append((identity, json.loads(raw), monotonic() + REGISTRATION_WAIT))
+                waiting = []
+                for identity, message, deadline in pending:
+                    # The engine hands the blocks over on the step after the request finishes, which can trail the reply.
+                    if message.get("op") == "read" and deadline > monotonic():
+                        with self._lock:
+                            if message["request_id"] not in self._reqs_to_send:
+                                waiting.append((identity, message, deadline))
+                                continue
                     try:
-                        message, _ = recv_message(self.request)
-                        worker._serve(self.request, message, stream)
-                    except (ConnectionError, OSError):
-                        return
+                        self._serve(server, identity, message, stream)
+                    except zmq.ContextTerminated:
+                        raise
+                    except zmq.ZMQError as error:  # the consumer left or stalled; it fails the load on its side
+                        logger.warning("answering a KV %s failed: %s", message.get("op"), error)
+                pending = waiting
+        except zmq.ContextTerminated:
+            pass
+        finally:
+            server.close()
 
-        return Handler
-
-    def _serve(self, sock: socket.socket, message: dict, stream):
+    def _serve(self, server: zmq.Socket, identity: bytes, message: dict, stream):
         op = message.get("op")
         if op == "handshake":
-            send_message(sock, dict(ok=True, engine_id=self.kv_transfer.engine_id, layout=self.layout))
+            send_message(server, dict(ok=True, engine_id=self.kv_transfer.engine_id, layout=self.layout), identity)
         elif op == "read":
-            self._serve_read(sock, message["request_id"], message["block_ids"], stream)
+            self._serve_read(server, identity, message["request_id"], message["block_ids"], stream)
         elif op == "done":
             with self._lock:
                 self._release(message["request_id"])
-            send_message(sock, dict(ok=True))
+            send_message(server, dict(ok=True), identity)
         else:
-            send_message(sock, dict(ok=False, error=f"unknown op {op!r}"))
+            send_message(server, dict(ok=False, error=f"unknown op {op!r}"), identity)
 
-    def _serve_read(self, sock: socket.socket, request_id: str, block_ids: list[int], stream):
+    def _serve_read(self, server: zmq.Socket, identity: bytes, request_id: str, block_ids: list[int], stream):
         with self._lock:
-            # The engine hands the blocks over on the step after the request finishes, which can trail the reply.
-            self._lock.wait_for(lambda: request_id in self._reqs_to_send, timeout=REGISTRATION_WAIT)
             held = self._reqs_to_send.get(request_id, (None,))[0]
             readable = held is not None and set(block_ids) <= held
             if readable:
                 self._reading[request_id] += 1
         if not readable:
             error = f"{request_id} holds no such blocks here; it expired, or never prefilled here"
-            send_message(sock, dict(ok=False, error=error))
+            send_message(server, dict(ok=False, error=error), identity)
             return
         try:
             num_bytes = sum(self._layer_nbytes(cache, len(block_ids)) for cache in self.kv_caches)
-            send_message(sock, dict(ok=True), num_bytes)
+            send_message(server, dict(ok=True, num_bytes=num_bytes), identity)
             with torch.cuda.stream(stream) if stream is not None else nullcontext():
                 index = torch.tensor(block_ids, device=self.kv_caches[0].device)
                 for cache in self.kv_caches:
                     chunk = cache.index_select(1, index).cpu()  # blocking, so the bytes are there to send
-                    sock.sendall(chunk.flatten().view(torch.uint8).numpy())
+                    server.send_multipart([identity, chunk.flatten().view(torch.uint8).numpy()], copy=False)
         finally:
             with self._lock:
                 self._reading[request_id] -= 1
@@ -287,49 +293,56 @@ class TcpConnectorWorker(KVConnectorWorker):
 
     def _load_loop(self):
         stream = self._thread_stream()
-        while (item := self._recv_queue.get()) is not None:
-            request_id, req, ready = item
-            stats = None
-            try:
-                stats = self._load(req, ready, stream)
-            except Exception as error:
-                logger.warning(
-                    "loading the KV of %s from %s:%d failed, so it prefills here: %s",
-                    request_id,
-                    req.remote_host,
-                    req.remote_port + self.rank,
-                    error,
-                )
-            with self._lock:
-                if stats is None:
-                    self._finished.failed_recving.add(request_id)
-                else:
-                    self._finished.finished_recving.add(request_id)
-                    self._finished.recv_stats[request_id] = stats
+        try:
+            while (item := self._recv_queue.get()) is not None:
+                request_id, req, ready = item
+                stats = None
+                try:
+                    stats = self._load(req, ready, stream)
+                except zmq.ContextTerminated:
+                    return
+                except Exception as error:
+                    logger.warning(
+                        "loading the KV of %s from %s:%d failed, so it prefills here: %s",
+                        request_id,
+                        req.remote_host,
+                        req.remote_port + self.rank,
+                        error,
+                    )
+                with self._lock:
+                    if stats is None:
+                        self._finished.failed_recving.add(request_id)
+                    else:
+                        self._finished.finished_recving.add(request_id)
+                        self._finished.recv_stats[request_id] = stats
+        finally:
+            for sock, _ in self._peers.values():
+                sock.close()
 
     def _load(self, req: ReqToRecv, ready, stream) -> KVTransferStats:
         key = (req.remote_host, req.remote_port + self.rank)
         sock = self._connect(key, req.remote_engine_id)
         try:
             started = monotonic()
+            sock.rcvtimeo = int((REGISTRATION_WAIT + SOCKET_TIMEOUT) * 1000)  # the producer may wait for the blocks
             send_message(sock, dict(op="read", request_id=req.remote_request_id, block_ids=req.remote_block_ids))
-            reply, num_bytes = recv_message(sock)
+            reply = recv_message(sock)
             if reply["ok"]:
-                self._receive_blocks(sock, req.local_block_ids, num_bytes, ready, stream)
+                self._receive_blocks(sock, req.local_block_ids, reply["num_bytes"], ready, stream)
                 seconds = monotonic() - started
             # Done either way: blocks this engine will not read are no use held.
             send_message(sock, dict(op="done", request_id=req.remote_request_id))
             recv_message(sock)
         except BaseException:
             self._peers.pop(key, None)
-            sock.close()  # its stream position is unknown
+            sock.close()  # replies may still be on their way
             raise
         if not reply["ok"]:
             raise RuntimeError(reply["error"])
         num_bytes = sum(self._layer_nbytes(cache, len(req.local_block_ids)) for cache in self.kv_caches)
         return KVTransferStats(seconds, num_bytes)
 
-    def _receive_blocks(self, sock: socket.socket, block_ids: list[int], num_bytes: int, ready, stream):
+    def _receive_blocks(self, sock: zmq.Socket, block_ids: list[int], num_bytes: int, ready, stream):
         expected = sum(self._layer_nbytes(cache, len(block_ids)) for cache in self.kv_caches)
         if num_bytes != expected:
             raise RuntimeError(f"the producer sent {num_bytes} bytes for {len(block_ids)} blocks, not {expected}")
@@ -338,15 +351,20 @@ class TcpConnectorWorker(KVConnectorWorker):
                 stream.wait_event(ready)
             index = torch.tensor(block_ids, device=self.kv_caches[0].device)
             for cache in self.kv_caches:
-                data = recv_exact(sock, self._layer_nbytes(cache, len(block_ids)))
-                chunk = torch.frombuffer(data, dtype=torch.uint8).view(cache.dtype)
-                chunk = chunk.view(cache.size(0), len(block_ids), *cache.shape[2:])
+                chunk = torch.empty(cache.size(0), len(block_ids), *cache.shape[2:], dtype=cache.dtype)
+                data = chunk.view(-1).view(torch.uint8).numpy()
+                try:
+                    received = sock.recv_into(data)
+                except zmq.Again:
+                    raise ConnectionError("the producer stopped sending") from None
+                if received != data.nbytes:
+                    raise RuntimeError(f"a layer of {received} bytes, not {data.nbytes}")
                 cache.index_copy_(1, index, chunk.to(cache.device))
         # The engine schedules the request as soon as this reports it.
         if stream is not None:
             stream.synchronize()
 
-    def _connect(self, key: tuple[str, int], engine_id: str) -> socket.socket:
+    def _connect(self, key: tuple[str, int], engine_id: str) -> zmq.Socket:
         """A connection to the producer rank at key, checked to hold engine_id's blocks in this layout."""
         if key in self._peers:
             sock, peer_engine_id = self._peers[key]
@@ -354,11 +372,14 @@ class TcpConnectorWorker(KVConnectorWorker):
                 return sock
             del self._peers[key]  # restarted since, so ask afresh
             sock.close()
-        sock = socket.create_connection(key, timeout=SOCKET_TIMEOUT)
+        sock = self._context.socket(zmq.DEALER)
         try:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.rcvhwm = LAYERS_IN_FLIGHT
+            sock.rcvtimeo = int(HANDSHAKE_TIMEOUT * 1000)
+            sock.sndtimeo = int(SOCKET_TIMEOUT * 1000)
+            sock.connect(f"tcp://{key[0]}:{key[1]}")
             send_message(sock, dict(op="handshake"))
-            reply, _ = recv_message(sock)
+            reply = recv_message(sock)
             if reply["engine_id"] != engine_id:
                 raise RuntimeError(f"{key[0]}:{key[1]} is engine {reply['engine_id']}, not {engine_id}; it restarted")
             if reply["layout"] != self.layout:
