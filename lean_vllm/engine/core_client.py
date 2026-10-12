@@ -25,6 +25,8 @@ from lean_vllm.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
 
+CONNECT_TIMEOUT_MS = 10_000
+
 
 def _dead_error(prefix: str, error: BaseException) -> EngineDeadError:
     dead = EngineDeadError(f"{prefix}: {error!r}")
@@ -84,6 +86,10 @@ class AsyncMPClient:
         if status != "ready":
             self._shutdown_process()
             raise RuntimeError(f"the engine core failed to start (exit code {self._process.exitcode})") from error
+        # The core's connect() is asynchronous: wait for its pipe, or the first non-blocking send finds no peer.
+        if not self._input.poll(CONNECT_TIMEOUT_MS, zmq.POLLOUT):
+            self._shutdown_process()
+            raise RuntimeError("the engine core started but never connected")
 
     def start(self):
         """Called from the event loop that will read the outputs."""
