@@ -1,7 +1,8 @@
 """Piecewise compilation: the model is traced once and split at attention, and each piece between
 two attention ops is compiled by Inductor. A piece captures one CUDA graph per bucket; attention runs eager between."""
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from torch import fx, nn

@@ -1,7 +1,8 @@
 """Every environment variable lean-vLLM reads, parsed in one place and read at access."""
 
 import os
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 
 def _bool(name: str, default: bool) -> bool:

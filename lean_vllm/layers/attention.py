@@ -1,6 +1,7 @@
 import dataclasses
+from collections.abc import Callable
 from itertools import accumulate
-from typing import Callable, cast
+from typing import cast
 
 import numpy as np
 import torch

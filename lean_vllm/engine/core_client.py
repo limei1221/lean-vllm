@@ -11,9 +11,9 @@ import multiprocessing as mp
 import pickle
 import shutil
 import tempfile
+from collections.abc import Callable
 from itertools import count
 from multiprocessing.connection import wait
-from typing import Callable
 
 import zmq
 import zmq.asyncio

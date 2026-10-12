@@ -4,8 +4,8 @@ LLMEngine runs one for offline generate, and AsyncLLM one for the server; the co
 """
 
 import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import AsyncIterator
 
 from transformers import PreTrainedTokenizerFast
 

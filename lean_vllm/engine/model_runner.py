@@ -1,10 +1,10 @@
 import logging
 import math
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial
-from typing import Callable
 
 import numpy as np
 import torch

@@ -5,7 +5,7 @@ moves requests in and outputs out.
 """
 
 import asyncio
-from typing import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable
 from uuid import uuid4
 
 from lean_vllm.engine.core_client import AsyncMPClient

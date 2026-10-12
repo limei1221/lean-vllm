@@ -83,7 +83,7 @@ line-length = 120    # what the code is written to
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "B", "I"]
+select = ["E", "F", "W", "B", "I", "UP"]
 ignore = [
     "E501",    # the formatter owns line length; what it cannot wrap is long strings and comments
     "B905",    # zip(strict=) on every call is noise where lengths match by construction

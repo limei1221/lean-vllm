@@ -9,9 +9,9 @@ out: ("added", request_id, error or None), ("outputs", [RequestOutput]), ("metri
 import logging
 import pickle
 import signal
+from collections.abc import Callable
 from multiprocessing import parent_process
 from multiprocessing.connection import Connection
-from typing import Callable
 
 import zmq
 
