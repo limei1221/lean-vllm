@@ -14,31 +14,31 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
-    logits_indices: torch.Tensor | None = None  # rows that sample; None means all of them
-    cu_seqlens_q_host: list[int] | None = None  # cu_seqlens_q and _k kept on the host, so MLA plans without a sync
+    logits_indices: torch.Tensor | None = None  # token rows used for sampling; None means all rows
+    cu_seqlens_q_host: list[int] | None = None  # host copies, so backends plan without a device sync
     cu_seqlens_k_host: list[int] | None = None
     context_chunks: list | None = None  # filled on first use by layers.attention.context_chunks
-    mla_decode_metadata: object | None = None  # FlashMLA's schedule holder, made by the step's first layer
-    decode_splits: dict | None = None  # by query length, filled on first use by split_decodes_and_prefills
-    decode_query_len: int = 1  # the leading rows' query length, which MLA decode takes: 1 + drafts when verifying
-    attn_metadata: dict | None = None  # what a backend plans on the step's first layer, e.g. FlashInfer's wrappers
-    piecewise_size: int | None = None  # the bucket whose piecewise graphs this pass captures or replays
-    full_graph_size: int | None = None  # the batch size whose full graph this pass captures
-    num_actual_tokens: int | None = None  # the step's own rows, when a piecewise bucket pads it; None is all
-    common_prefix_len: int = 0  # cached tokens every row shares, for a backend to attend once (cascade); 0 is none
+    mla_decode_metadata: object | None = None  # FlashMLA schedule metadata, created by the first layer that needs it
+    decode_splits: dict | None = None  # cached results of split_decodes_and_prefills, keyed by query length
+    decode_query_len: int = 1  # queries per leading decode row; includes draft tokens during verification
+    attn_metadata: dict | None = None  # backend plans reused across layers, such as FlashInfer wrappers
+    piecewise_size: int | None = None  # bucket size for piecewise graph capture or replay
+    full_graph_size: int | None = None  # batch size for full graph capture
+    num_actual_tokens: int | None = None  # token rows excluding piecewise graph padding; None means all rows
+    common_prefix_len: int = 0  # shared cached prefix length for cascade attention; 0 means no shared prefix is used
 
 
 def split_decodes_and_prefills(context: Context, query_len: int = 1) -> tuple[int, Context | None, Context | None]:
-    """A prefill step's leading rows of query_len queries each, as (their count, a decode context, a context for
-    the rest).
+    """Split the leading rows with query_len queries each from the rest of the batch.
 
-    Each context is None when its group has no rows. The runner puts such rows first, so the split is a slice,
-    built on the host once per step and shared by every layer, as vLLM's split_decodes_and_prefills with
-    require_uniform. A prompt chunk of that length decodes too: attention can't tell it from a decode, as the
-    query shape is the same.
+    Return (num_decode_rows, decode_context, prefill_context). If no rows can use decode attention, return
+    (0, None, context). If all rows use decode attention, the prefill context is None.
+    The runner puts rows with this query length first, so each group is a slice of the batch. The split is cached
+    per query length and shared by every layer, as vLLM's split_decodes_and_prefills with require_uniform.
+    A prompt chunk with query_len tokens also uses decode attention because its query shape is the same.
     """
     if context.block_tables is None or context.cu_seqlens_q_host is None:
-        return 0, None, context  # nothing cached to decode against, or no host lengths to split by
+        return 0, None, context  # no block tables or host query lengths; keep the batch in the prefill group
     if context.decode_splits is None:
         context.decode_splits = {}
     if query_len not in context.decode_splits:
@@ -66,7 +66,7 @@ def split_decodes_and_prefills(context: Context, query_len: int = 1) -> tuple[in
             prefills = Context(
                 is_prefill=True,
                 cu_seqlens_q=context.cu_seqlens_q[n:] - cu_q[n],
-                # The device's offset: an async step moves decode rows back there, leaving the host's a bound.
+                # Device offset: async rejection moves decode rows back on the device; host lengths stay upper bounds.
                 cu_seqlens_k=context.cu_seqlens_k[n:] - context.cu_seqlens_k[n],
                 cu_seqlens_q_host=sub_q,
                 cu_seqlens_k_host=sub_k,
@@ -88,14 +88,14 @@ def get_context():
 
 @contextmanager
 def set_context(is_prefill: bool, **kwargs):
-    """The context for one forward pass; the previous one comes back on exit, even on error."""
+    """Create a context for one forward pass and restore the previous context on exit, even on error."""
     with use_context(Context(is_prefill, **kwargs)) as context:
         yield context
 
 
 @contextmanager
 def use_context(context: Context):
-    """An existing context for a pass, as set_context's, so a pass can run again in the context it was captured in."""
+    """Run a pass in an existing context, e.g. the one a graph was captured in; restore the previous on exit."""
     global _CONTEXT
     previous, _CONTEXT = _CONTEXT, context
     try:

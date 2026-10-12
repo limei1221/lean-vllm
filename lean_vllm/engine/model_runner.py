@@ -33,10 +33,11 @@ CALL_TIMEOUT = timedelta(days=365)
 
 
 def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int) -> list[int]:
-    """vLLM's default capture sizes: 1, 2, 4, then every 8 below 256 and every 16 from there, up to twice the
-    batch's sequences, 512 at most, and the token budget. The budget itself is captured if it fits.
+    """Return graph capture sizes using vLLM's default size schedule.
 
-    Piecewise graphs take every size, and full decode graphs those of at most max_num_seqs rows.
+    Start with 1, 2, 4, then multiples of 8 below 256 and multiples of 16 from 256 onward. Limit the sizes to
+    min(2 * max_num_seqs, 512, max_num_batched_tokens). Include the token budget itself if it fits this limit.
+    Piecewise graphs use these sizes as token counts; full decode graphs also apply row and token limits.
     """
     top = min(max_num_seqs * 2, 512, max_num_batched_tokens)
     sizes = [size for size in (1, 2, 4) if size <= top]
@@ -48,10 +49,18 @@ def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int) -> l
 
 
 def decode_query_len(lens: np.ndarray, num_speculative_tokens: int) -> int:
-    """The query length of the rows MLA decode takes this step: 1, or with drafts the commonest one up to 1 + drafts,
-    as FlashMLA takes one per call."""
+    """Choose one query length for MLA decode, which requires the same length for every row in a call.
+
+    Use the most common length at or below 1 + num_speculative_tokens. Choose the shorter length on ties,
+    or 1 if no length qualifies.
+    """
     short = lens[lens <= 1 + num_speculative_tokens]
-    return int(np.argmax(np.bincount(short))) if short.size else 1
+    if not short.size:
+        return 1
+
+    counts = np.bincount(short)
+    most_common_length = np.argmax(counts)
+    return int(most_common_length)
 
 
 @dataclass(slots=True)
@@ -61,18 +70,18 @@ class InFlightDrafts:
     Related vLLM state: prev_sampled_token_ids, _draft_token_ids, and valid_sampled_token_count.
     """
 
-    next_token_ids: torch.Tensor  # each row's newest token, after its kept drafts
+    next_token_ids: torch.Tensor  # each row's next token, after any accepted drafts
     draft_token_ids: torch.Tensor  # [rows, num_speculative_tokens], for the next step to verify
-    num_rejected: torch.Tensor  # drafts it verified and rejected, by which the next step's positions move back
+    num_rejected: torch.Tensor  # rejected drafts per row; subtract these counts from the next step's positions
 
 
 class ModelRunner:
-    cascade_layers: list[Attention] = []  # one layer per kind, backend and head count; each must agree to cascade
-    proposer: MTPProposer | None = None  # with a speculative_config
+    cascade_layers: list[Attention] = []  # one layer per type, backend and head counts; all must allow cascade
+    proposer: MTPProposer | None = None  # set when speculative decoding is enabled
     num_speculative_tokens = 0
     graph_query_len = 1  # queries per row in a full decode graph: 1, or 1 + drafts when verifying
-    in_flight_drafts: InFlightDrafts | None = None  # with a speculative_config, the last launched step's
-    decodes_latents = True  # every MLA layer attends its latents, so no attention reads key lengths on the host
+    in_flight_drafts: InFlightDrafts | None = None  # speculative outputs from the last launched step
+    decodes_latents = True  # all MLA backends support decode attention directly on cached latents
 
     def __init__(self, config: Config, rank: int):
         self.config = config
@@ -82,10 +91,10 @@ class ModelRunner:
         self.device = dev.get_device()
         self.step_kind = "enforced"  # how the last step ran: see _step_kind
         self._prev_tokens: SampledTokens | None = None  # the step still in flight, if any
-        self._prev_rows: dict[int, int] | None = None  # seq_id -> its row in those tokens
+        self._prev_rows: dict[int, int] | None = None  # seq_id -> sampling row in _prev_tokens
         model_cls = get_model_class(hf_config)
-        self.graph_bs: list[int] = []  # captured batch sizes in rows, full graphs
-        self.piecewise_bs: list[int] = []  # captured token counts, piecewise graphs
+        self.graph_bs: list[int] = []  # captured full graph sizes, in sequence rows
+        self.piecewise_bs: list[int] = []  # captured piecewise graph sizes, in tokens
         self.graphs: dict = {}
         self.graph_pool = None  # shared by both capture kinds
         self.compile_backend: PiecewiseBackend | None = None  # holds the pieces and their graphs
@@ -96,7 +105,7 @@ class ModelRunner:
             dev.dist_backend(self.device), f"tcp://localhost:{config.dist_port}", world_size=self.world_size, rank=rank
         )
         if self.world_size > 1:
-            # Calls go to the workers on the host, whatever device the default group runs on.
+            # Send worker calls through a CPU group, independent of the model's device backend.
             self.call_group = dist.new_group(backend="gloo", timeout=CALL_TIMEOUT)
         dev.set_device(self.device, rank)
         default_dtype = torch.get_default_dtype()
@@ -104,13 +113,13 @@ class ModelRunner:
         torch.set_default_device(self.device)
         model_kwargs = {"enable_expert_parallel": True} if config.enable_expert_parallel else {}
         self.model = model_cls(hf_config, **model_kwargs)
-        register_layers(self.model)  # before warmup_model, which runs the op
+        register_layers(self.model)  # attention ops need registered layers before warmup
         drafter = None
         if config.speculative is not None:
-            # Its own module, so the target's compile and graphs never hold it; it compiles and captures its own.
+            # Keep the drafter separate so it can compile and capture graphs independently of the target model.
             drafter = get_drafter_class(hf_config)(hf_config, config.enable_expert_parallel)
             register_layers(drafter)
-        # Each layer chose its backend as it was built; graphs depend on all of them, the drafter's too.
+        # Graph support depends on every attention backend, including the drafter's.
         layers = [module for module in self.model.modules() if isinstance(module, Attention)]
         if drafter is not None:
             layers += [module for module in drafter.modules() if isinstance(module, Attention)]
@@ -139,7 +148,7 @@ class ModelRunner:
             )
         for module in self.model.modules():
             if isinstance(module, MLAAttention):
-                # Warmup expands a step's worth of new latents, so a chunk this size fits what it measured.
+                # Limit cached-latent expansion to the configured batch token budget.
                 module.max_context_chunk = config.max_num_batched_tokens
         load_model(self.model, config.model)
         if self.cudagraph_mode != "none":
@@ -201,8 +210,8 @@ class ModelRunner:
                     for piece in self.proposer.compile_backend.pieces:
                         piece.graphs.clear()
             del self.graphs, self.graph_pool
-        dev.synchronize(self.device)  # drain the device
-        dist.destroy_process_group()  # drop the comms
+        dev.synchronize(self.device)  # wait for pending device work
+        dist.destroy_process_group()  # close distributed communication
 
     def loop(self):
         while True:
@@ -220,7 +229,10 @@ class ModelRunner:
         return method(*args)
 
     def kv_connector_step(self, metadata: KVConnectorMetadata) -> KVConnectorOutput | None:
-        """Start this step's transfers on every rank, and return those finished on all of them (rank 0 only)."""
+        """Start KV loads, make outgoing blocks available, and collect completed transfers across ranks.
+
+        Rank 0 reports transfers completed on every rank; other ranks return None.
+        """
         assert self.kv_connector is not None
         self.kv_connector.start_load_kv(metadata)
         output = self.kv_connector.get_finished()
@@ -231,7 +243,10 @@ class ModelRunner:
         return self.kv_aggregator.aggregate(outputs) if outputs is not None else None
 
     def compile_model(self):
-        """Traced whole, split at attention, pieces compiled by Inductor. Warmup's step runs the compile."""
+        """Set up whole-model tracing and Inductor compilation for pieces split at attention ops.
+
+        The first warmup call triggers tracing and compilation.
+        """
         self.graph_pool = torch.cuda.graph_pool_handle()
         self.compile_backend = compile_piecewise(self.model, self.graph_pool)
 
@@ -250,15 +265,17 @@ class ModelRunner:
 
     @torch.inference_mode()
     def _dummy_sampler_run(self):
-        """A step samples up to one row per sequence, far more than the warmup prefill, so measure that too.
-        With drafts, each row has a logits row per draft beside its own."""
+        """Measure sampler memory with more sampling rows than the prefill warmup may use.
+
+        Each sequence needs one logits row plus one per draft token.
+        """
         num_logits = 1 + self.num_speculative_tokens
         num_rows = max(min(self.config.max_num_seqs * num_logits, self.config.max_num_batched_tokens) // num_logits, 1)
-        # Random: dummy hidden states could hold values that break the sampler.
+        # Use random values because uninitialized hidden states could break the sampler.
         hidden_states = torch.rand(num_rows * num_logits, self.config.hf_config.hidden_size)
         with set_context(False):  # no logits_indices, so every row samples
             logits = self.model.compute_logits(hidden_states)
-        # Non-greedy and truncated, the costlier path: the sort holds the whole vocab twice over.
+        # Exercise non-greedy top-k/top-p sampling, whose sort allocates values and indices for the full vocabulary.
         temperatures = torch.full((num_rows,), 0.5, dtype=torch.float32)
         top_k = torch.full((num_rows,), logits.size(1) - 1, dtype=torch.int64)
         top_p = torch.full((num_rows,), 0.9, dtype=torch.float32)
@@ -280,9 +297,9 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
-        # Each layer names its cache layout, which its backend may choose: keys and values per head, or one MLA latent.
+        # Ask each layer for its cache shape: per-head keys and values, or compressed MLA latents.
         layers = [module for module in self.model.modules() if isinstance(module, Attention)]
-        if self.proposer is not None:  # the drafter's layers cache by the target's block tables
+        if self.proposer is not None:  # drafter caches use the target model's block tables
             layers += [module for module in self.proposer.drafter.modules() if isinstance(module, Attention)]
         block_numel = sum(math.prod(layer.kv_cache_shape(1, self.block_size)) for layer in layers)
         block_bytes = block_numel * config.hf_config.dtype.itemsize
@@ -297,50 +314,51 @@ class ModelRunner:
 
     @property
     def input_buffers(self) -> InputBuffers:
-        """Made on first use, so a runner built without __init__, as the tests build it, has one too."""
+        """Create input buffers on first use, including for test runners that skip __init__."""
         buffers = self.__dict__.get("_input_buffers")
         if buffers is None:
             buffers = self._input_buffers = InputBuffers(self.device)
         return buffers
 
     def prepare_batch(self, seqs: list[Sequence]):
-        """One batch for any mix of prompt chunks and decode rows, and the context to run it in.
+        """Build input tensors and attention context for a batch of prompt chunks, decode rows, or both.
 
-        As vLLM's _prepare_inputs: one pass over the rows for their scalars and tokens, then numpy for everything
-        per token, and one copy per tensor into buffers that outlive the step.
+        As in vLLM's _prepare_inputs, collect sequence data on the host and use NumPy for per-token calculations.
+        On CUDA, copy each input tensor through reusable buffers. Fill pending tokens and drafts from the
+        previous step's device tensors.
         """
         buffers = self.input_buffers
         buffers.begin()
         num_rows, block_size = len(seqs), self.block_size
-        # Scheduler order first: it is the order the sampled tokens are read back in.
+        # Start in scheduler order so sampled tokens can be returned in that order.
         lens = np.fromiter((seq.num_scheduled_tokens for seq in seqs), np.int64, num_rows)
         starts = np.fromiter((seq.num_cached_tokens for seq in seqs), np.int64, num_rows)
         planned = np.fromiter((seq.num_planned_tokens for seq in seqs), np.int64, num_rows)
-        # A decoding row verifies its drafts beside its token, so it runs and samples one more position per draft.
+        # A decode row runs its current token plus each draft, producing one logits row per position.
         num_drafts = np.fromiter(
             (0 if seq.is_prefill else seq.num_scheduled_tokens - 1 for seq in seqs), np.int64, num_rows
         )
         query_len = decode_query_len(lens, self.num_speculative_tokens)
-        order = np.argsort(lens != query_len, kind="stable")  # decodes_first, as indices
+        order = np.argsort(lens != query_len, kind="stable")  # the decodes_first ordering, expressed as indices
         batch = [seqs[i] for i in order]
         row_of = np.empty(num_rows, np.int64)
         row_of[order] = np.arange(num_rows)  # each scheduled sequence's row in the batch
 
         lens, starts = lens[order], starts[order]
-        # A row with nothing left to prefill samples its last token, and each of its drafts' positions.
+        # Sample rows that reach the end of their planned tokens, including any draft positions to verify.
         sampling = np.flatnonzero(starts[row_of] + lens[row_of] >= planned)  # in scheduler order
-        # Rows of an async step verifying drafts while the step before is in flight: placed as if it kept all of
-        # its own, and moved back on the device, so the host never waits.
+        # Initially place pending rows as if the previous step accepted every draft.
+        # Correct their positions on the device unless attention planning needs exact host lengths.
         in_flight = self.in_flight_drafts
         moved = [i for i, seq in enumerate(batch) if seq.num_pending_tokens] if in_flight is not None else []
         moved_src = [self._prev_row(batch[i]) for i in moved]
-        # Rows of several queries prefill, unless every row verifies as many drafts and attends latents: then MLA
-        # decodes them whole, every token samples, and a full graph can hold the step.
+        # A batch without prompts can use decode attention when all rows have the same query length and all
+        # MLA backends support latent decode. Other batches with drafts use the prefill path, which can split rows.
         has_prompt = any(seq.is_prefill for seq in seqs)
         uniform = not has_prompt and self.decodes_latents and bool((lens == query_len).all())
         is_prefill = has_prompt or (bool(num_drafts.any()) and not uniform)
         if moved and (not self.decodes_latents or (is_prefill and bool((lens[moved] != query_len).any()))):
-            # Expanding latents plans keys on the host, so it waits for the step in flight: a sync.
+            # Latent expansion needs exact key lengths on the host. Wait for the previous step's rejection counts.
             assert in_flight is not None
             num_rejected = in_flight.num_rejected.tolist()
             starts[moved] -= [num_rejected[src] for src in moved_src]
@@ -357,7 +375,7 @@ class ModelRunner:
         pending_dst: list[int] = []
         pending_src: list[int] = []
         draft_dst: list[int] = []
-        draft_src: list[int] = []  # into the in-flight drafts, flattened
+        draft_src: list[int] = []  # indices into the flattened in-flight draft tensor
         k = self.num_speculative_tokens
         for seq, start, end in zip(batch, starts.tolist(), ends.tolist()):
             if seq.is_prefill:
@@ -365,7 +383,7 @@ class ModelRunner:
                 token_ids.extend(seq[start:end])
             else:
                 if seq.num_pending_tokens:
-                    # Sampled by a step still in flight, its drafts too; the device copy fixes them below.
+                    # The current host token and drafts may be stale; replace them from device tensors below.
                     src = self._prev_row(seq)
                     pending_dst.append(len(token_ids))
                     pending_src.append(src)
@@ -391,7 +409,8 @@ class ModelRunner:
             table = np.full((num_rows, max(map(len, tables))), -1, np.int32)
             for i, row in enumerate(tables):
                 table[i, : len(row)] = row
-            # Each token's slot is its block's, plus its offset in it. Rows with no blocks (warmup) store nothing.
+            # A token's cache slot is its block's starting slot plus its offset within that block.
+            # Skip rows without blocks, as in warmup.
             keep = np.fromiter(map(bool, tables), bool, num_rows)[token_rows]
             kept = positions[keep]
             blocks = table[token_rows[keep], kept // block_size].astype(np.int64)
@@ -410,7 +429,7 @@ class ModelRunner:
             slot_mapping=buffers.put("slot_mapping", [] if slot_mapping is None else slot_mapping, torch.int32),
             context_lens=buffers.put("context_lens", ends, torch.int32),
             block_tables=block_tables,
-            # A pure-decode batch samples on every row, so the gather is skipped.
+            # A pure-decode batch uses every token row for sampling, so skip the logits gather.
             logits_indices=buffers.put("logits_indices", logits_indices, torch.int64) if is_prefill else None,
             common_prefix_len=common_prefix_len,
             decode_query_len=query_len,
@@ -419,7 +438,7 @@ class ModelRunner:
         positions_t = buffers.put("positions", positions, torch.int64)
         all_greedy = all(temperature == 0 for temperature in row_temperatures)
         temperatures = None if all_greedy else buffers.put("temperatures", row_temperatures, torch.float32)
-        # Both or neither: one sort serves both, and the compiled sampler has no other variant for warmup to compile.
+        # Pass both top_k and top_p or neither. They share one sort and avoid top-k-only and top-p-only variants.
         top_k = top_p = None
         if any(seq.top_k > 0 or seq.top_p < 1 for seq in sampling_rows):
             top_k = buffers.put("top_k", [seq.top_k for seq in sampling_rows], torch.int64)
@@ -433,7 +452,8 @@ class ModelRunner:
                 prev = self._prev_tokens.device_tokens()
             num_pending = len(pending_dst)
             if pending_dst == list(range(num_pending)) == pending_src:
-                # Pending rows are the first n of both; prev may have more if a request finished.
+                # Pending tokens occupy the first num_pending positions in both tensors.
+                # The previous tensor may have extra rows for requests that have since finished.
                 input_ids[:num_pending] = prev[:num_pending]
             else:
                 dst = buffers.put("pending_dst", pending_dst, torch.int64)
@@ -446,7 +466,7 @@ class ModelRunner:
             input_ids.index_copy_(0, dst, in_flight.draft_token_ids.flatten().index_select(0, src))
         if self.proposer is not None:
             num_draft_tokens = buffers.put("num_draft_tokens", sampling_drafts, torch.int64)
-            # The drafts are the tokens after each sampling row's first.
+            # Each draft token follows the input position whose logits verify it.
             is_draft = offsets < np.repeat(sampling_drafts, num_logits)
             draft_token_ids = input_ids[buffers.put("draft_index", logits_indices[is_draft] + 1, torch.int64)]
             self._spec_inputs = (draft_token_ids, num_draft_tokens)
@@ -482,8 +502,11 @@ class ModelRunner:
         moved_src: list[int],
         buffers: InputBuffers,
     ):
-        """Move the moved rows back past the drafts the step in flight rejected, on the device: positions, slots and
-        key lengths, as vLLM's update_num_computed_tokens_for_batch_change. The host keeps its lengths as bounds."""
+        """Adjust pending rows for drafts rejected by the previous step.
+
+        Update positions, cache slots, and key lengths on the device, as in vLLM's
+        update_num_computed_tokens_for_batch_change. Host lengths stay unchanged and remain upper bounds.
+        """
         back = torch.zeros(len(context["context_lens"]), dtype=torch.int64, device=positions.device)
         rejected = in_flight.num_rejected.index_select(0, buffers.put("moved_src", moved_src, torch.int64))
         back.index_copy_(0, buffers.put("moved", moved, torch.int64), rejected)
@@ -496,9 +519,12 @@ class ModelRunner:
         context["slot_mapping"].copy_(blocks * block_size + positions % block_size)
 
     def _cascade_prefix_len(self, table: np.ndarray, starts: np.ndarray, lens: np.ndarray) -> int:
-        """vLLM's _compute_cascade_attn_prefix_len: the pages every row shares, cut to the fewest cached tokens so no
-        query falls inside them, in whole pages; 0 unless every kind of layer would cascade on it. vLLM counts
-        blocks every request holds; this compares the step's own tables, so a request not scheduled cannot hide it."""
+        """Return the shared cached prefix length for cascade attention, or 0 if it cannot be used.
+
+        Compare this batch's block tables and keep only whole blocks before every row's first query.
+        Every representative layer must allow cascade attention. This serves the role of vLLM's
+        _compute_cascade_attn_prefix_len, using only the requests scheduled in this step.
+        """
         if len(starts) < 2 or not self.cascade_layers:
             return 0
         num_pages = int(starts.min()) // self.block_size
@@ -512,31 +538,38 @@ class ModelRunner:
 
     @staticmethod
     def decodes_first(seqs: list[Sequence], num_speculative_tokens: int = 0) -> list[Sequence]:
-        """The batch's row order: decode rows first, one query each or, verifying drafts, decode_query_len, so a
-        backend that splits a step slices them off, as vLLM's reorder_batch. Stable, and a no-op on a pure-decode
-        step."""
+        """Put rows matching decode_query_len first so attention backends can split the batch with a slice.
+
+        Preserve order within each group, as in vLLM's reorder_batch. The chosen query length can include drafts;
+        if every row has that length, the order stays unchanged.
+        """
         lens = np.array([seq.num_scheduled_tokens for seq in seqs], np.int64)
         query_len = decode_query_len(lens, num_speculative_tokens)
         return sorted(seqs, key=lambda seq: seq.num_scheduled_tokens != query_len)
 
     def _prev_row(self, seq: Sequence) -> int:
-        """Where this sequence sampled in the step still in flight."""
+        """Return this sequence's sampling row in the previous step."""
         row = self._prev_rows.get(seq.seq_id) if self._prev_rows else None
         assert row is not None, "a pending token but no row in the launched step"
         return row
 
     @staticmethod
     def _cudagraph_mode(mode: str, layers: list[Attention]) -> str:
-        """The mode these captures can serve. A full graph holds attention, so every layer's decode must be
-        capturable; if one is not, full falls back to piecewise (attention runs eager, the rest is still captured)."""
+        """Choose a graph mode supported by every attention layer.
+
+        Full graphs include attention. If any layer cannot be captured, use piecewise graphs when the requested
+        mode allows them; otherwise disable graphs. Piecewise graphs leave attention outside graph capture.
+        """
         if mode in FULL_MODES and not all(layer.supports_full_cudagraph() for layer in layers):
             return "piecewise" if mode in PIECEWISE_MODES else "none"
         return mode
 
     def _step_kind(self, is_prefill: bool, num_tokens: int, cascade: bool = False, query_len: int = 1) -> str:
-        """How this step runs: "graph", "piecewise", or why no graph covers it. A decode step's rows each have
-        query_len tokens; the full graphs hold rows of graph_query_len. A cascade step takes no full graph:
-        the graphs hold the one-kernel decode."""
+        """Return "graph", "piecewise", or a label explaining why this step runs without a graph.
+
+        Full graphs require a pure-decode batch with query_len equal to graph_query_len and a captured size
+        large enough for the batch. Cascade attention cannot use these graphs because they capture standard decode.
+        """
         if self.cudagraph_mode == "none":
             return "enforced"
         if not is_prefill and not cascade and self.cudagraph_mode in FULL_MODES and self.graph_bs:
@@ -544,7 +577,7 @@ class ModelRunner:
                 return "graph"
         if self.cudagraph_mode in PIECEWISE_MODES and self._piecewise_bucket(num_tokens):
             return "piecewise"
-        # No graph covers the step, which runs compiled: "prefill" for a prefill or mixed step, "decode" for pure decode.
+        # Run without a graph. Label prefill and mixed batches "prefill", and pure-decode batches "decode".
         return "prefill" if is_prefill else "decode"
 
     @torch.inference_mode()
@@ -553,7 +586,7 @@ class ModelRunner:
         self.step_kind = self._step_kind(
             is_prefill, input_ids.size(0), context.common_prefix_len > 0, context.decode_query_len
         )
-        if self.compile_backend is not None and not self.compile_backend.pieces:  # this call traces
+        if self.compile_backend is not None and not self.compile_backend.pieces:  # the first call traces the model
             mark_dynamic_tokens(input_ids, positions)
         if self.step_kind == "graph":
             hidden_states = self._replay_full(input_ids, positions)
@@ -562,11 +595,14 @@ class ModelRunner:
         else:
             hidden_states = self.model(input_ids, positions)
         if self.proposer is not None:
-            self._hidden_states = hidden_states  # the drafter's input, after sampling
+            self._hidden_states = hidden_states  # inputs for the drafter after sampling
         return self.model.compute_logits(hidden_states)
 
     def _replay_full(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """One graph for the whole model. Pure decode only: attention is inside it. Padding rows hold no keys."""
+        """Replay a full-model graph for a pure-decode batch, including attention.
+
+        Pad to the next captured batch size. Padding rows have zero context length and do not write to the cache.
+        """
         num_tokens = input_ids.size(0)
         bs = num_tokens // self.graph_query_len
         context = get_context()
@@ -586,12 +622,12 @@ class ModelRunner:
         return graph_vars["outputs"][:num_tokens]
 
     def _piecewise_bucket(self, num_tokens: int) -> int | None:
-        """The bucket a step of this size replays in, or None. Shared so dispatch and replay agree."""
+        """Return the smallest fitting piecewise bucket, or None for sizes outside the captured range."""
         bucket = next((size for size in self.piecewise_bs if size >= num_tokens), None)
         return None if bucket is None or num_tokens < self.piecewise_bs[0] else bucket
 
     def _replay_piecewise(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """The compiled model padded to the step's bucket: pieces replay their graphs, attention runs eager on real rows."""
+        """Pad inputs to a piecewise bucket and replay its graphs; attention runs eagerly on unpadded token rows."""
         num_tokens = input_ids.size(0)
         bucket = self._piecewise_bucket(num_tokens)
         buffers = self.piecewise_vars
@@ -602,7 +638,7 @@ class ModelRunner:
         return self.model(buffers["input_ids"][:bucket], buffers["positions"][:bucket])[:num_tokens]
 
     def run(self, seqs: list[Sequence]) -> SampledTokens:
-        """Prepare, launch and sample. The tokens are not fetched here; the engine awaits them."""
+        """Prepare inputs, run the model, and sample tokens. Return SampledTokens for the engine to fetch later."""
         with record_function("prepare_batch"):
             input_ids, positions, temperatures, context = self.prepare_batch(seqs)
         with set_context(**context):
@@ -630,8 +666,11 @@ class ModelRunner:
         return pending
 
     def _verify(self, logits: torch.Tensor, temperatures: torch.Tensor | None) -> torch.Tensor:
-        """Each sampling row's kept drafts and next token, [rows, num_speculative_tokens + 1], -1 past the last; on
-        every rank, as each runs the drafter on them."""
+        """Return accepted drafts and the next token for each sampling row, padded with -1.
+
+        The result has shape [rows, num_speculative_tokens + 1]. Every rank verifies drafts because each rank
+        uses the result to run its drafter.
+        """
         assert self.proposer is not None
         draft_token_ids, num_draft_tokens = self._spec_inputs
         return self.rejection_sampler(
@@ -640,31 +679,33 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_piecewise(self):
-        """Run the compiled model once per bucket, largest first; each piece captures its graph as the run reaches it."""
+        """Run each bucket from largest to smallest, capturing each piece's graph for that bucket."""
         self.piecewise_bs = cudagraph_capture_sizes(self.config.max_num_seqs, self.config.max_num_batched_tokens)
         largest = self.piecewise_bs[-1]
         input_ids = torch.zeros(largest, dtype=torch.int64)
         positions = torch.zeros(largest, dtype=torch.int64)
         self.piecewise_vars = dict(input_ids=input_ids, positions=positions)
         for size in reversed(self.piecewise_bs):
-            # Attention runs for real between the pieces, on one fresh prompt that writes no cache slot.
+            # Run attention eagerly between graph pieces, using a fresh prompt with cache writes disabled.
             seq = Sequence([0] * size)
             seq.num_scheduled_tokens = size
             _, _, _, context = self.prepare_batch([seq])
             context["slot_mapping"] = torch.full((size,), -1, dtype=torch.int32)
             with set_context(**context, piecewise_size=size):
                 self.model(input_ids[:size], positions[:size])
-                if self.proposer is not None:  # its first pass runs over the target's batch, so the same buckets
+                if self.proposer is not None:  # the drafter's first pass uses the target's batch and bucket sizes
                     self.proposer.capture_piecewise(size)
             torch.cuda.synchronize()
 
     def _max_num_blocks(self) -> int:
-        """The widest block table a step can hand a full graph: max_model_len, plus the slots the drafter writes
-        past a row's last token, which can still be held from a step whose drafts were rejected."""
+        """Return the block-table width needed for max_model_len plus speculative token slots.
+
+        Include the extra slots because a row may still hold blocks allocated for rejected drafts.
+        """
         return (self.config.max_model_len + self.num_speculative_tokens + self.block_size - 1) // self.block_size
 
     def _decode_graph_sizes(self) -> list[int]:
-        """The batch sizes, in rows, a full decode graph may take: the capture sizes up to max_num_seqs."""
+        """Return candidate full decode graph sizes in sequence rows, capped at max_num_seqs."""
         config = self.config
         sizes = cudagraph_capture_sizes(config.max_num_seqs, config.max_num_batched_tokens)
         return [size for size in sizes if size <= config.max_num_seqs]
@@ -673,8 +714,8 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        # With drafts, each decode row verifies them beside its token, so a graph's rows hold 1 + drafts queries,
-        # as vLLM's uniform_decode_query_len; a step of one query per row then runs piecewise.
+        # Capture 1 + num_speculative_tokens queries per row, as in vLLM's uniform_decode_query_len.
+        # Steps with a different query length need a piecewise graph or must run without a graph.
         q = self.graph_query_len = 1 + self.num_speculative_tokens
         self.graph_bs = [bs for bs in self._decode_graph_sizes() if bs * q <= config.max_num_batched_tokens]
         if not self.graph_bs:
@@ -682,9 +723,9 @@ class ModelRunner:
         max_bs = self.graph_bs[-1]
         max_num_blocks = self._max_num_blocks()
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        # FlashMLA bakes its tile schedule and split-KV workspace from context_lens at capture, so capture the
-        # worst case: block 0 is valid, so a full block_tables of zeros holds max_model_len tokens per row. Every
-        # replay refreshes context_lens/block_tables (see _replay_full), and the kernel gates on those lengths.
+        # Size FlashMLA's captured tile schedule and split-KV workspace for max_model_len tokens per row.
+        # Zero-filled block tables point to valid block 0. Each replay replaces the tables and context lengths
+        # with the current batch's values (see _replay_full), which determine how many keys attention reads.
         context_lens.fill_(config.max_model_len)
         self.graph_vars = dict(
             input_ids=torch.zeros(max_bs * q, dtype=torch.int64),
@@ -705,14 +746,16 @@ class ModelRunner:
             ) as context:
                 run = partial(self._full_graph_pass, context, bs * q)
                 run()  # warmup, which also plans FlashInfer
-                # The warmup scheduled MLA decode into the default pool; clear it so the capture reschedules
-                # into the graph's own pool (else the graph bakes pointers freed with this context).
+                # Clear the MLA schedule created during warmup so capture allocates it in the graph's pool.
+                # Otherwise the graph could keep pointers to memory freed when this context is released.
                 context.mla_decode_metadata = None
                 self.graphs[bs] = self._capture(run, self.graph_pool)
 
     def _full_graph_pass(self, context: Context, num_tokens: int) -> None:
-        """The whole model over the graph's buffers, in the context it is captured in, which the warmup's plans
-        stay in for the capture to find."""
+        """Run the model on graph buffers using the same context for warmup and capture.
+
+        Reusing the context lets capture find the backend plans created during warmup.
+        """
         graph_vars = self.graph_vars
         with use_context(context):
             input_ids, positions = graph_vars["input_ids"][:num_tokens], graph_vars["positions"][:num_tokens]
