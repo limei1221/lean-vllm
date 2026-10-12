@@ -86,7 +86,7 @@ class BlockManager:
         return (seq.num_planned_tokens + num_lookahead + self.block_size - 1) // self.block_size
 
     def can_allocate(self, seq: Sequence, num_lookahead: int = 0) -> int:
-        """Cached blocks seq would get, or -1 if the rest does not fit. The trailing block always recomputes."""
+        """Return the reusable prefix block count, or -1 if allocation cannot fit. Exclude seq's final block."""
         num_cached_blocks = 0
         num_new_blocks = self._num_blocks(seq, num_lookahead)
         last_hit_held = False
@@ -136,7 +136,7 @@ class BlockManager:
         return max(self._num_blocks(seq, num_lookahead) - len(seq.block_table), 0)
 
     def can_append(self, seq: Sequence, num_lookahead: int = 0) -> bool:
-        """Whether the blocks for seq's next token, and num_lookahead slots past it (drafts), are free."""
+        """Check for enough free blocks to cover seq's planned tokens plus num_lookahead draft slots."""
         return self.free_block_queue.num_free_blocks >= self._num_missing_blocks(seq, num_lookahead)
 
     def may_append(self, seq: Sequence, num_lookahead: int = 0):

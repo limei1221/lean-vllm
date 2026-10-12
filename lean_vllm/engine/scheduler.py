@@ -275,7 +275,7 @@ class Scheduler:
             output.dropped.append(seq)  # notify the caller that the request has finished, even though it was dropped
 
     def advance(self, seqs: list[Sequence]) -> list[LaunchedRow]:
-        """Move bookkeeping forward with no token values. Returns the sampling rows, in the sampler's order."""
+        """Update token counts before sampled values reach the host. Return sampling rows in the sampler's order."""
         rows = []
         for seq in seqs:
             # Optimistic, as vLLM's num_computed_tokens: reconcile takes back the slots of rejected drafts.
@@ -300,7 +300,7 @@ class Scheduler:
         token_ids: list[int] | list[list[int]],
         draft_token_ids: list[list[int]] | None = None,
     ) -> list[Sequence]:
-        """Commit the sampled tokens and run the stop checks. Returns the rows that produced one.
+        """Commit sampled tokens and run stop checks. Return sequences whose results were processed.
 
         A speculative step gives each row its kept drafts and one more token, and the drafts for its next step.
         """
@@ -351,7 +351,7 @@ class Scheduler:
         self.block_manager.deallocate(seq)
 
     def update_from_kv_connector_output(self, kv_output: KVConnectorOutput):
-        """Free what was sent, and run what was loaded. A failed load prefills here, from the local prefix hits."""
+        """Release sent blocks and resume requests after KV loads. Failed loads prefill from the local cached prefix."""
         for request_id in kv_output.finished_sending:
             seq = self.sending.pop(request_id, None)
             if seq is not None:

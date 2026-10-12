@@ -18,11 +18,11 @@ class SchedulingPolicy(ABC):
 
     @abstractmethod
     def add(self, seq: Sequence):
-        """A newly arrived request."""
+        """Add a newly arrived request to the waiting queue."""
 
     @abstractmethod
     def requeue(self, seq: Sequence):
-        """A preempted request, which has already waited once."""
+        """Return a preempted request to the waiting queue."""
 
     @abstractmethod
     def peek(self) -> Sequence: ...
@@ -41,10 +41,10 @@ class SchedulingPolicy(ABC):
 
     @abstractmethod
     def victim(self, running: deque[Sequence]) -> Sequence:
-        """Which running sequence gives up its blocks first."""
+        """Choose the running sequence that gives up its blocks first."""
 
     def by_urgency(self, running: deque[Sequence]) -> deque[Sequence]:
-        """Running in the order victim() spares it, most spared first."""
+        """Order running sequences from least to most likely to be chosen by victim()."""
         return running
 
 

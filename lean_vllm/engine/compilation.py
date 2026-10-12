@@ -18,7 +18,7 @@ SPLITTING_OPS = ("lean_vllm.attention", "lean_vllm.mla_attention")
 
 
 def split_at_attention(gm: fx.GraphModule) -> tuple[fx.GraphModule, set[str]]:
-    """Each attention op in a submodule of its own, and the nodes between two of them in one piece."""
+    """Put each attention op in its own submodule and group intervening nodes into separate pieces."""
     part, attention, index = {}, set(), 0
     for node in gm.graph.nodes:
         if node.op in ("placeholder", "output"):
@@ -44,7 +44,7 @@ def weak_ref(value: Any) -> Any:
 
 
 class Piece:
-    """One compiled piece. Under a piecewise_size it replays that bucket's graph, capturing it on the first call."""
+    """One compiled piece. When piecewise_size is set, capture or replay the graph for that size bucket."""
 
     def __init__(self, compiled: Callable, pool):
         self.compiled, self.pool = compiled, pool
@@ -55,7 +55,7 @@ class Piece:
         if size is None:
             return self.compiled(*args)
         if size in self.graphs:
-            # Its inputs sit where they sat at capture: the runner's buffers, weights, or an earlier piece's output.
+            # Replay uses the same input addresses as capture: runner buffers, weights, or an earlier piece's output.
             graph, output = self.graphs[size]
             graph.replay()
             return output
@@ -105,14 +105,14 @@ class PiecewiseBackend:
 
 
 def compile_piecewise(model: nn.Module, pool=None) -> PiecewiseBackend:
-    """Compile model in place; its first call traces, and must pass its inputs through mark_dynamic_tokens."""
+    """Set up in-place compilation. Call mark_dynamic_tokens on inputs before the first call traces the model."""
     backend = PiecewiseBackend(pool)
-    # Unguarded, so the one trace serves every later step: no size, one token included, recompiles.
+    # Skip guards so later steps reuse the trace for any token count, including one.
     model.compile(backend=backend, fullgraph=True, options={"guard_filter_fn": torch.compiler.skip_all_guards_unsafe})
     return backend
 
 
 def mark_dynamic_tokens(*tensors: torch.Tensor):
-    """The token dim symbolic, and nothing else. A trace that bakes the size in fails loudly."""
+    """Mark dimension 0 as dynamic. Tracing fails if it treats that token count as a constant."""
     for tensor in tensors:
         torch._dynamo.mark_dynamic(tensor, 0)

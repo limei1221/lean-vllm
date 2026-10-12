@@ -60,7 +60,10 @@ class AsyncLLM:
         sampling_params: SamplingParams,
         request_id: str | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
-        """Per-step outputs; closing the generator aborts. Admission settles first, so a status code is still choosable."""
+        """Wait for admission before returning an output generator, so the server can choose an HTTP status.
+
+        Closing the generator after iteration starts aborts an unfinished request.
+        """
         token_ids: list[int] = self.tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
         request_id = request_id or f"req-{uuid4().hex}"
         if request_id in self.output_processor.request_states:
@@ -132,7 +135,7 @@ class AsyncLLM:
         self.output_processor.fail_all(EngineDeadError("the server is shutting down"))
 
     def _on_loop(self, callback: Callable, *args):
-        """Run callback on the event loop: now if this is its thread, else soon."""
+        """Run callback now on the engine's event loop, or schedule it thread-safely from another thread."""
         if self._loop is None or self._loop.is_closed():
             return  # never started, or the loop is closed and its streams with it
         try:

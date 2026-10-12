@@ -30,7 +30,7 @@ def validate_request(
     max_model_len: int,
     kv_transfer: KVTransferConfig | None = None,
 ):
-    """Every front door comes through here, so nothing invalid reaches the runner."""
+    """Reject empty prompts, invalid token IDs, excessive context lengths, and incompatible KV-transfer settings."""
     if not prompt:
         raise InvalidRequest("the prompt is empty")
     bad = next((token_id for token_id in prompt if not 0 <= token_id < vocab_size), None)
@@ -50,7 +50,7 @@ def validate_request(
 
 
 def load_tokenizer(model: str) -> PreTrainedTokenizerFast:
-    """Detokenization steps tokenizers' DecodeStream, so only a fast tokenizer will do."""
+    """Load a fast tokenizer, which incremental detokenization through DecodeStream requires."""
     tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         raise ValueError(f"{model} has no fast tokenizer (a tokenizer.json), which detokenization needs")

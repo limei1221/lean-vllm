@@ -56,7 +56,7 @@ def load_model(model: nn.Module, path: str):
 
 
 def check_loaded(model: nn.Module, loaded: set[str], path: str):
-    """A parameter no weight reached would run on uninitialized memory. A tied one shares a loaded one's storage."""
+    """Reject parameters with no loaded weights, allowing tied parameters that share a loaded tensor's data pointer."""
     loaded_storage = {model.get_parameter(name).data_ptr() for name in loaded}
     missing = [
         name

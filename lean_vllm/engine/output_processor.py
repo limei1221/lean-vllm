@@ -63,7 +63,7 @@ class OutputProcessor:
         return state
 
     def process_outputs(self, outputs: list[RequestOutput]) -> list[RequestOutput]:
-        """Fill in each output's text and hand it to its stream. Returns those of requests without one."""
+        """Fill text when a tokenizer is available and route tracked outputs to streams or the returned list."""
         unstreamed = []
         for output in outputs:
             state = self.request_states.get(output.request_id)
@@ -80,7 +80,7 @@ class OutputProcessor:
         return unstreamed
 
     def fail_all(self, error: Exception):
-        """Every live stream raises error, and every request is forgotten."""
+        """Clear request state and queue error for each live stream to raise when read."""
         states, self.request_states = self.request_states, {}
         for state in states.values():
             if state.stream is not None:

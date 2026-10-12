@@ -1,7 +1,8 @@
-"""How AsyncLLM reaches the engine core, as vLLM's AsyncMPClient: the transport only, with no per-request state.
+"""Transport between AsyncLLM and the engine core, as vLLM's AsyncMPClient, without streams or detokenizers.
 
 The core runs in a process of its own, so the event loop only sends requests and reads outputs while the step loop
-holds its own GIL. Once the core is gone, every call raises EngineDeadError.
+holds its own GIL. If the core dies, pending admission and metrics calls fail and the output reader receives
+EngineDeadError.
 """
 
 import asyncio
@@ -110,7 +111,7 @@ class AsyncMPClient:
         self._fail_pending(EngineDeadError("the server is shutting down"))
 
     async def add_request_async(self, request_id: str, prompt: list[int], sampling_params: SamplingParams):
-        """Returns once the core has admitted the request, and raises whatever refused it."""
+        """Wait for the core to admit the request, or raise the error that prevented admission."""
         if self._stopped:
             raise EngineDeadError("the server is shutting down")
         if self.error is not None:
@@ -170,7 +171,7 @@ class AsyncMPClient:
                 self._die(error)
 
     def _handle(self, message: tuple) -> bool:
-        """False once the core has said it is dead."""
+        """Handle one core message. Return False on a death notification to stop the output reader."""
         kind = message[0]
         if kind == "outputs":
             self._outputs.put_nowait(message[1])

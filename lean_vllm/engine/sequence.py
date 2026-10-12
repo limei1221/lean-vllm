@@ -16,7 +16,7 @@ def _serialize(token_ids: tuple[int, ...], prefix: int) -> bytes:
 
 
 def sha256_hash(token_ids: tuple[int, ...], prefix: int) -> int:
-    """The default hash. Collision-resistant, so no one can craft a prompt that hits another user's cached KV blocks."""
+    """Hash the block and its prefix with SHA-256 to resist deliberate prefix-cache collisions."""
     return int.from_bytes(hashlib.sha256(_serialize(token_ids, prefix)).digest(), "big")
 
 
@@ -109,7 +109,7 @@ class Sequence:
 
     @property
     def num_planned_tokens(self):
-        """Length once every reserved token lands. What allocation must cover."""
+        """Total committed and reserved tokens that block allocation must cover."""
         return self.num_tokens + self.num_pending_tokens
 
     @property
@@ -154,7 +154,7 @@ class Sequence:
         self.commit_token(token_id)
 
     def drop_pending(self):
-        """Give up reserved tokens, on preemption, abort or finish."""
+        """Clear token reservations on preemption, abort or finish."""
         self.num_pending_tokens = 0
 
     def __getstate__(self):
