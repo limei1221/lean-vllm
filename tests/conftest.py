@@ -1,20 +1,19 @@
-"""A scheduler harness with no torch, no model and no GPU, so scheduling is testable on a laptop."""
+"""The real engine loop with a fake runner: no model loading or GPU needed."""
 
 import asyncio
 from dataclasses import dataclass
 from functools import wraps
 from itertools import count
-from time import perf_counter
 
 import pytest
 
+from lean_vllm.engine.llm_engine import LLMEngine
 from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.output import RequestOutput
 from lean_vllm.engine.scheduler import Scheduler
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.kv_transfer import KVConnectorOutput
 from lean_vllm.sampling_params import SamplingParams
-from lean_vllm.spec_decode import split_sampled
 
 EOS = 7
 
@@ -52,6 +51,8 @@ class FakeSampledTokens:
 
 class FakeModelRunner:
     """Stands in for ModelRunner: same call() surface, deterministic tokens, every batch recorded."""
+
+    step_kind = "enforced"
 
     def __init__(self, eos_after: dict[str, int] | None = None):
         self.eos_after = eos_after or {}
@@ -91,8 +92,10 @@ class FakeModelRunner:
         pass
 
 
-class FakeEngine:
-    """LLMEngine.step without the model. Mirrors it deliberately: change both together."""
+class FakeLLMEngine(LLMEngine):
+    """The production step loop with a fake runner and direct scheduler admission."""
+
+    tokenizer = None
 
     def __init__(self, config: FakeConfig, runner: FakeModelRunner):
         self.config = config
@@ -101,7 +104,9 @@ class FakeEngine:
         self.metrics = Metrics()
         self.last_output = None
         self.in_flight = None
-        self.profiler = None  # real LLMEngine exposes one; the async loop reads it
+        self.profiler = None
+        self.output_processor = None
+        self.ps = []
 
     def add(
         self, prompt: list[int], sampling_params: SamplingParams | None = None, request_id: str | None = None
@@ -111,65 +116,20 @@ class FakeEngine:
         self.metrics.record_received()
         return seq
 
-    def step(self) -> list[RequestOutput]:
-        started = perf_counter()
-        draining, self.in_flight = self.in_flight, None
-        if self.config.async_scheduling:
-            output = self._launch()
-            stepped = self._reconcile(draining)
-        else:
-            stepped = self._reconcile(draining)
-            output = self._launch()
-        outputs = [
-            RequestOutput(
-                request_id=seq.request_id,
-                token_ids=seq.token_ids[-seq.num_new_tokens :],
-                finished=seq.is_finished,
-                finish_reason=seq.finish_reason,
-                metrics=seq.metrics() if seq.is_finished else None,
-                kv_transfer_params=seq.kv_transfer_result,
-            )
-            for seq in stepped
-        ]
-        outputs += [
-            RequestOutput(
-                request_id=seq.request_id,
-                token_ids=[],
-                finished=True,
-                finish_reason=seq.finish_reason,
-                metrics=seq.metrics(),
-            )
-            for seq in output.dropped
-            if seq not in stepped
-        ]
-        # attributed to the step this call launched
-        self.metrics.record_step(self.scheduler, output, outputs, perf_counter() - started, "enforced")
-        return outputs
+    def add_request(self, prompt: list[int], sampling_params=None, request_id: str | None = None) -> str:
+        return self.add(prompt, sampling_params, request_id).request_id
 
     def _launch(self):
-        output = self.last_output = self.scheduler.schedule()
-        if output.kv_connector_metadata is not None:
-            kv_output = self.model_runner.call("kv_connector_step", output.kv_connector_metadata)
-            self.scheduler.update_from_kv_connector_output(kv_output)
-            self.metrics.record_kv_transfer(kv_output)
-        if output:
-            pending = self.model_runner.call("run", output.scheduled)
-            rows = self.scheduler.advance(output.scheduled)
-            self.in_flight = (output, rows, pending)
-        return output
+        self.last_output = super()._launch()
+        return self.last_output
 
-    def _reconcile(self, draining) -> list[Sequence]:
-        if draining is None:
-            return []
-        _, rows, pending = draining
-        token_ids, draft_token_ids = pending.tolist(), None
-        if self.config.speculative is not None:
-            token_ids, draft_token_ids = split_sampled(token_ids, self.config.speculative.num_speculative_tokens)
-            self.metrics.record_spec_decoding(rows, token_ids)
-        return self.scheduler.reconcile(rows, token_ids, draft_token_ids)
 
-    def is_finished(self):
-        return self.in_flight is None and self.scheduler.is_finished()
+class FakeEngine(FakeLLMEngine):
+    """Scheduler tests consume only outputs; core-client tests use FakeLLMEngine's full step result."""
+
+    def step(self) -> list[RequestOutput]:
+        outputs, _, _ = super().step()
+        return outputs
 
     def run_to_completion(self, max_steps: int = 500) -> dict[str, list[int]]:
         """Completion token ids per request, as generate() would accumulate them."""
@@ -180,34 +140,6 @@ class FakeEngine:
             for output in self.step():
                 outputs.setdefault(output.request_id, []).extend(output.token_ids)
         raise AssertionError("engine did not finish; a sequence is stuck")
-
-
-class FakeLLMEngine(FakeEngine):
-    """LLMEngine's surface, so the core clients can drive it without a model."""
-
-    tokenizer = None  # the async engine only needs one for str prompts
-
-    def add_request(self, prompt: list[int], sampling_params=None, request_id: str | None = None) -> str:
-        return self.add(prompt, sampling_params, request_id).request_id
-
-    def abort_request(self, request_id: str, reason: str = "abort") -> bool:
-        seq = self.scheduler.seqs.get(request_id)
-        aborted = self.scheduler.abort(request_id, reason)
-        if aborted:
-            self.metrics.record_aborted(
-                RequestOutput(
-                    request_id=request_id,
-                    token_ids=[],
-                    finished=True,
-                    finish_reason=seq.finish_reason,
-                    metrics=seq.metrics(),
-                )
-            )
-        return aborted
-
-    def step(self) -> tuple[list[RequestOutput], int, int]:
-        outputs = super().step()
-        return outputs, self.last_output.num_prefill_tokens, self.last_output.num_decode_tokens
 
 
 def by_label(metric) -> dict:

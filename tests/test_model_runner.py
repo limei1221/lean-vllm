@@ -443,8 +443,8 @@ def test_preemption_recomputes_the_generated_suffix(runner, make_engine, chunked
     for _ in range(16):
         engine.step()
     # Drain the in-flight step without launching another, so schedule() below sees fresh state.
-    _, rows, pending = engine.in_flight
-    engine.scheduler.reconcile(rows, pending.tolist())
+    pending = engine.in_flight
+    engine.scheduler.reconcile(pending.rows, pending.pending.tolist())
     engine.in_flight = None
     assert first.is_finished
     assert second.num_preemptions == 1
