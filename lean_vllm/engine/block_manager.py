@@ -73,8 +73,8 @@ class BlockManager:
     ):
         self.block_size = block_size
         self.enable_prefix_caching = enable_prefix_caching
-        # An MTP drafter's cache at a block's last token depends on the token after it, so that block recomputes,
-        # as vLLM's use_eagle.
+        # The MTP drafter's KV cache at a block's last position depends on the next token, outside the block.
+        # Recompute the last matching cached block because that token may differ, as in vLLM's use_eagle logic.
         self.recompute_last_hit = recompute_last_hit
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
@@ -101,7 +101,7 @@ class BlockManager:
         self.free_block_queue.append(self.blocks[block_id])
 
     def _num_blocks(self, seq: Sequence, num_lookahead: int) -> int:
-        """Blocks seq needs once every reserved token lands and num_lookahead more slots are written."""
+        """Return the number of blocks needed for existing tokens, pending tokens, and additional lookahead slots."""
         return (seq.num_planned_tokens + num_lookahead + self.block_size - 1) // self.block_size
 
     def can_allocate(self, seq: Sequence, num_lookahead: int = 0) -> int:
@@ -163,7 +163,7 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence, num_computed_tokens: int):
-        """Publish each full block once its KV is computed and its tokens are known (a reserved token can lag)."""
+        """Publish full blocks once their KV is computed and token IDs committed (async or draft tokens can lag)."""
         if not self.enable_prefix_caching:
             return
         end = min(num_computed_tokens, seq.num_tokens) // self.block_size

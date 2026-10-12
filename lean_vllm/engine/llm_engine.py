@@ -250,7 +250,7 @@ class LLMEngine:
         )
 
     def _dropped(self, seq: Sequence) -> RequestOutput:
-        """Finished by the scheduler without ever sampling, so there is no token."""
+        """Final output for a dropped or aborted request, with no new tokens."""
         return RequestOutput(
             request_id=seq.request_id,
             token_ids=[],

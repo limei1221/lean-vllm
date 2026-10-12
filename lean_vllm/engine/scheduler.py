@@ -16,7 +16,7 @@ class SchedulerOutput:
 
     scheduled: list[Sequence] = field(default_factory=list)
     preempted: list[Sequence] = field(default_factory=list)
-    dropped: list[Sequence] = field(default_factory=list)  # finished without ever sampling
+    dropped: list[Sequence] = field(default_factory=list)  # finished during scheduling due to capacity limits
     # Counted while scheduling: advance() clears num_scheduled_tokens.
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
@@ -55,7 +55,7 @@ class Scheduler:
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
         speculative = config.speculative
         self.num_speculative_tokens = speculative.num_speculative_tokens if speculative is not None else 0
-        # Slots past a row's last token that the drafter writes, its first draft aside.
+        # Extra KV slots needed for speculative decoding.
         self.num_lookahead_tokens = max(self.num_speculative_tokens - 1, 0)
         self.block_manager = BlockManager(
             config.num_kvcache_blocks,
@@ -89,7 +89,7 @@ class Scheduler:
             self._finish(seq, reason)  # its blocks are being written; they are freed once the load ends
             return True
         queue = self.waiting if seq.status == SequenceStatus.WAITING else self.running
-        queue.remove(seq)  # both queues expose remove()
+        queue.remove(seq)
         seq.drop_pending()
         self._finish(seq, reason)
         self._free(seq)
@@ -102,7 +102,7 @@ class Scheduler:
             output = self._schedule_whole_prompts()
             if output:
                 return self._with_connector_meta(output)  # prefill-only step
-            dropped = output.dropped  # nothing to run, but the drops still owe an output
+            dropped = output.dropped  # no prefill work; keep dropped requests so they receive a final response
         output = SchedulerOutput(dropped=dropped)
         budget = self.max_num_batched_tokens
         still_running: deque[Sequence] = deque()
@@ -118,9 +118,12 @@ class Scheduler:
                 still_running.append(seq)  # its reserved tokens already reach the limit
                 continue
             if not seq.is_prefill:  # decoding, so the cache grows
-                # Drafts past the budget or the request's last token would be thrown away, so they never run.
                 num_left = seq.max_tokens - (seq.num_planned_tokens - seq.num_prompt_tokens)
-                del seq.spec_token_ids[max(min(budget, num_left) - 1, 0) :]
+                step_limit = min(budget, num_left)
+                # Accepted drafts can produce output tokens, plus one additional sampled token.
+                # Reserve one slot for that token and keep only the drafts that fit.
+                drafts_to_keep = max(step_limit - 1, 0)
+                del seq.spec_token_ids[drafts_to_keep:]
                 num_lookahead = len(seq.spec_token_ids) + self.num_lookahead_tokens
                 if not self._make_room(seq, still_running, output, num_lookahead):
                     continue
@@ -140,6 +143,7 @@ class Scheduler:
                     continue
                 num_cached_blocks = self.block_manager.can_allocate(seq, self.num_lookahead_tokens)
                 if num_cached_blocks == -1:
+                    # Not enough KV-cache space; keep the head request waiting to preserve queue order.
                     break
                 budget -= self._admit(seq, num_cached_blocks, budget, output)
 
@@ -164,7 +168,7 @@ class Scheduler:
             if num_cached_blocks == -1:
                 break
             num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
-            if self._loads_remotely(seq):
+            if self._loads_remotely(seq):  # this request is configured to load KV blocks from another instance
                 num_tokens = 0  # it waits for its blocks, then computes one token
             if num_tokens > self.max_num_batched_tokens:
                 self.waiting.pop()  # will never fit in one step, and splitting is off
@@ -176,7 +180,7 @@ class Scheduler:
         return output
 
     def _never_fits(self, seq: Sequence) -> bool:
-        """Short of blocks with the entire cache free, counting the drafter's lookahead slots as can_allocate does."""
+        """Return whether the sequence, including lookahead slots, exceeds total KV-cache capacity."""
         return self.block_manager._num_blocks(seq, self.num_lookahead_tokens) > len(self.block_manager.blocks)
 
     def _loads_remotely(self, seq: Sequence) -> bool:
@@ -203,7 +207,7 @@ class Scheduler:
         return num_tokens
 
     def _schedule(self, seq: Sequence, budget: int, output: SchedulerOutput) -> int:
-        """Give seq its share of the budget: a prompt chunk, or one decoded token and the drafts to verify."""
+        """Schedule a prefill chunk or the last generated token plus any drafts to verify."""
         # A preempted request also prefills its generated suffix until it samples again.
         num_tokens = (
             min(seq.num_tokens - seq.num_cached_tokens, budget) if seq.is_prefill else 1 + len(seq.spec_token_ids)
@@ -231,13 +235,14 @@ class Scheduler:
                 self._preempt(victim, output)
             elif still_running or output.scheduled:
                 self._preempt(seq, output)
+                # The current sequence was requeued, so the caller must skip it this step.
                 return False
             elif seq.num_pending_tokens:
-                still_running.append(seq)  # its in-flight token may stop it; decide after reconcile
+                # The pending token may finish this request; defer the capacity decision until after reconcile.
+                still_running.append(seq)
                 return False
             elif self.recving or self.sending:
-                # Transfers still own blocks outside running. Wait until they
-                # finish before deciding whether this request can ever fit.
+                # KV transfers hold blocks outside running; wait for them before deciding it can never fit.
                 still_running.append(seq)
                 return False
             else:
@@ -252,7 +257,7 @@ class Scheduler:
         seq.is_prefill = True
         seq.num_preemptions += 1
         seq.drop_pending()  # the in-flight token is discarded and recomputed
-        seq.spec_token_ids = []  # the step that samples again drafts anew
+        seq.spec_token_ids = []
         self.block_manager.deallocate(seq)
         self.waiting.requeue(seq)
         output.preempted.append(seq)
@@ -267,7 +272,7 @@ class Scheduler:
         seq.drop_pending()
         del self.seqs[seq.request_id]
         if output is not None:
-            output.dropped.append(seq)  # the caller is still owed a final output
+            output.dropped.append(seq)  # notify the caller that the request has finished, even though it was dropped
 
     def advance(self, seqs: list[Sequence]) -> list[LaunchedRow]:
         """Move bookkeeping forward with no token values. Returns the sampling rows, in the sampler's order."""
@@ -305,8 +310,9 @@ class Scheduler:
             if seq.is_finished or seq.num_preemptions != row.num_preemptions:
                 continue  # aborted, finished or requeued since the launch; the token is void
             new_token_ids = [sampled] if isinstance(sampled, int) else sampled
-            # The rejected drafts' slots hold keys of the wrong tokens, so the next step writes over them, and their
-            # reservations go. A step launched since was placed as if they were kept; the runner moved it back.
+            # Rejected draft slots contain keys for the wrong tokens. Release their reservations so the next
+            # step can overwrite them. Any step launched in the meantime assumed those drafts were accepted;
+            # the runner has already shifted that step back to account for the rejections.
             num_rejected = row.num_draft_tokens - (len(new_token_ids) - 1)
             seq.num_cached_tokens -= num_rejected
             seq.num_pending_tokens -= num_rejected
@@ -324,8 +330,9 @@ class Scheduler:
             if seq.first_token_time is None:
                 seq.first_token_time = perf_counter()  # when the token reaches the host, not at launch
             stepped.append(seq)
-            if reason is None:
-                if draft_token_ids is not None and not seq.num_pending_tokens:  # else a launched step verifies them
+            if reason is None:  # no stopping condition was met
+                # Save these drafts only if no in-flight step is already verifying them.
+                if draft_token_ids is not None and not seq.num_pending_tokens:
                     seq.spec_token_ids = draft_token_ids[i]
                 continue
             seq.drop_pending()  # a later step may already have reserved one
