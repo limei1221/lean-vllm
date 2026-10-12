@@ -1,10 +1,8 @@
-import numpy as np
 import torch
 import torch.nn.functional as F
 
 from lean_vllm.attention import triton_cache
 from lean_vllm.attention.abstract import AttentionBackend, write_into
-from lean_vllm.attention.merge import merge_attention_
 from lean_vllm.utils.context import Context
 
 _IMPORT_ERROR: ImportError | None = None
@@ -12,31 +10,6 @@ try:
     from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache, get_scheduler_metadata
 except ImportError as e:  # Hopper only, and built by the cuda extra
     _IMPORT_ERROR = e
-
-# vLLM's thresholds: below them, cascade's second kernel costs more than reading the prefix once saves.
-CASCADE_MIN_PREFIX_LEN = 256
-CASCADE_MIN_ROWS = 8
-
-
-def _cdiv(a: int, b: int) -> int:
-    return -(-a // b)
-
-
-def use_cascade_attention(
-    common_prefix_len: int, query_lens: np.ndarray, num_heads: int, num_kv_heads: int, num_sms: int
-) -> bool:
-    """vLLM's heuristic, for FA's 128-wide tiles: cascade pays unless every row decodes and flash decoding, which
-    splits each row's keys across CTAs, would fill the SMs in fewer waves over the prefix."""
-    if common_prefix_len < CASCADE_MIN_PREFIX_LEN or len(query_lens) < CASCADE_MIN_ROWS:
-        return False
-    group = num_heads // num_kv_heads
-    if group == 1 or not np.all(query_lens == 1):
-        return True  # FA uses no flash decoding here
-    num_rows, tile = len(query_lens), 128
-    prefix_tiles = _cdiv(common_prefix_len, tile)
-    cascade_time = _cdiv(num_heads * _cdiv(num_rows, tile), num_sms) * prefix_tiles
-    flash_decoding_time = _cdiv(num_rows * num_kv_heads * _cdiv(group, tile) * prefix_tiles, num_sms)
-    return cascade_time < flash_decoding_time
 
 
 def _step_cache(context: Context) -> dict:
@@ -48,13 +21,11 @@ def _step_cache(context: Context) -> dict:
 class FlashAttention3Backend(AttentionBackend):
     """FlashAttention-3 kernels with a Triton KV-cache scatter. Hopper only.
 
-    Paged calls take a tile schedule made once per step (vLLM's AOT schedule), and rows sharing a long cached prefix
-    attend it once for all (vLLM's cascade attention).
+    Paged calls take a tile schedule made once per step (vLLM's AOT schedule).
     """
 
     _graph_problems: dict[tuple, dict] = {}  # a full graph's decode schedule, by key: how to remake it before replay
     _graph_schedules: dict[tuple, torch.Tensor] = {}  # what full graphs read their schedule from, per layer shape
-    _num_sms: int | None = None
 
     @staticmethod
     def get_name() -> str:
@@ -84,14 +55,6 @@ class FlashAttention3Backend(AttentionBackend):
     def store_latents(self, latent, latent_cache, slot_mapping) -> None:
         triton_cache.store_latents(latent, latent_cache, slot_mapping)
 
-    def use_cascade_attention(self, common_prefix_len: int, query_lens: np.ndarray) -> bool:
-        num_sms = FlashAttention3Backend._num_sms
-        if num_sms is None:
-            num_sms = FlashAttention3Backend._num_sms = torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count
-        return use_cascade_attention(common_prefix_len, query_lens, self.num_heads, self.num_kv_heads, num_sms)
-
     def prefill(self, q, k, v, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
         # FA3's entry points take no out, so one given is copied into.
         if context.block_tables is None:
@@ -109,8 +72,6 @@ class FlashAttention3Backend(AttentionBackend):
             )
             return write_into(out, o)
         # Keys come from the pages, cold rows too; FA3's varlen entry takes no page table.
-        if context.common_prefix_len:
-            return self._cascade(q, k_cache, v_cache, context, out)
         assert context.cu_seqlens_k is not None
         cache_seqlens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
         o = self._paged(
@@ -144,50 +105,8 @@ class FlashAttention3Backend(AttentionBackend):
         return o, lse.transpose(0, 1)  # FA3's varlen lse is [heads, tokens]
 
     def decode(self, q, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
-        if context.common_prefix_len:
-            return self._cascade(q, k_cache, v_cache, context, out)
         o = self._paged("decode", q.unsqueeze(1), k_cache, v_cache, context, context.context_lens, context.block_tables)
         return write_into(out, o.squeeze(1))  # match the [batch, heads, dim] contract
-
-    def _cascade(self, q, k_cache, v_cache, context: Context, out) -> torch.Tensor:
-        """vLLM's cascade_attention: every query attends the pages all rows share in one unmasked pass, then its own
-        keys past them causally, and the two merge by log-sum-exp into out."""
-        prefix_len = context.common_prefix_len
-        num_prefix_pages = prefix_len // k_cache.size(1)
-        tables, lens = context.block_tables, context.context_lens
-        assert tables is not None and lens is not None and context.cu_seqlens_q is not None
-        cache = _step_cache(context)
-        if ("fa3", "cascade_lens") not in cache:
-            prefix_lens = torch.full((1,), prefix_len, dtype=torch.int32, device=lens.device)
-            cache["fa3", "cascade_lens"] = prefix_lens, lens - prefix_len
-        prefix_lens, suffix_lens = cache["fa3", "cascade_lens"]
-        # The step's queries as one row of a batch of one, so the prefix is read once.
-        o_prefix, lse_prefix, *_ = self._paged(
-            "prefix",
-            q.unsqueeze(0),
-            k_cache,
-            v_cache,
-            context,
-            prefix_lens,
-            tables[:1, :num_prefix_pages],
-            causal=False,
-            return_lse=True,
-        )
-        o_suffix, lse_suffix, *_ = self._paged(
-            "suffix",
-            q,
-            k_cache,
-            v_cache,
-            context,
-            suffix_lens,
-            tables[:, num_prefix_pages:],
-            context.cu_seqlens_q,
-            context.max_seqlen_q,
-            return_lse=True,
-        )
-        o_prefix = o_prefix[0]
-        merge_attention_(o_prefix, lse_prefix[0].T, o_suffix, lse_suffix.T, out)  # FA3's lse is [heads, tokens]
-        return o_prefix if out is None else out
 
     def _paged(
         self,
@@ -200,12 +119,10 @@ class FlashAttention3Backend(AttentionBackend):
         page_table,
         cu_seqlens_q=None,
         max_seqlen_q=None,
-        causal=True,
-        return_lse=False,
     ):
         """FA3 over the pages, q batched or packed by cu_seqlens_q, on the step's schedule for this problem."""
         schedule = self._schedule(
-            kind, q, k_cache, v_cache, context, cache_seqlens, page_table, cu_seqlens_q, max_seqlen_q, causal
+            kind, q, k_cache, v_cache, context, cache_seqlens, page_table, cu_seqlens_q, max_seqlen_q
         )
         return flash_attn_with_kvcache(
             q,
@@ -216,9 +133,8 @@ class FlashAttention3Backend(AttentionBackend):
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             softmax_scale=self.scale,
-            causal=causal,
+            causal=True,
             scheduler_metadata=schedule,
-            return_softmax_lse=return_lse,
         )
 
     def _schedule(
@@ -232,7 +148,6 @@ class FlashAttention3Backend(AttentionBackend):
         page_table,
         cu_seqlens_q,
         max_seqlen_q,
-        causal,
     ) -> torch.Tensor:
         """FA3's tile schedule for one problem, made by the step's first layer to pose it so the rest skip the
         in-kernel pass. A full graph reads it from a buffer refilled before each replay."""
@@ -255,7 +170,7 @@ class FlashAttention3Backend(AttentionBackend):
             headdim_v=v_cache.size(-1),
             cu_seqlens_q=cu_seqlens_q,
             page_size=page_size,
-            causal=causal,
+            causal=True,
         )
         schedule = get_scheduler_metadata(cache_seqlens=cache_seqlens, **problem)
         if context.full_graph_size is not None:  # the capture's warmup; the capture finds it here

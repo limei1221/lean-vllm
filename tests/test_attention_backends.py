@@ -1,6 +1,5 @@
 """Backends checked against dense_attention, an independent oracle using no SDPA or paging."""
 
-import numpy as np
 import pytest
 import torch
 
@@ -11,7 +10,6 @@ from lean_vllm.attention import (
     FlashMLABackend,
     LayerSpec,
     TorchAttention,
-    flash_backend,
     flashinfer_backend,
     get_attention_backend,
     triton_merge,
@@ -1089,27 +1087,6 @@ def _shared_prefix_step(decode: bool):
     return q, k_cache, v_cache, context, expected
 
 
-@pytest.mark.parametrize("decode", [True, False], ids=["decode", "prefill"])
-def test_fa3_cascade_matches_attending_each_row_whole(fake_fa3, decode):
-    """The shared pages read once for every query, unmasked, merged with each row's own keys past them."""
-    backend, fake = fake_fa3
-    q, k_cache, v_cache, context, expected = _shared_prefix_step(decode)
-    context.common_prefix_len = 2 * BLOCK_SIZE
-    attend = backend.decode if decode else lambda *args, **kw: backend.prefill(q, None, None, *args[1:], **kw)
-    out = torch.full_like(q, float("nan"))
-
-    got = attend(q, k_cache, v_cache, context, out=out)
-
-    assert got is out
-    torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
-    prefix, suffix = fake.schedules
-    assert (prefix["batch_size"], prefix["max_seqlen_q"], prefix["max_seqlen_k"]) == (1, q.size(0), 2 * BLOCK_SIZE)
-    assert not prefix["causal"] and prefix["cu_seqlens_q"] is None
-    assert (suffix["batch_size"], suffix["max_seqlen_k"], suffix["causal"]) == (3, 2 * BLOCK_SIZE, True)
-    suffix_lens = (context.context_lens - 2 * BLOCK_SIZE).tolist()
-    assert fake.calls[1].tolist() == [3, *suffix_lens]  # the suffix call ran on its schedule: each row's keys past it
-
-
 def test_fa3_makes_one_schedule_per_problem_per_step(fake_fa3):
     """The first layer to pose a problem makes it, and the rest are handed the same one."""
     backend, fake = fake_fa3
@@ -1145,18 +1122,3 @@ def test_fa3_full_graphs_read_a_schedule_refilled_before_replay(fake_fa3):
     assert fake.schedules[-1]["batch_size"] == 4 and fake.schedules[-1]["max_seqlen_k"] == width * BLOCK_SIZE
     FlashAttention3Backend.before_full_graph_replay(step, 2)
     assert buffer.tolist() == [2, 5, 9, 0, 0]  # a smaller graph's schedule, its stale tail zeroed
-
-
-@pytest.mark.parametrize(
-    "prefix, query_lens, want",
-    [
-        (255, [5] * 8, False),  # too short a prefix
-        (1024, [5] * 7, False),  # too few rows
-        (256, [5] * 8, True),  # prefill: no flash decoding to compete with
-        (4096, [1] * 256, True),  # a wide decode batch: cascade reads the prefix in fewer waves
-        (256, [1] * 8, False),  # a narrow one: flash decoding fills the SMs
-    ],
-)
-def test_fa3_cascades_as_vllms_heuristic_decides(prefix, query_lens, want):
-    """Qwen3-8B's 32 query heads over 8 key heads, on an H100's 132 SMs."""
-    assert flash_backend.use_cascade_attention(prefix, np.array(query_lens), 32, 8, 132) is want

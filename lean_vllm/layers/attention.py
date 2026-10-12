@@ -3,7 +3,6 @@ from collections.abc import Callable
 from itertools import accumulate
 from typing import cast
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -98,10 +97,6 @@ class Attention(nn.Module):
     def supports_full_cudagraph(self) -> bool:
         """Whether a full graph may hold this layer's decode."""
         return self.backend.supports_full_cudagraph()
-
-    def use_cascade_attention(self, common_prefix_len: int, query_lens: np.ndarray) -> bool:
-        """Whether this layer would attend the rows' shared prefix once for all of them this step."""
-        return self.backend.use_cascade_attention(common_prefix_len, query_lens)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         # Through an opaque op, so the compiled model splits here and attention runs eager between the pieces.
@@ -232,9 +227,6 @@ class MLAAttention(Attention):
     def supports_full_cudagraph(self) -> bool:
         # Decode must attend latents, as expanding them needs the step's host plan, and be safe to replay.
         return self.backend.supports_mla_decode() and self.backend.supports_full_cudagraph_mla_decode()
-
-    def use_cascade_attention(self, common_prefix_len: int, query_lens: np.ndarray) -> bool:
-        return False  # it attends through mla_decode and _prefill, which have no cascade path
 
     def forward(self, q: torch.Tensor, latent: torch.Tensor):  # type: ignore[override]
         out = q.new_empty(self.output_shape(q.size(0)))

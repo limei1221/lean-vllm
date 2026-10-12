@@ -76,7 +76,6 @@ class InFlightDrafts:
 
 
 class ModelRunner:
-    cascade_layers: list[Attention] = []  # one layer per type, backend and head counts; all must allow cascade
     proposer: MTPProposer | None = None  # set when speculative decoding is enabled
     num_speculative_tokens = 0
     graph_query_len = 1  # queries per row in a full decode graph: 1, or 1 + drafts when verifying
@@ -127,11 +126,9 @@ class ModelRunner:
             counts = Counter(layer.backend.get_name() for layer in layers)
             logger.info("attention backends: %s", ", ".join(f"{name} ({n} layers)" for name, n in counts.items()))
         self.attention_backends = list(dict.fromkeys(type(layer.backend) for layer in layers))  # replay hooks
-        groups = {(type(layer), type(layer.backend), layer.num_heads, layer.num_kv_heads): layer for layer in layers}
         self.decodes_latents = all(
             layer.backend.supports_mla_decode() for layer in layers if isinstance(layer, MLAAttention)
         )
-        self.cascade_layers = list(groups.values())
         self.enforce_eager = (
             config.enforce_eager
             or self.device.type != "cuda"
@@ -428,7 +425,6 @@ class ModelRunner:
         row_temperatures = [seq.temperature for seq in sampling_rows]
 
         block_tables = slot_mapping = None
-        common_prefix_len = 0
         tables = [seq.block_table for seq in batch]
         if any(tables):
             table = np.full((num_rows, max(map(len, tables))), -1, np.int32)
@@ -441,7 +437,6 @@ class ModelRunner:
             blocks = table[token_rows[keep], kept // block_size].astype(np.int64)
             slot_mapping = blocks * block_size + kept % block_size
             block_tables = buffers.put("block_tables", table, torch.int32)
-            common_prefix_len = self._cascade_prefix_len(table, starts, lens)
         cu_seqlens_q, cu_seqlens_k = cu_q.tolist(), cu_k.tolist()
         context = dict(
             is_prefill=is_prefill,
@@ -456,7 +451,6 @@ class ModelRunner:
             block_tables=block_tables,
             # A pure-decode batch uses every token row for sampling, so skip the logits gather.
             logits_indices=buffers.put("logits_indices", logits_indices, torch.int64) if is_prefill else None,
-            common_prefix_len=common_prefix_len,
             decode_query_len=query_len,
         )
         input_ids = buffers.put("input_ids", np.array(token_ids, np.int64), torch.int64)
@@ -549,24 +543,6 @@ class ModelRunner:
         blocks = context["block_tables"][token_rows_t, positions // block_size].long()
         context["slot_mapping"].copy_(blocks * block_size + positions % block_size)
 
-    def _cascade_prefix_len(self, table: np.ndarray, starts: np.ndarray, lens: np.ndarray) -> int:
-        """Return the shared cached prefix length for cascade attention, or 0 if it cannot be used.
-
-        Compare this batch's block tables and keep only whole blocks before every row's first query.
-        Every representative layer must allow cascade attention. This serves the role of vLLM's
-        _compute_cascade_attn_prefix_len, using only the requests scheduled in this step.
-        """
-        if len(starts) < 2 or not self.cascade_layers:
-            return 0
-        num_pages = int(starts.min()) // self.block_size
-        shared = (table[:, :num_pages] == table[0, :num_pages]).all(axis=0)
-        common_prefix_len = (num_pages if shared.all() else int(shared.argmin())) * self.block_size
-        if common_prefix_len and all(
-            layer.use_cascade_attention(common_prefix_len, lens) for layer in self.cascade_layers
-        ):
-            return common_prefix_len
-        return 0
-
     @staticmethod
     def decodes_first(seqs: list[Sequence], num_speculative_tokens: int = 0) -> list[Sequence]:
         """Put rows matching decode_query_len first so attention backends can split the batch with a slice.
@@ -578,15 +554,15 @@ class ModelRunner:
         query_len = decode_query_len(lens, num_speculative_tokens)
         return sorted(seqs, key=lambda seq: seq.num_scheduled_tokens != query_len)
 
-    def _step_kind(self, is_prefill: bool, num_tokens: int, cascade: bool = False, query_len: int = 1) -> str:
+    def _step_kind(self, is_prefill: bool, num_tokens: int, query_len: int = 1) -> str:
         """Return "graph", "piecewise", or a label explaining why this step runs without a graph.
 
         Full graphs require a pure-decode batch with query_len equal to graph_query_len and a captured size
-        large enough for the batch. Cascade attention cannot use these graphs because they capture standard decode.
+        large enough for the batch.
         """
         if self.cudagraph_mode == "none":
             return "enforced"
-        if not is_prefill and not cascade and self.cudagraph_mode in FULL_MODES and self.graph_bs:
+        if not is_prefill and self.cudagraph_mode in FULL_MODES and self.graph_bs:
             if query_len == self.graph_query_len and num_tokens <= self.graph_bs[-1] * query_len:
                 return "graph"
         if self.cudagraph_mode in PIECEWISE_MODES and self._piecewise_bucket(num_tokens):
@@ -597,9 +573,7 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         context = get_context()
-        self.step_kind = self._step_kind(
-            is_prefill, input_ids.size(0), context.common_prefix_len > 0, context.decode_query_len
-        )
+        self.step_kind = self._step_kind(is_prefill, input_ids.size(0), context.decode_query_len)
         if self.compile_backend is not None and not self.compile_backend.pieces:  # the first call traces the model
             mark_dynamic_tokens(input_ids, positions)
         if self.step_kind == "graph":

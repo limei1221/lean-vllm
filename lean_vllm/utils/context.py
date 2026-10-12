@@ -25,7 +25,6 @@ class Context:
     piecewise_size: int | None = None  # bucket size for piecewise graph capture or replay
     full_graph_size: int | None = None  # batch size for full graph capture
     num_actual_tokens: int | None = None  # token rows excluding piecewise graph padding; None means all rows
-    common_prefix_len: int = 0  # shared cached prefix length for cascade attention; 0 means no shared prefix is used
 
 
 def split_decodes_and_prefills(context: Context, query_len: int = 1) -> tuple[int, Context | None, Context | None]:
