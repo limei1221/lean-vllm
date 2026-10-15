@@ -204,7 +204,7 @@ A backend whose `split_decodes()` is true instead runs the step's one-query rows
 through `decode` and the rest through `prefill`, as vLLM's FlashInfer and MLA
 backends do (their `reorder_batch_threshold` is 1). The pieces:
 
-1. **Reorder.** `ModelRunner.decodes_first` puts one-query rows first, stably,
+1. **Reorder.** `ModelRunner.prepare_batch` puts one-query rows first, stably,
    like vLLM's `reorder_batch`. Only the token layout moves: `logits_indices`
    still lists sampling rows in the scheduler's order, which is the order it
    reads tokens back in.

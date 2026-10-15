@@ -3,11 +3,12 @@
 import pickle
 import random
 
+import numpy as np
 import pytest
 import torch
 
 from lean_vllm.attention import TorchAttention
-from lean_vllm.engine.model_runner import ModelRunner, cudagraph_capture_sizes
+from lean_vllm.engine.model_runner import ModelRunner, cudagraph_capture_sizes, decode_query_len
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.layers.attention import Attention, MLAAttention
 from lean_vllm.sampling_params import SamplingParams
@@ -499,11 +500,17 @@ class TestDummySamplerRun:
             sampling_runner._dummy_sampler_run()
 
 
+def decodes_first(seqs: list[Sequence], num_speculative_tokens: int = 0) -> list[Sequence]:
+    """prepare_batch's row order: rows of decode_query_len first, scheduler order kept within each group."""
+    query_len = decode_query_len(np.array([seq.num_scheduled_tokens for seq in seqs]), num_speculative_tokens)
+    return sorted(seqs, key=lambda seq: seq.num_scheduled_tokens != query_len)
+
+
 def reference_batch(seqs: list[Sequence], block_size: int) -> dict:
     """The per-token loops prepare_batch replaced, kept as its oracle; pending tokens aside."""
     out = dict(input_ids=[], positions=[], slot_mapping=[], cu_seqlens_q=[0], cu_seqlens_k=[0], context_lens=[])
     last_tokens = {}
-    for seq in ModelRunner.decodes_first(seqs):
+    for seq in decodes_first(seqs):
         start, end = seq.num_cached_tokens, seq.num_cached_tokens + seq.num_scheduled_tokens
         out["input_ids"] += seq[start:end] if seq.is_prefill else [seq.last_token]
         out["positions"] += range(start, end)
@@ -520,7 +527,7 @@ def reference_batch(seqs: list[Sequence], block_size: int) -> dict:
     out["logits_indices"] = [last_tokens[id(seq)] for seq in sampling]
     temperatures = [seq.temperature for seq in sampling]
     out["temperatures"] = None if all(t == 0 for t in temperatures) else temperatures
-    tables = [seq.block_table for seq in ModelRunner.decodes_first(seqs)]
+    tables = [seq.block_table for seq in decodes_first(seqs)]
     width = max(map(len, tables))
     out["block_tables"] = [table + [-1] * (width - len(table)) for table in tables] if width else None
     return out
