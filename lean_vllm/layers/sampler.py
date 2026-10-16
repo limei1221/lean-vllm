@@ -3,10 +3,12 @@ from torch import nn
 
 
 def apply_top_k_top_p(logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None) -> torch.Tensor:
-    """Masks each row's logits outside its top k, then outside its top p of probability.
+    """Mask each row's logits with top-k filtering, then top-p filtering.
 
-    A k of 0 keeps the whole row, as does a p of 1. It sorts the vocab, so a batch with neither passes None.
-    The logits are updated in place.
+    Top-p uses probabilities computed after top-k filtering. A k of 0 disables
+    top-k filtering, and a p of 1 disables top-p filtering. Pass None for both
+    filters to skip sorting the vocabulary. Update logits in place and return
+    the same tensor.
     """
     if k is None and p is None:
         return logits
@@ -18,7 +20,8 @@ def apply_top_k_top_p(logits: torch.Tensor, k: torch.Tensor | None, p: torch.Ten
         cutoff = logits_sort.gather(1, (vocab_size - k.long()).unsqueeze(1))
         logits_sort.masked_fill_(logits_sort < cutoff, -float("inf"))
     if p is not None:
-        # Ascending, so a token goes while the mass up to it is within 1 - p; the most likely one always stays.
+        # Remove the least likely tokens whose cumulative probability is at most 1 - p.
+        # Always keep the most likely token.
         probs_sum = logits_sort.softmax(dim=-1, dtype=torch.float32).cumsum(dim=-1)
         top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
         top_p_mask[:, -1] = False
@@ -38,7 +41,7 @@ class Sampler(nn.Module):
             return logits.argmax(dim=-1)
         return self.sample(logits, temperatures, top_k, top_p)
 
-    @torch.compile(dynamic=True)  # warmup's batch size is not serving's, so never recompile per size
+    @torch.compile(dynamic=True)  # Allow different batch sizes during warmup and serving without recompiling.
     def sample(
         self,
         logits: torch.Tensor,
@@ -51,5 +54,7 @@ class Sampler(nn.Module):
         logits = logits.div_(temperatures.clamp_min(1e-10).unsqueeze(dim=1))
         logits = apply_top_k_top_p(logits, top_k, top_p)
         probs = torch.softmax(logits, dim=-1)
+        # Exponential racing trick: argmax(probs / E), with independent E ~ Exp(1),
+        # samples one token per row according to probs (equivalent to the Gumbel-max trick).
         sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
         return torch.where(temperatures == 0, greedy_tokens, sample_tokens)

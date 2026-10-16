@@ -1,5 +1,7 @@
-"""Piecewise compilation: the model is traced once and split at attention, and each piece between
-two attention ops is compiled by Inductor. A piece captures one CUDA graph per bucket; attention runs eager between."""
+"""Split the traced model at attention ops and compile the remaining pieces with Inductor.
+
+Each compiled piece captures one CUDA graph per token-count bucket. Attention runs eagerly between pieces.
+"""
 
 from collections.abc import Callable
 from typing import Any
@@ -13,7 +15,7 @@ from torch.fx.passes.split_module import split_module
 
 from lean_vllm.utils.context import get_context
 
-# The opaque ops of layers/attention.py. A trace records the packet the model calls, so no overload suffix.
+# Custom ops defined in layers/attention.py. Match these names after removing any .default suffix.
 SPLITTING_OPS = ("lean_vllm.attention", "lean_vllm.mla_attention")
 
 
@@ -33,7 +35,7 @@ def split_at_attention(gm: fx.GraphModule) -> tuple[fx.GraphModule, set[str]]:
 
 
 def weak_ref(value: Any) -> Any:
-    """The tensors in value, viewed without keeping their memory alive, as vLLM's weak_ref_tensors."""
+    """Return tensor views that share memory without keeping it alive; recurse through lists and tuples."""
     if isinstance(value, (list, tuple)):
         return type(value)(weak_ref(item) for item in value)
     if not isinstance(value, torch.Tensor):
@@ -59,16 +61,17 @@ class Piece:
             graph, output = self.graphs[size]
             graph.replay()
             return output
-        self.compiled(*args)  # warm up outside the graph, where first launches may compile or allocate
+        self.compiled(*args)  # warm up before capture, since first launches may compile or allocate
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, self.pool):
             output = self.compiled(*args)
-        self.graphs[size] = graph, weak_ref(output)  # weak, so the pool can reuse it once later pieces read it
+        # Cache views without keeping output memory alive, so the pool can reuse it once later pieces read it.
+        self.graphs[size] = graph, weak_ref(output)
         return output
 
 
 class _CompilePieces(fx.Interpreter):
-    """Runs the split graph on fake inputs, so each piece compiles for the symbolic shapes it is called with."""
+    """Run the split graph on fake inputs and compile each non-attention piece for its symbolic input shapes."""
 
     def __init__(self, split: fx.GraphModule, attention: set[str], pool):
         super().__init__(split)
@@ -80,12 +83,12 @@ class _CompilePieces(fx.Interpreter):
         if target not in self.attention:
             piece = Piece(compile_fx(self.fetch_attr(target), list(args)), self.pool)
             self.pieces.append(piece)
-            self.module.__dict__[target] = piece  # past nn.Module's setattr, which wants a module
+            self.module.__dict__[target] = piece  # bypass nn.Module's setattr, which requires a module here
         return output
 
 
 class PiecewiseBackend:
-    """The torch.compile backend. It keeps every piece, so the runner can drop their graphs on exit."""
+    """The torch.compile backend: split and compile the traced graph, keeping pieces to clear on exit."""
 
     def __init__(self, pool=None):
         self.pool = pool
@@ -95,17 +98,17 @@ class PiecewiseBackend:
         split, attention = split_at_attention(gm)
         fake_mode = detect_fake_mode(example_inputs)
         assert fake_mode is not None
-        # Dynamo traced with fakes of these inputs; from_tensor returns those, symbolic sizes included.
+        # Reuse Dynamo's fake tensors, including their symbolic sizes, for compilation.
         fake_inputs = [fake_mode.from_tensor(x) if isinstance(x, torch.Tensor) else x for x in example_inputs]
         compiler = _CompilePieces(split, attention, self.pool)
         with fake_mode, enable_python_dispatcher():
             compiler.run(*fake_inputs)
-        self.pieces += compiler.pieces  # only now: a trace Dynamo restarts leaves nothing behind
+        self.pieces += compiler.pieces  # only once compilation finishes, so a restarted trace leaves none behind
         return split
 
 
 def compile_piecewise(model: nn.Module, pool=None) -> PiecewiseBackend:
-    """Set up in-place compilation. Call mark_dynamic_tokens on inputs before the first call traces the model."""
+    """Set up compilation on the model. Call mark_dynamic_tokens on inputs before the first model call."""
     backend = PiecewiseBackend(pool)
     # Skip guards so later steps reuse the trace for any token count, including one.
     model.compile(backend=backend, fullgraph=True, options={"guard_filter_fn": torch.compiler.skip_all_guards_unsafe})
