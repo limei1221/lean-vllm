@@ -5,6 +5,7 @@ import torch
 from lean_vllm.attention import triton_cache
 from lean_vllm.attention.abstract import AttentionBackend
 from lean_vllm.utils.context import Context
+from lean_vllm.utils.device import get_device
 
 _IMPORT_ERROR: ImportError | None = None
 try:
@@ -38,7 +39,7 @@ class FlashInferBackend(AttentionBackend):
         return (
             _IMPORT_ERROR is None
             and triton_cache._IMPORT_ERROR is None
-            and torch.cuda.is_available()
+            and get_device().type == "cuda"
             and torch.cuda.get_device_capability()[0] >= 8
         )
 

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from lean_vllm.attention import triton_cache
 from lean_vllm.attention.abstract import AttentionBackend, write_into
 from lean_vllm.utils.context import Context
+from lean_vllm.utils.device import get_device
 
 _IMPORT_ERROR: ImportError | None = None
 try:
@@ -37,7 +38,7 @@ class FlashAttention3Backend(AttentionBackend):
         return (
             _IMPORT_ERROR is None
             and triton_cache._IMPORT_ERROR is None
-            and torch.cuda.is_available()
+            and get_device().type == "cuda"
             and torch.cuda.get_device_capability()[0] == 9
         )
 

@@ -76,6 +76,8 @@ filterwarnings = [
     # torch.utils.mkldnn, pulled in by @torch.compile's inductor import, still uses
     # torch.jit.script_method internally. torch warning about its own API; drop on upgrade.
     'ignore:`torch\.jit\.script_method` is deprecated:DeprecationWarning',
+    # flashinfer 0.7.0's CuTe DSL kernels use names cutlass-dsl 4.8 deprecated; drop on upgrade.
+    'ignore::DeprecationWarning:flashinfer\..*',
 ]
 
 [tool.ruff]
