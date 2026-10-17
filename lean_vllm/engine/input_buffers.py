@@ -47,7 +47,7 @@ class InputBuffers:
         n = values.size
         if name not in self._device or self._device[name].numel() < n:
             capacity = max(n, 2 * (self._device[name].numel() if name in self._device else 0), MIN_CAPACITY)
-            self._pinned[name] = torch.empty(capacity, dtype=dtype, pin_memory=True)
+            self._pinned[name] = torch.empty(capacity, dtype=dtype, device="cpu", pin_memory=True)
             self._host[name] = self._pinned[name].numpy()
             self._device[name] = torch.empty(capacity, dtype=dtype, device=self.device)
         self._host[name][:n] = values.reshape(-1)
