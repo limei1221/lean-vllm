@@ -7,8 +7,8 @@ produced.
 
 It serves every model the engine loads (Qwen3 and DeepSeek-V2, see
 [deepseek-v2.md](deepseek-v2.md)), one model per server. On Qwen3-8B on an H100
-it matches vLLM below saturation and trails it by 3.7–3.9% at the plateau
-([3 October report](benchmark-2026-10-03-Qwen3-8B.md)).
+it matches vLLM below saturation and trails it by 0.6–1.7% at the plateau
+([17 October report](benchmark-2026-10-17-Qwen3-8B.md)).
 
 ## What is supported
 
@@ -130,19 +130,19 @@ goodput alongside p99.
 
 ## Performance
 
-The [3 October report](benchmark-2026-10-03-Qwen3-8B.md) compares lean-vLLM with vLLM 0.26.0 on Qwen3-8B
+The [17 October report](benchmark-2026-10-17-Qwen3-8B.md) compares lean-vLLM with vLLM 0.26.0 on Qwen3-8B
 on one H100:
 
 - Below saturation the two are at parity: identical goodput at load 1, and
-  median TPOT 3% higher.
-- At the plateau lean-vLLM reaches 24.81–25.06 requests/s against vLLM's
-  25.76–26.09.
-- Async scheduling adds 1.5–6.7% goodput under load.
-- Large prefill steps now run compiled on both engines, so the remaining gap
-  sits in the graph steps: lean-vLLM captures 13 piecewise sizes to vLLM's 51,
-  and pads more when a step falls between them.
+  median TPOT within 1%.
+- At the plateau lean-vLLM reaches 25.52–25.58 requests/s against vLLM's
+  25.68–26.02.
+- Async scheduling adds 2.3–7.4% goodput under load.
+- Both engines now capture the same graph sizes and compile the large prefill
+  steps the same way. Offline, lean-vLLM's step is 17% longer than vLLM's,
+  mostly in kernel time.
 
-DeepSeek-V2-Lite has its own [3 October report](benchmark-2026-10-03-DeepSeek-V2-Lite.md).
+DeepSeek-V2-Lite has its own [17 October report](benchmark-2026-10-17-DeepSeek-V2-Lite.md).
 
 ## How it works
 
@@ -225,8 +225,8 @@ offsets, slot mapping and which rows sample.
 Under tensor parallelism every rank all-gathers the logits and samples with the
 same seed, as vLLM does, so each rank can prepare its next step without waiting
 for rank 0. This has passed on CPU but not yet run on GPUs. On an H100 async
-scheduling cuts offline GPU idle time from 26.5% to 2.9%
-([3 October report](benchmark-2026-10-03-Qwen3-8B.md#offline-pipelining-removes-the-gpu-idle)).
+scheduling cuts offline GPU idle time from 22.5% to 3.3%
+([17 October report](benchmark-2026-10-17-Qwen3-8B.md#offline-pipelining-removes-the-gpu-idle-and-vllm-runs-less-kernel-time)).
 
 ### CUDA graphs
 

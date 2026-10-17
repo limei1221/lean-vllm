@@ -74,17 +74,17 @@ See the [client example](example_serving.py) and
 
 ## Benchmarks
 
-Latest recorded results: 3 October 2026, one H100 80 GB, vLLM 0.26.0,
+Latest recorded results: 17 October 2026, one H100 80 GB, vLLM 0.26.0,
 1,000 requests per point, async scheduling enabled on both engines.
 
 ![Qwen3-8B: completed requests per second and median time per output token versus offered load](assets/benchmarks/qwen3-8b.png)
 
 ![DeepSeek-V2-Lite-Chat: completed requests per second and median time per output token versus offered load](assets/benchmarks/deepseek-v2-lite.png)
 
-The figures use numbers from the [results table](docs/benchmark-results-2026-10-03.md).
-For detailed analysis, see the 3 October reports for
-[Qwen3-8B](docs/benchmark-2026-10-03-Qwen3-8B.md) and
-[DeepSeek-V2-Lite](docs/benchmark-2026-10-03-DeepSeek-V2-Lite.md).
+The figures use numbers from the [results table](docs/benchmark-results-2026-10-17.md).
+For detailed analysis, see the 17 October reports for
+[Qwen3-8B](docs/benchmark-2026-10-17-Qwen3-8B.md) and
+[DeepSeek-V2-Lite](docs/benchmark-2026-10-17-DeepSeek-V2-Lite.md).
 
 ## Credit
 
