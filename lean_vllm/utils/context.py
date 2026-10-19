@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -19,9 +19,10 @@ class Context:
     cu_seqlens_k_host: list[int] | None = None
     context_chunks: list | None = None  # filled on first use by layers.attention.context_chunks
     mla_decode_metadata: object | None = None  # FlashMLA schedule metadata, created by the first layer that needs it
-    decode_splits: dict | None = None  # cached results of split_decodes_and_prefills, keyed by query length
+    # cached results of split_decodes_and_prefills, keyed by query length
+    decode_splits: dict = field(default_factory=dict)
     decode_query_len: int = 1  # queries per leading decode row; includes draft tokens during verification
-    attn_metadata: dict | None = None  # backend plans reused across layers, such as FlashInfer wrappers
+    attn_metadata: dict = field(default_factory=dict)  # backend plans reused across layers, such as FlashInfer wrappers
     piecewise_size: int | None = None  # bucket size for piecewise graph capture or replay
     full_graph_size: int | None = None  # batch size for full graph capture
     num_actual_tokens: int | None = None  # token rows excluding piecewise graph padding; None means all rows
@@ -38,8 +39,6 @@ def split_decodes_and_prefills(context: Context, query_len: int = 1) -> tuple[in
     """
     if context.block_tables is None or context.cu_seqlens_q_host is None:
         return 0, None, context  # no block tables or host query lengths; keep the batch in the prefill group
-    if context.decode_splits is None:
-        context.decode_splits = {}
     if query_len not in context.decode_splits:
         cu_q, cu_k = context.cu_seqlens_q_host, context.cu_seqlens_k_host
         assert cu_k is not None and context.cu_seqlens_q is not None and context.cu_seqlens_k is not None

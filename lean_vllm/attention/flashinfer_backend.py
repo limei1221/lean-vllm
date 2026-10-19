@@ -123,8 +123,6 @@ class FlashInferBackend(AttentionBackend):
             layout,
             graph_size,
         )
-        if context.attn_metadata is None:
-            context.attn_metadata = {}
         if key in context.attn_metadata:
             return context.attn_metadata[key]
         wrapper = FlashInferBackend._wrappers.get(key)

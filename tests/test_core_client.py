@@ -6,6 +6,8 @@ The core runs conftest's fake engine, built by the factories below in the spawne
 import asyncio
 import multiprocessing as mp
 import os
+import signal
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 import pytest
@@ -55,6 +57,13 @@ def fake_engine(script: list[int] | None = None, explode: bool = False, **overri
 
 def failing_engine():
     raise ValueError("no such model")
+
+
+def orphan_a_core(pid_pipe) -> None:
+    """A client that starts its core, says which process it is, and dies without stopping it."""
+    client = AsyncMPClient(fake_engine, shutdown_timeout=10)
+    pid_pipe.send(client._process.pid)
+    os._exit(0)  # no atexit, so nothing tells the core
 
 
 @pytest.fixture
@@ -191,6 +200,24 @@ class TestDeath:
         await collect(client, list(range(8)), SamplingParams(max_tokens=2, ignore_eos=True))
         client.stop()
         assert client.engine_core._process.exitcode == 0
+
+    def test_an_idle_core_exits_once_its_client_is_gone(self):
+        ctx = mp.get_context("spawn")
+        receiver, sender = ctx.Pipe(duplex=False)
+        client = ctx.Process(target=orphan_a_core, args=(sender,))
+        client.start()
+        assert receiver.poll(60), "the client never reported its core"
+        core = receiver.recv()
+        client.join(10)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.kill(core, 0)
+            except ProcessLookupError:
+                return  # exited, and reaped by its new parent
+            time.sleep(0.05)
+        os.kill(core, signal.SIGKILL)
+        raise AssertionError("the core outlived its client")
 
 
 ENGINE_ARGS = dict(enforce_eager=True, kvcache_memory_gb=0.25, max_model_len=256, max_num_batched_tokens=256)

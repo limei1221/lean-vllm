@@ -13,12 +13,6 @@ except ImportError as e:  # Hopper only, and built by the cuda extra
     _IMPORT_ERROR = e
 
 
-def _step_cache(context: Context) -> dict:
-    if context.attn_metadata is None:
-        context.attn_metadata = {}
-    return context.attn_metadata
-
-
 class FlashAttention3Backend(AttentionBackend):
     """FlashAttention-3 kernels with a Triton KV-cache scatter. Hopper only.
 
@@ -155,7 +149,7 @@ class FlashAttention3Backend(AttentionBackend):
         page_size = k_cache.size(1)
         shape = (self.num_heads, self.num_kv_heads, self.head_dim, v_cache.size(-1), q.dtype, page_size)
         key = ("fa3", kind, *shape, context.full_graph_size)  # the step cache holds other backends' plans too
-        cache = _step_cache(context)
+        cache = context.attn_metadata
         if key in cache:
             return cache[key]
         varlen = cu_seqlens_q is not None

@@ -1,7 +1,6 @@
 import logging
 import math
 from collections import Counter
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial
@@ -13,6 +12,13 @@ from torch.profiler import record_function
 
 from lean_vllm.config import FULL_MODES, PIECEWISE_MODES, Config
 from lean_vllm.engine.compilation import PiecewiseBackend, compile_piecewise, mark_dynamic_tokens
+from lean_vllm.engine.cuda_graphs import (
+    capture_graph,
+    full_graph_buffers,
+    pad_to_bucket,
+    replay_full_graph,
+    smallest_fitting,
+)
 from lean_vllm.engine.input_buffers import InputBuffers
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.sequence import Sequence
@@ -585,42 +591,34 @@ class ModelRunner:
     def _replay_full(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Replay a full-model graph for a pure-decode batch, including attention.
 
-        Use the smallest captured batch size that fits. Padding rows have zero context length and do not
-        write to the cache.
+        Use the smallest captured batch size that fits.
         """
-        num_tokens = input_ids.size(0)
-        bs = num_tokens // self.graph_query_len
-        context = get_context()
-        graph_bs = next(x for x in self.graph_bs if x >= bs)
-        graph = self.graphs[graph_bs]
-        graph_vars = self.graph_vars
-        graph_vars["input_ids"][:num_tokens] = input_ids
-        graph_vars["positions"][:num_tokens] = positions
-        graph_vars["slot_mapping"].fill_(-1)
-        graph_vars["slot_mapping"][:num_tokens] = context.slot_mapping
-        graph_vars["context_lens"].zero_()
-        graph_vars["context_lens"][:bs] = context.context_lens
-        graph_vars["block_tables"][:bs, : context.block_tables.size(1)] = context.block_tables
-        for backend in self.attention_backends:  # e.g. FlashInfer re-plans the graph's decode
-            backend.before_full_graph_replay(context, graph_bs)
-        graph.replay()
-        return graph_vars["outputs"][:num_tokens]
+        graph_bs = smallest_fitting(self.graph_bs, input_ids.size(0) // self.graph_query_len)
+        assert graph_bs is not None
+        return replay_full_graph(
+            self.graphs[graph_bs],
+            self.graph_vars,
+            get_context(),
+            graph_bs,
+            self.attention_backends,
+            input_ids=input_ids,
+            positions=positions,
+        )
 
     def _piecewise_bucket(self, num_tokens: int) -> int | None:
         """Return the smallest fitting piecewise bucket, or None for sizes outside the captured range."""
-        bucket = next((size for size in self.piecewise_bs if size >= num_tokens), None)
+        bucket = smallest_fitting(self.piecewise_bs, num_tokens)
         return None if bucket is None or num_tokens < self.piecewise_bs[0] else bucket
 
     def _replay_piecewise(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Pad inputs to a piecewise bucket and replay its graphs; attention runs eagerly on unpadded token rows."""
         num_tokens = input_ids.size(0)
         bucket = self._piecewise_bucket(num_tokens)
-        buffers = self.piecewise_vars
-        buffers["input_ids"][:num_tokens] = input_ids
-        buffers["positions"][:num_tokens] = positions
-        context = get_context()
-        context.piecewise_size, context.num_actual_tokens = bucket, num_tokens
-        return self.model(buffers["input_ids"][:bucket], buffers["positions"][:bucket])[:num_tokens]
+        assert bucket is not None
+        input_ids, positions = pad_to_bucket(
+            self.piecewise_vars, bucket, get_context(), input_ids=input_ids, positions=positions
+        )
+        return self.model(input_ids, positions)[:num_tokens]
 
     def _verify(self, logits: torch.Tensor, temperatures: torch.Tensor | None) -> torch.Tensor:
         """Return accepted drafts and the next token for each sampling row, padded with -1.
@@ -671,25 +669,20 @@ class ModelRunner:
         self.graph_bs = [bs for bs in self._decode_graph_sizes() if bs * q <= config.max_num_batched_tokens]
         if not self.graph_bs:
             return
-        max_bs = self.graph_bs[-1]
-        max_num_blocks = self._max_num_blocks()
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        # Size FlashMLA's captured tile schedule and split-KV workspace for max_model_len tokens per row.
-        context_lens.fill_(config.max_model_len)
-        self.graph_vars = dict(
-            input_ids=torch.zeros(max_bs * q, dtype=torch.int64),
-            positions=torch.zeros(max_bs * q, dtype=torch.int64),
-            slot_mapping=torch.zeros(max_bs * q, dtype=torch.int32),
-            context_lens=context_lens,
-            block_tables=torch.zeros(max_bs, max_num_blocks, dtype=torch.int32),
-            outputs=torch.zeros(max_bs * q, hf_config.hidden_size),
+        self.graph_vars = graph_vars = full_graph_buffers(
+            self.graph_bs[-1],
+            q,
+            self._max_num_blocks(),
+            config.max_model_len,
+            hf_config.hidden_size,
+            hf_config.dtype,
+            self.device,
         )
-        graph_vars = self.graph_vars
         for bs in reversed(self.graph_bs):
             with set_context(
                 False,
                 slot_mapping=graph_vars["slot_mapping"][: bs * q],
-                context_lens=context_lens[:bs],
+                context_lens=graph_vars["context_lens"][:bs],
                 block_tables=graph_vars["block_tables"][:bs],
                 full_graph_size=bs,
             ) as context:
@@ -710,13 +703,7 @@ class ModelRunner:
             input_ids, positions = graph_vars["input_ids"][:num_tokens], graph_vars["positions"][:num_tokens]
             graph_vars["outputs"][:num_tokens] = self.model(input_ids, positions)
 
-    @staticmethod
-    def _capture(run: Callable[[], None], pool) -> torch.cuda.CUDAGraph:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool):
-            run()
-        torch.cuda.synchronize()
-        return graph
+    _capture = staticmethod(capture_graph)
 
     @torch.inference_mode()
     def capture_piecewise(self):

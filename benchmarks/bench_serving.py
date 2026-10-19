@@ -20,6 +20,7 @@ import httpx
 import numpy as np
 from openai import AsyncOpenAI
 from prometheus_client.parser import text_string_to_metric_families
+from tqdm import tqdm
 
 PERCENTILES = (50, 90, 95, 99)
 
@@ -178,24 +179,21 @@ class Run:
     """What has finished so far, and whether the client should keep sending."""
 
     def __init__(self, total: int, max_failure_rate: float, quiet: bool):
-        self.total = total
         self.budget = max(2, int(max_failure_rate * total))
-        self.quiet = quiet
-        self.done = 0
         self.failed = 0
         self.first_error: str | None = None
         self.aborted = False
+        self.progress = tqdm(total=total, desc="requests", unit="req", disable=quiet, file=sys.stderr)
 
     def finish(self, result: Result) -> Result:
-        self.done += 1
         if result.status == "failed":
             self.failed += 1
             self.first_error = self.first_error or result.error
             if self.failed > self.budget and not self.aborted:
                 self.aborted = True
-                print(f"\naborting: {self.failed} failures, the first {self.first_error}", file=sys.stderr)
-        if not self.quiet:
-            print(f"\r{self.done}/{self.total} done, {self.failed} failed", end="", file=sys.stderr)
+                tqdm.write(f"aborting: {self.failed} failures, the first {self.first_error}", file=sys.stderr)
+        self.progress.set_postfix(failed=self.failed, refresh=False)
+        self.progress.update()
         return result
 
 
@@ -268,8 +266,7 @@ async def run_trace(
     else:
         results = list(await asyncio.gather(*tasks))
     duration = perf_counter() - t0
-    if not args.quiet:
-        print(file=sys.stderr)
+    run.progress.close()
     return results, run, duration
 
 

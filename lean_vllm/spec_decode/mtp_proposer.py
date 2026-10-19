@@ -7,6 +7,13 @@ import torch
 from torch import nn
 
 from lean_vllm.engine.compilation import PiecewiseBackend, compile_piecewise, mark_dynamic_tokens
+from lean_vllm.engine.cuda_graphs import (
+    capture_graph,
+    full_graph_buffers,
+    pad_to_bucket,
+    replay_full_graph,
+    smallest_fitting,
+)
 from lean_vllm.engine.input_buffers import InputBuffers
 from lean_vllm.models.deepseek_mtp import DeepSeekMTP
 from lean_vllm.utils.context import Context, set_context
@@ -123,7 +130,7 @@ class MTPProposer:
             self._step_context(sample_positions, table, cu_seqlens_q, inputs.max_position, step)
             for step in range(1, self.num_speculative_tokens)
         ]
-        graph_bs = next((size for size in self.graph_bs if size >= num_rows), None)
+        graph_bs = smallest_fitting(self.graph_bs, num_rows)
         for step, (step_positions, step_context) in enumerate(steps, 1):
             with set_context(**step_context) as step_ctx:
                 if graph_bs is None or step_ctx.block_tables is None:  # past the largest graph, or warmup
@@ -145,15 +152,16 @@ class MTPProposer:
         """The first pass, padded to the smallest captured bucket that holds it, as the target's _replay_piecewise.
         The target's hidden states are copied in before any replay, which may reuse the pool they sit in."""
         n = input_ids.size(0)
-        bucket = next((size for size in self.piecewise_bs if size >= n), None)
+        bucket = smallest_fitting(self.piecewise_bs, n)
         if bucket is not None:
-            graph_vars = self.piecewise_vars
-            graph_vars["input_ids"][:n] = input_ids
-            graph_vars["positions"][:n] = positions
-            graph_vars["hidden_states"][:n] = hidden_states
-            context.piecewise_size, context.num_actual_tokens = bucket, n
-            input_ids, positions = graph_vars["input_ids"][:bucket], graph_vars["positions"][:bucket]
-            hidden_states = graph_vars["hidden_states"][:bucket]
+            input_ids, positions, hidden_states = pad_to_bucket(
+                self.piecewise_vars,
+                bucket,
+                context,
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=hidden_states,
+            )
         return self._first_pass(input_ids, positions, hidden_states)[:n]
 
     def _first_pass(
@@ -200,26 +208,17 @@ class MTPProposer:
         hidden_states: torch.Tensor,
         context: Context,
     ) -> torch.Tensor:
-        """The pass for these rows from the graph of bs rows, as the target's _replay_full; padding rows write no
-        slot and attend nothing."""
-        assert context.slot_mapping is not None and context.context_lens is not None
-        assert context.block_tables is not None
-        graph_vars = self.graph_vars
-        n = input_ids.size(0)
-        graph_vars["input_ids"][:n] = input_ids
-        graph_vars["positions"][:n] = positions
-        graph_vars["hidden_states"][:n] = hidden_states
-        graph_vars["slot_mapping"].fill_(-1)
-        graph_vars["slot_mapping"][:n] = context.slot_mapping
-        graph_vars["context_lens"].zero_()
-        graph_vars["context_lens"][:n] = context.context_lens
-        # Positions stop short of max_model_len, so blocks past the buffer's width are lookahead no pass reads.
-        width = min(context.block_tables.size(1), graph_vars["block_tables"].size(1))
-        graph_vars["block_tables"][:n, :width] = context.block_tables[:, :width]
-        for backend in self.graph_backends:
-            backend.before_full_graph_replay(context, bs)
-        self.graphs[(layer, bs)].replay()
-        return graph_vars["outputs"][:n]
+        """The pass for these rows from the graph of bs rows, as the target's _replay_full."""
+        return replay_full_graph(
+            self.graphs[(layer, bs)],
+            self.graph_vars,
+            context,
+            bs,
+            self.graph_backends,
+            input_ids=input_ids,
+            positions=positions,
+            hidden_states=hidden_states,
+        )
 
     @torch.inference_mode()
     def capture_piecewise(self, size: int) -> None:
@@ -247,17 +246,10 @@ class MTPProposer:
         if not layers:
             return  # one draft per row, which the first pass makes
         weight = next(self.drafter.parameters())
-        max_bs, hidden_size, device = sizes[-1], self.drafter.hidden_size, weight.device
-        self.graph_vars = dict(
-            input_ids=torch.zeros(max_bs, dtype=torch.int64, device=device),
-            positions=torch.zeros(max_bs, dtype=torch.int64, device=device),
-            hidden_states=torch.zeros(max_bs, hidden_size, dtype=weight.dtype, device=device),
-            slot_mapping=torch.zeros(max_bs, dtype=torch.int32, device=device),
-            # FlashMLA bakes its schedule from the lengths at capture, so the worst case, as the target's capture.
-            context_lens=torch.full((max_bs,), self.max_model_len, dtype=torch.int32, device=device),
-            block_tables=torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=device),
-            outputs=torch.zeros(max_bs, hidden_size, dtype=weight.dtype, device=device),
+        self.graph_vars = full_graph_buffers(
+            sizes[-1], 1, max_num_blocks, self.max_model_len, self.drafter.hidden_size, weight.dtype, weight.device
         )
+        self.graph_vars["hidden_states"] = torch.zeros_like(self.graph_vars["outputs"])
         self.graph_backends = backends
         for bs in reversed(sizes):
             for layer in layers:
@@ -281,8 +273,4 @@ class MTPProposer:
     @staticmethod
     def _capture(run: Callable[[], None], pool) -> torch.cuda.CUDAGraph:
         run()  # outside the graph first, where first launches may compile or allocate
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool):
-            run()  # a fresh context, so FlashMLA's schedule holder lands in the graph's pool
-        torch.cuda.synchronize()
-        return graph
+        return capture_graph(run, pool)  # a fresh context, so FlashMLA's schedule holder lands in the graph's pool

@@ -20,7 +20,6 @@ from lean_vllm.engine.scheduler import InvalidRequest
 logger = logging.getLogger(__name__)
 
 IDLE_POLL_MS = 5  # backoff after a step that ran nothing although work is outstanding
-PARENT_POLL_MS = 1000  # how often an idle core checks that the client is still there
 
 
 def make_engine(model: str, **kwargs):
@@ -47,6 +46,12 @@ class EngineCore:
         self.input = input_socket
         self.output = output_socket
         self.running = True
+        # An idle core waits on the client's sentinel too, which turns ready when the client process exits.
+        self.poller = zmq.Poller()
+        self.poller.register(self.input, zmq.POLLIN)
+        parent = parent_process()
+        if parent is not None:
+            self.poller.register(parent.sentinel, zmq.POLLIN)
 
     def run(self):
         while self.running:
@@ -62,12 +67,10 @@ class EngineCore:
     def _handle_inputs(self, wait_ms: int | None):
         """Handle queued messages, waiting up to wait_ms for the first. None waits until a message or parent exit."""
         if wait_ms is None:
-            while not self.input.poll(PARENT_POLL_MS):
-                parent = parent_process()
-                if parent is not None and not parent.is_alive():
-                    logger.warning("the client process is gone, so the engine core exits")
-                    self.running = False
-                    return
+            if self.input not in dict(self.poller.poll()):  # only the sentinel is ready
+                logger.warning("the client process is gone, so the engine core exits")
+                self.running = False
+                return
         elif wait_ms and not self.input.poll(wait_ms):
             return
         while self.running:
