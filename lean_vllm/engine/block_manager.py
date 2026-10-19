@@ -1,5 +1,4 @@
 from collections import OrderedDict
-from typing import Iterable
 
 from lean_vllm.engine.sequence import Sequence
 
@@ -21,26 +20,32 @@ class Block:
         self.token_ids = []
 
 
-class FreeBlockQueue:
-    """Free blocks, least recently released first. An OrderedDict, as a prefix hit takes one from the middle."""
+class FreeKVCacheBlockQueue:
+    """Free blocks, least recently released first.
 
-    def __init__(self, block_ids: Iterable[int]):
-        self._ids: OrderedDict[int, None] = OrderedDict.fromkeys(block_ids)
+    A prefix hit takes a block out of the middle in O(1).
+    """
 
-    def popleft(self) -> int:
-        return self._ids.popitem(last=False)[0]
+    def __init__(self, blocks: list[Block]):
+        self._blocks = OrderedDict((block.block_id, block) for block in blocks)
 
-    def append(self, block_id: int):
-        self._ids[block_id] = None
+    @property
+    def num_free_blocks(self) -> int:
+        return len(self._blocks)
 
-    def remove(self, block_id: int):
-        del self._ids[block_id]
+    def popleft(self) -> Block:
+        assert self._blocks, "no free blocks"
+        return self._blocks.popitem(last=False)[1]
 
-    def __len__(self) -> int:
-        return len(self._ids)
+    def remove(self, block: Block):
+        assert block.block_id in self._blocks
+        del self._blocks[block.block_id]
 
-    def __iter__(self):
-        return iter(self._ids)
+    def append(self, block: Block):
+        self._blocks[block.block_id] = block
+
+    def get_all_free_blocks(self) -> list[Block]:
+        return list(self._blocks.values())
 
 
 class BlockManager:
@@ -49,12 +54,12 @@ class BlockManager:
     ):
         self.block_size = block_size
         self.enable_prefix_caching = enable_prefix_caching
-        # An MTP drafter's cache at a block's last token depends on the token after it, so that block recomputes,
-        # as vLLM's use_eagle.
+        # The MTP drafter's KV cache at a block's last position depends on the next token, outside the block.
+        # Recompute the last matching cached block because that token may differ, as in vLLM's use_eagle logic.
         self.recompute_last_hit = recompute_last_hit
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids = FreeBlockQueue(range(num_blocks))
+        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
         self.used_block_ids: set[int] = set()
 
     @property
@@ -62,8 +67,8 @@ class BlockManager:
         return len(self.used_block_ids) / len(self.blocks) if self.blocks else 0.0
 
     def _allocate_block(self) -> int:
-        block_id = self.free_block_ids.popleft()
-        block = self.blocks[block_id]
+        block = self.free_block_queue.popleft()
+        block_id = block.block_id
         assert block.ref_count == 0
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
@@ -74,14 +79,14 @@ class BlockManager:
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
+        self.free_block_queue.append(self.blocks[block_id])
 
     def _num_blocks(self, seq: Sequence, num_lookahead: int) -> int:
-        """Blocks seq needs once every reserved token lands and num_lookahead more slots are written."""
+        """Return the number of blocks needed for existing tokens, pending tokens, and additional lookahead slots."""
         return (seq.num_planned_tokens + num_lookahead + self.block_size - 1) // self.block_size
 
     def can_allocate(self, seq: Sequence, num_lookahead: int = 0) -> int:
-        """Cached blocks seq would get, or -1 if the rest does not fit. The trailing block always recomputes."""
+        """Return the reusable prefix block count, or -1 if allocation cannot fit. Exclude seq's final block."""
         num_cached_blocks = 0
         num_new_blocks = self._num_blocks(seq, num_lookahead)
         last_hit_held = False
@@ -96,7 +101,7 @@ class BlockManager:
         if self.recompute_last_hit and num_cached_blocks:
             num_cached_blocks -= 1
             num_new_blocks += last_hit_held
-        if len(self.free_block_ids) < num_new_blocks:
+        if self.free_block_queue.num_free_blocks < num_new_blocks:
             return -1
         return num_cached_blocks
 
@@ -109,7 +114,7 @@ class BlockManager:
                 block.ref_count += 1
             else:
                 block.ref_count = 1
-                self.free_block_ids.remove(block_id)
+                self.free_block_queue.remove(block)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
         for _ in range(num_cached_blocks, self._num_blocks(seq, num_lookahead)):
@@ -131,15 +136,15 @@ class BlockManager:
         return max(self._num_blocks(seq, num_lookahead) - len(seq.block_table), 0)
 
     def can_append(self, seq: Sequence, num_lookahead: int = 0) -> bool:
-        """Whether the blocks for seq's next token, and num_lookahead slots past it (drafts), are free."""
-        return len(self.free_block_ids) >= self._num_missing_blocks(seq, num_lookahead)
+        """Check for enough free blocks to cover seq's planned tokens plus num_lookahead draft slots."""
+        return self.free_block_queue.num_free_blocks >= self._num_missing_blocks(seq, num_lookahead)
 
     def may_append(self, seq: Sequence, num_lookahead: int = 0):
         for _ in range(self._num_missing_blocks(seq, num_lookahead)):
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence, num_computed_tokens: int):
-        """Publish each full block once its KV is computed and its tokens are known (a reserved token can lag)."""
+        """Publish full blocks once their KV is computed and token IDs committed (async or draft tokens can lag)."""
         if not self.enable_prefix_caching:
             return
         end = min(num_computed_tokens, seq.num_tokens) // self.block_size

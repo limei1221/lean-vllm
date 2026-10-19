@@ -9,7 +9,7 @@ from lean_vllm.kv_transfer.base import (
     ReqToRecv,
     check_kv_transfer_params,
 )
-from lean_vllm.kv_transfer.tcp_connector import TcpConnectorScheduler, TcpConnectorWorker
+from lean_vllm.kv_transfer.nixl_connector import NixlConnectorScheduler, NixlConnectorWorker
 
 __all__ = [
     "KVConnectorMetadata",
@@ -27,7 +27,7 @@ __all__ = [
 ]
 
 # As vLLM's KVConnectorFactory: a name in kv_transfer_config, and the class for each half.
-CONNECTORS = {"TcpConnector": (TcpConnectorScheduler, TcpConnectorWorker)}
+CONNECTORS = {"NixlConnector": (NixlConnectorScheduler, NixlConnectorWorker)}
 
 
 def parse_kv_transfer_config(value: "str | dict | KVTransferConfig") -> KVTransferConfig:

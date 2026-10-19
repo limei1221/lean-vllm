@@ -75,6 +75,17 @@ When an MLA model's layers would take `flashmla`, `Config` switches the KV cache
 to 64-token pages and logs a warning. It resolves the backend from the spec the
 layers will build, before any layer exists.
 
+### KV cache layout
+
+Backends see each layer's key and value caches as `(block, token, head, dim)`.
+Underneath they are NHD, that shape itself, or HND, `(block, head, token, dim)`,
+bound as a transposed view. HND keeps each head's slice of a block contiguous,
+which `NixlConnector` needs to read one rank's share of the heads, so every
+disaggregated engine runs on HND. `LEAN_VLLM_KV_CACHE_LAYOUT=HND` sets it otherwise, as
+vLLM's `VLLM_KV_CACHE_LAYOUT`. The Triton store and `torch` write by the cache's
+strides, FlashAttention-3 reads them, and FlashInfer is handed the HND tensor
+with its `HND` layout. MLA latents have no heads, so their layout never changes.
+
 Graphs depend on every layer: the runner stays eager if any layer's backend
 reports `supports_cuda_graph()` false, and drops full graphs for piecewise if
 any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
@@ -95,6 +106,7 @@ any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
 | Check | Where | Result |
 |---|---|---|
 | Every available backend against a dense reference: prefill, paged prefill, prefix-cache hits, decode, mixed batches, `varlen_with_lse` | Every machine the suite runs on | Pass |
+| An HND cache stores and attends as an NHD one | Every machine the suite runs on | Pass on CPU (`torch`); the GPU backends not run yet |
 | `mla_decode` against the reference at FlashMLA's shapes | CPU (`torch`); H100 (`flashmla`) | Pass on CPU; H100 result not recorded |
 | The CUDA backend against the reference | A100, back when that backend was FlashAttention-2 | Pass |
 | FlashAttention-3 suite | H100 | Not recorded, though both FA3 backends have served benchmarks there |
@@ -105,8 +117,7 @@ any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
 | FlashInfer's full-graph wrappers: one per batch size over shared buffers, padded rows, re-planned before replay | CPU, with a fake wrapper | Pass; never captured on a GPU |
 | FlashInfer's ragged plan: one per lengths, shared by a step's layers and reused across steps | CPU, with a fake wrapper | Pass |
 | MLA backend order | Every machine | Pass |
-| FA3's cascade against attending each row whole; one schedule per problem per step; full-graph schedules refilled before replay; vLLM's cascade heuristic | CPU, with a fake kernel that does the arithmetic | Pass; never run on an H100 |
-| The runner's cascade prefix: shared pages, cut to the fewest cached tokens; no full graph on a cascade step | Every machine | Pass |
+| FA3: one schedule per problem per step; full-graph schedules refilled before replay | CPU, with a fake kernel that does the arithmetic | Pass; never run on an H100 |
 
 The reference is `dense_attention` in `tests/test_attention_backends.py`: the
 textbook formula, looped over heads, with no SDPA and no paging, so agreeing with
@@ -197,7 +208,7 @@ cannot quietly stop telling them apart.
 ### Mixed batches, and the split into decode and prefill
 
 A step can hold prompt chunks and decode rows together. `prefill` already takes
-packed rows with fewer queries than keys, so a decode row is simply a row with
+packed rows with fewer queries than keys, so a decode row is just a row with
 one query, and the bottom-right mask already fits it. FA3 runs a mixed step that
 way, in one call, as vLLM's FlashAttention backend does.
 
@@ -205,7 +216,7 @@ A backend whose `split_decodes()` is true instead runs the step's one-query rows
 through `decode` and the rest through `prefill`, as vLLM's FlashInfer and MLA
 backends do (their `reorder_batch_threshold` is 1). The pieces:
 
-1. **Reorder.** `ModelRunner.decodes_first` puts one-query rows first, stably,
+1. **Reorder.** `ModelRunner.prepare_batch` puts one-query rows first, stably,
    like vLLM's `reorder_batch`. Only the token layout moves: `logits_indices`
    still lists sampling rows in the scheduler's order, which is the order it
    reads tokens back in.
@@ -244,7 +255,7 @@ second path, and so does this backend.
 FA3 reads pages of any size, which is what made 16 tokens the default block
 size. FA2 required multiples of 256.
 
-### FlashAttention-3: one tile schedule per step, and cascade attention
+### FlashAttention-3: one tile schedule per step
 
 Without a schedule, every paged FA3 call first runs a pass that splits the
 work across SMs. As vLLM does on FA3, the step's first layer to pose a
@@ -254,19 +265,6 @@ arguments. Both take the longest key length from the page table's width, as
 `flash_attn_with_kvcache` does. A full graph reads its decode schedule from a
 buffer that `before_full_graph_replay` refills for the step's lengths, with
 the tail zeroed, as vLLM's `_store_scheduler_metadata` does.
-
-When the step's rows share cached pages, as a common system prompt leaves
-them under prefix caching, the runner offers that prefix for cascade
-attention. As vLLM's `_compute_cascade_attn_prefix_len`, it is cut to the
-fewest cached tokens of any row, so it holds no query, then to whole pages.
-vLLM counts blocks held by every request; the runner compares the step's own
-block tables, so a request that was not scheduled cannot hide the prefix.
-The backend's `use_cascade_attention` is vLLM's heuristic: at least 256
-tokens and 8 rows, and for an all-decode GQA step, fewer waves than flash
-decoding. If every kind of layer agrees, FA3 attends the prefix once for all
-queries, unmasked, then each row's own keys causally, and merges the two into
-the output. A cascade step takes no full graph, as in vLLM. Other backends
-have no cascade path and decline.
 
 ### FlashInfer: planned once per step
 
@@ -325,8 +323,9 @@ Decode gathers the block table's full width, so it reads no lengths back either.
 The padding and the gathered copy cost memory traffic that grows with batch
 size and context length, and a step that mixes long chunks with decode rows
 spends compute on padding. Each key head's query heads fold into its query axis
-rather than going through `enable_gqa`. The backend still reports no CUDA graph support. That is the right
-trade for a reference and for laptop development, and the wrong one for speed.
+rather than going through `enable_gqa`. The backend still reports no CUDA graph
+support. That is the right trade for a reference and for laptop development, and
+the wrong one for speed.
 
 ## Next steps
 
@@ -334,5 +333,4 @@ trade for a reference and for laptop development, and the wrong one for speed.
    `flashinfer` with FA3 disabled and compare against vLLM's FlashInfer backend.
 2. Capture a FlashInfer model's full graphs on a GPU and check its decode
    against eager, then compare decode throughput with piecewise only.
-3. Run FA3's schedule and cascade on an H100: the suite, then Qwen3-8B with a
-   shared system prompt, cascade on and off, against vLLM.
+3. Run FA3's schedule on an H100: the suite, then Qwen3-8B against vLLM.

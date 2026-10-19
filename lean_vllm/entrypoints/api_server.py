@@ -2,9 +2,10 @@
 
 import asyncio
 import json
+from collections.abc import AsyncGenerator, Coroutine
 from contextlib import aclosing, asynccontextmanager
 from time import time
-from typing import AsyncGenerator, Awaitable, Literal
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -118,7 +119,7 @@ async def _serve(
     request: Request | None = None,
 ):
     if body.model != model:
-        # As in OpenAI and vLLM, an unserved model name is a 404, not a field to ignore.
+        # An unserved model name returns 404.
         raise HTTPException(404, f"the model {body.model!r} does not exist")
     if engine.is_dead:
         raise HTTPException(503, f"the engine died: {engine.error!r}")
@@ -149,12 +150,12 @@ async def _serve(
     return reply
 
 
-async def _unless_disconnected(request: Request | None, work: Awaitable):
+async def _unless_disconnected(request: Request | None, work: Coroutine):
     """Starlette only watches for a disconnect while streaming. None if the client left first."""
     if request is None:
         return await work
-    task = asyncio.ensure_future(work)
-    listener = asyncio.ensure_future(_disconnected(request))
+    task = asyncio.create_task(work)
+    listener = asyncio.create_task(_disconnected(request))
     try:
         await asyncio.wait((task, listener), return_when=asyncio.FIRST_COMPLETED)
     finally:

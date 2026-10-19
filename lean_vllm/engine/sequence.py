@@ -1,6 +1,5 @@
 import hashlib
 import pickle
-from copy import copy
 from enum import Enum, auto
 from itertools import count
 from time import perf_counter
@@ -12,12 +11,12 @@ from lean_vllm.sampling_params import SamplingParams
 
 
 def _serialize(token_ids: tuple[int, ...], prefix: int) -> bytes:
-    """Pickle, as vLLM does. Stable within a Python version, not across them."""
+    """Pickle serialization. Stable within a Python version, not across them."""
     return pickle.dumps((prefix, token_ids), protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def sha256_hash(token_ids: tuple[int, ...], prefix: int) -> int:
-    """The default, and vLLM's. A collision would serve one tenant another's tokens."""
+    """Hash the block and its prefix with SHA-256 to resist deliberate prefix-cache collisions."""
     return int.from_bytes(hashlib.sha256(_serialize(token_ids, prefix)).digest(), "big")
 
 
@@ -37,7 +36,7 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
-    # Set once from Config: Sequences are built where no config is at hand (warmup, TP workers).
+    # Shared settings, set once from Config, since warmup and TP workers build Sequences without a Config.
     block_size = 16
     enable_prefix_caching = True
     hash_algo = "sha256"
@@ -50,7 +49,7 @@ class Sequence:
         self.seq_id = next(Sequence.counter)
         self.request_id = request_id if request_id is not None else f"req-{self.seq_id}"
         self.status = SequenceStatus.WAITING
-        self.token_ids = copy(token_ids)
+        self.token_ids = token_ids.copy()
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
@@ -58,7 +57,7 @@ class Sequence:
         self.num_pending_tokens = 0  # reserved by a launched step, not yet sampled here
         self.num_published_blocks = 0  # blocks already in the prefix cache
         self.num_scheduled_tokens = 0
-        self.num_new_tokens = 0  # committed by the last reconcile, which the step's output carries
+        self.num_new_tokens = 0  # tokens committed by the last reconcile
         self.spec_token_ids: list[int] = []  # drafts for the next step to verify
         self.is_prefill = True
         self.block_table: list[int] = []
@@ -71,7 +70,7 @@ class Sequence:
         self.stop_token_ids = sampling_params.stop_token_ids
         self.skip_special_tokens = sampling_params.skip_special_tokens
         self.priority = sampling_params.priority
-        # Copied, as the connector marks it and generate() shares one SamplingParams across prompts.
+        # Copy per sequence: the connector changes transfer flags, and generate() shares SamplingParams across prompts.
         params = sampling_params.kv_transfer_params
         self.kv_transfer_params: dict | None = dict(params) if params is not None else None
         self.kv_transfer_result: dict | None = None  # what the connector hands back on finishing
@@ -82,17 +81,6 @@ class Sequence:
         self.first_token_time: float | None = None
         self.finish_time: float | None = None
         self._extend_block_hashes()
-
-    def metrics(self) -> RequestMetrics:
-        return RequestMetrics(
-            arrival_time=self.arrival_time,
-            num_prompt_tokens=self.num_prompt_tokens,
-            num_completion_tokens=self.num_completion_tokens,
-            num_preemptions=self.num_preemptions,
-            first_scheduled_time=self.first_scheduled_time,
-            first_token_time=self.first_token_time,
-            finish_time=self.finish_time,
-        )
 
     def __len__(self):
         return self.num_tokens
@@ -110,7 +98,7 @@ class Sequence:
 
     @property
     def num_planned_tokens(self):
-        """Length once every reserved token lands. What allocation must cover."""
+        """Total committed and reserved tokens that block allocation must cover."""
         return self.num_tokens + self.num_pending_tokens
 
     @property
@@ -130,7 +118,7 @@ class Sequence:
         return self.token_ids[i * self.block_size : (i + 1) * self.block_size]
 
     def _extend_block_hashes(self):
-        """Hash every block that has just become full, chaining on the one before. Computed once, as it is final."""
+        """Hash each newly full block once, including the previous block's hash to form a chain."""
         if not self.enable_prefix_caching:
             return
         algo = HASH_ALGOS[self.hash_algo]
@@ -139,7 +127,7 @@ class Sequence:
             self.block_hashes.append(algo(tuple(self.block(i)), prefix))
 
     def reserve_token(self, num_tokens: int = 1):
-        """A launched step will sample here, or keep drafts here; the values are not known yet."""
+        """Reserve space for sampled or retained draft tokens whose values are not yet known."""
         self.num_pending_tokens += num_tokens
 
     def commit_token(self, token_id: int):
@@ -155,12 +143,27 @@ class Sequence:
         self.commit_token(token_id)
 
     def drop_pending(self):
-        """Give up reserved tokens, on preemption, abort or finish."""
+        """Clear token reservations on preemption, abort or finish."""
         self.num_pending_tokens = 0
+
+    def metrics(self) -> RequestMetrics:
+        return RequestMetrics(
+            arrival_time=self.arrival_time,
+            num_prompt_tokens=self.num_prompt_tokens,
+            num_completion_tokens=self.num_completion_tokens,
+            num_preemptions=self.num_preemptions,
+            first_scheduled_time=self.first_scheduled_time,
+            first_token_time=self.first_token_time,
+            finish_time=self.finish_time,
+        )
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
         return (
+            self.seq_id,
+            self.temperature,
+            self.top_k,
+            self.top_p,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
@@ -174,6 +177,10 @@ class Sequence:
 
     def __setstate__(self, state):
         (
+            self.seq_id,
+            self.temperature,
+            self.top_k,
+            self.top_p,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
@@ -188,5 +195,6 @@ class Sequence:
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
         else:
+            # Unpickling a decode sequence on a TP worker: only the last token is sent.
             self.token_ids = []
             self.last_token = last_state

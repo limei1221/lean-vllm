@@ -22,17 +22,15 @@ def test_async_scheduling_is_on_by_default(make_config):
     assert make_config().async_scheduling
 
 
-def test_tensor_parallelism_turns_async_scheduling_off(make_config, caplog):
-    """Ranks above zero never see the sampled tokens."""
-    config = make_config(tensor_parallel_size=2)
-    assert not config.async_scheduling
-    assert "async_scheduling is off" in caplog.text
+def test_tensor_parallelism_keeps_async_scheduling_on(make_config):
+    """Every rank samples, so each fills its next step's inputs itself."""
+    assert make_config(tensor_parallel_size=2).async_scheduling
 
 
 @pytest.mark.parametrize("architecture, supported", [("DeepseekV2ForCausalLM", True), ("Qwen3ForCausalLM", False)])
 def test_expert_parallelism_needs_a_moe_model(make_config, monkeypatch, architecture, supported):
     monkeypatch.setattr(FakeHFConfig, "architectures", [architecture], raising=False)
-    assert make_config().enable_expert_parallel is False  # off by default, as in vLLM
+    assert make_config().enable_expert_parallel is False  # off by default
     if supported:
         assert make_config(enable_expert_parallel=True).enable_expert_parallel
     else:
@@ -61,3 +59,13 @@ def test_the_rendezvous_port_is_picked_unless_given(make_config):
     """A fixed port would keep a second engine on the host from starting."""
     assert make_config().dist_port > 0
     assert make_config(dist_port=29500).dist_port == 29500
+
+
+def test_the_kv_cache_layout_is_nhd_unless_nixl_or_the_environment_asks(make_config, monkeypatch):
+    assert make_config().kv_cache_layout == "NHD"
+    assert make_config(kv_transfer_config='{"kv_connector": "NixlConnector"}').kv_cache_layout == "HND"
+    monkeypatch.setenv("LEAN_VLLM_KV_CACHE_LAYOUT", "hnd")
+    assert make_config().kv_cache_layout == "HND"
+    monkeypatch.setenv("LEAN_VLLM_KV_CACHE_LAYOUT", "HDN")
+    with pytest.raises(AssertionError, match="unknown kv cache layout"):
+        make_config()

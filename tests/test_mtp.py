@@ -10,6 +10,7 @@ import json
 
 import pytest
 import torch
+from conftest import by_label, total
 from safetensors.torch import save_file
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -168,14 +169,14 @@ def test_a_drafter_that_predicts_the_target_has_every_draft_kept(make_engine, k)
     engine = make_engine()
     predict_the_target(engine)
     want = generate(engine)
-    plain_steps = engine.metrics.steps.total
+    plain_steps = total(engine.metrics.steps)
     assert all(b == (a + 1) % VOCAB for tokens in want for a, b in zip(tokens, tokens[1:]))
     engine = make_engine(k)
     predict_the_target(engine)
     assert generate(engine) == want
     metrics = engine.metrics
-    assert metrics.spec_accepted_tokens.total == metrics.spec_draft_tokens.total > 0
-    assert metrics.steps.total < plain_steps
+    assert total(metrics.spec_accepted_tokens) == total(metrics.spec_draft_tokens) > 0
+    assert total(metrics.steps) < plain_steps
 
 
 def no_cache_context(n: int) -> dict:
@@ -216,7 +217,7 @@ def reference_drafts(engine, token_ids: list[int], k: int) -> list[int]:
 
 
 def keep_drafts_at_random(logits, draft_token_ids, num_draft_tokens, temperatures, max_num_drafts, top_k, top_p):
-    """Stands in for the rejection sampler, as vLLM's synthetic method: random weights would keep almost no draft.
+    """Stands in for the rejection sampler: random weights would keep almost no draft.
     Each row keeps a random number of its drafts, then the target's token after them."""
     generator = torch.Generator().manual_seed(len(draft_token_ids) * 1000 + logits.size(0))
     output = torch.full((num_draft_tokens.numel(), max_num_drafts + 1), -1, dtype=torch.int64)
@@ -288,7 +289,7 @@ def test_the_drafts_are_those_of_one_pass_over_the_sequence(
     generate(engine, max_tokens=12)
 
     assert len(proposed) > len(PROMPTS)
-    assert engine.metrics.spec_accepted_per_pos.values.keys() == {"0", "1"}
+    assert by_label(engine.metrics.spec_accepted_per_pos).keys() == {"0", "1"}
     for token_ids, drafts in proposed:
         assert drafts == reference_drafts(engine, token_ids, k), f"after {len(token_ids)} tokens"
     assert sorted(graphs) == [(0, size) for size in graph_sizes or []]
@@ -364,3 +365,10 @@ def test_sampled_decoding_runs_to_its_length(make_engine):
 def test_tensor_parallel_ranks_draft_together(make_engine):
     want = generate(make_engine())
     assert generate(make_engine(2, tensor_parallel_size=2)) == want
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [0, 2])
+def test_tensor_parallel_ranks_sample_together(make_engine, num_speculative_tokens):
+    """Every rank samples with the same seed; a rank that drew other tokens would feed its next step wrong ones."""
+    want = generate(make_engine(num_speculative_tokens), temperature=0.7)
+    assert generate(make_engine(num_speculative_tokens, tensor_parallel_size=2), temperature=0.7) == want

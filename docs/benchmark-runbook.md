@@ -1,12 +1,12 @@
 # Benchmark runbook: lean-vLLM versus vLLM on DeepSeek-V2-Lite
 
 Compare DeepSeek-V2-Lite (16B total, 2.4B active, MLA + MoE + YaRN) on one NVIDIA
-H100-SXM5-80GB using the same workload and resource limits, with **chunked
-prefill enabled** and **full + piecewise CUDA graphs** on both engines.
-lean-vLLM decodes over latents with FlashMLA and runs the routed experts through
-its Triton MoE. Both engines run **one curve each with async scheduling on**.
+H100-SXM5-80GB using the same workload and resource limits, with chunked
+prefill and full + piecewise CUDA graphs on both engines. lean-vLLM decodes over
+latents with FlashMLA and runs the routed experts through its Triton MoE. Each
+engine runs one curve, with async scheduling on.
 
-The five offered loads—**1, 24, 32, 48, and 64 requests/s**—are the starting
+The five offered loads (1, 24, 32, 48 and 64 requests/s) are a starting
 bracket, not a final one. V2-Lite activates only 2.4B parameters per token, so it
 saturates at a higher load than a dense 8B; do a first pass, then recenter the
 rates so they straddle the knee, where throughput plateaus and tail latency
@@ -14,14 +14,13 @@ rises. Load 1 stays because its TPOT isolates per-step overhead. Each point uses
 1,000 requests. Run the engines sequentially on the same machine and compare
 these fresh results.
 
-The GPU paths this measures—FlashMLA decode, the Triton MoE, both graph
-modes—must be validated for correctness before any timing is meaningful. Section
-0 gates on that. Use the same Bash session for the commands below.
+Validate the GPU paths this measures (FlashMLA decode, the Triton MoE, both
+graph modes) before trusting any timing. Section 0 gates on that. Use the same Bash session for the commands below.
 
 ## 0. Validate correctness first
 
-A fast curve over wrong numbers is worthless. Before benchmarking, confirm the
-GPU paths agree with their references on this machine:
+A fast curve over wrong numbers is worthless. Before benchmarking, check that
+the GPU paths agree with their references on this machine:
 
 ```bash
 uv run pytest tests/test_attention_backends.py -k mla -v      # FlashMLA decode vs the fp32 oracle
@@ -48,12 +47,11 @@ uv run hf download deepseek-ai/DeepSeek-V2-Lite-Chat --local-dir ~/workspace/hug
 ```
 
 The sync pulls a prebuilt FlashAttention-3, about 400 MB, pinned by URL and hash
-in `pyproject.toml`. FA3 alone is compiled by no one here, but FlashMLA is: it
-publishes no wheel, so decode over latents needs a source build against the
-pinned torch. That build wants `nvcc`, so unlike the FA3-only path this box needs
-a CUDA toolkit. Build FlashMLA **after** `uv sync`, and never re-run a plain
-`uv sync` afterward—it removes anything it did not install unless run with
-`--inexact`:
+in `pyproject.toml`. FlashMLA publishes no wheel, so decode over latents needs a
+source build against the pinned torch. That build wants `nvcc`, so unlike the
+FA3-only path this box needs a CUDA toolkit. Build FlashMLA after `uv sync`, and
+never re-run a plain `uv sync` afterward, since it removes anything it did not
+install unless run with `--inexact`:
 
 ```bash
 git clone --recursive https://github.com/deepseek-ai/FlashMLA.git ~/workspace/FlashMLA
@@ -68,8 +66,8 @@ uv run python -c 'import torch; from lean_vllm.layers.fused_moe import use_trito
 ```
 
 The first must print `flashmla`; `flash_attn_3` means the FlashMLA build did not
-land and decode would expand latents every step—correct, but not the path being
-measured. The second must print `triton`; `torch` means the Triton import failed
+land and decode would expand latents every step. That is correct, but it is not
+the path being measured. The second must print `triton`; `torch` means the Triton import failed
 and the experts would fall back to `grouped_mm`.
 
 Neither engine ships a tuned MoE config for V2-Lite on an H100, so both run
@@ -124,7 +122,7 @@ The graph-mode option differs between engines: lean-vLLM uses
 `--cudagraph-mode full_and_piecewise`; vLLM uses the equivalent
 `FULL_AND_PIECEWISE` setting in `--compilation-config`.
 
-Both engines now capture MLA decode inside the full graph. The FlashMLA build
+Both engines capture MLA decode inside the full graph. The FlashMLA build
 here (deepseek-ai HEAD) fuses the tile schedule and split-KV workspace into
 `dense_decode_fwd`, sizing them from `cache_seqlens`. Both lean-vLLM and vLLM
 capture that construction once, at capture time, with worst-case sequence lengths,
@@ -136,7 +134,7 @@ step that fits a captured batch size replays the whole model, attention included
 A decode batch past the largest captured size runs eager: the piecewise buckets
 stop at 512 tokens too, so no graph covers it.
 
-MLA caches one compressed latent per token per layer—about 31 KB per token
+MLA caches one compressed latent per token per layer, about 31 KB per token
 across V2-Lite's 27 layers, against the ~276 KB a plain paged cache of its heads
 would take. The weights are 31 GB, leaving most of the 80 GB for cache, so
 327,680 tokens fits with wide margin. Raise `KVTOKENS` if a first pass shows the
@@ -285,8 +283,8 @@ Before drawing conclusions:
 - Check that each run completed all 1,000 requests without failures.
   Goodput has no latency cutoff, so read it alongside latency.
 - Compare matching offered loads and workload settings. Both engines run with
-  async scheduling on, so the curves are directly comparable. Find where throughput
-  levels off and tail latency rises sharply—the saturation knee. If it sits at
+  async scheduling on, so the curves are directly comparable. Find the saturation
+  knee, where throughput levels off and tail latency rises sharply. If it sits at
   or beyond the top rate, extend `RATES` upward and rerun into a new directory.
 - Confirm both engines decoded with an MLA kernel, not an expanded fallback, and
   name each in the report; a kernel-versus-fallback gap is not an engine gap.
@@ -296,8 +294,8 @@ Before drawing conclusions:
 Per-run JSON contains client summaries and two scrapes of the server's
 Prometheus `/metrics`, `server.before` and `server.after`, taken after warmup
 and after the run. `server.run` holds what they moved by during the run: the
-busy fraction, mean batch tokens and preemptions the sweep table shows. Each run records `started_at` and `finished_at` in UTC around the client
-run, so align the GPU log to those rather than to file modification times.
+busy fraction, mean batch tokens and preemptions the sweep table shows. Each run
+records `started_at` and `finished_at` in UTC around the client run, so align the GPU log to those rather than to file modification times.
 
 Stop the logger and archive the session:
 

@@ -1,6 +1,7 @@
 """Disaggregated prefill in the scheduler: what each side admits, holds and frees, with the transfers faked."""
 
 import pytest
+from conftest import observed, total
 
 from lean_vllm.engine.scheduler import DuplicateRequestId
 from lean_vllm.engine.sequence import SequenceStatus
@@ -69,7 +70,7 @@ class TestDecodeSide:
         assert (req.remote_request_id, req.remote_host, req.remote_port) == ("p-1", "10.0.0.1", 14579)
 
     def test_once_loaded_it_computes_only_its_last_prompt_token(self, make_disagg_engine):
-        """As vLLM: the decode instance recomputes one token so that it samples the first one itself."""
+        """The decode instance recomputes one token so that it samples the first one itself."""
         engine = make_disagg_engine()
         engine.add(PROMPT, SamplingParams(max_tokens=3, ignore_eos=True, kv_transfer_params=remote_prefill()), "d-1")
         engine.step()
@@ -108,11 +109,12 @@ class TestDecodeSide:
         assert engine.model_runner.batches[0] == (True, [("d-1", len(PROMPT))])
         assert "2 remote blocks for a 3-block prompt" in caplog.text
 
-    def test_a_different_tensor_parallel_size_prefills_here(self, make_disagg_engine):
+    def test_a_different_tensor_parallel_size_still_loads(self, make_disagg_engine):
+        """Each rank reads its heads from whichever producer ranks hold them."""
         engine = make_disagg_engine()
         engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params=remote_prefill(tp_size=2)), "d-1")
-        engine.run_to_completion()
-        assert recvs(engine) == {}
+        engine.step()
+        assert recvs(engine)["d-1"].remote_tp_size == 2
 
     def test_an_abort_mid_load_frees_the_blocks_only_once_the_load_ends(self, make_disagg_engine):
         """The loader is still writing them."""
@@ -209,7 +211,7 @@ class TestPrefillSide:
         assert engine.last_output.num_cached_blocks == 2
 
     def test_a_prefill_that_stops_on_a_stop_token_hands_over_too(self, make_disagg_engine):
-        """As vLLM: a stop token hands over as max_tokens does; the decode instance samples its own first token."""
+        """A stop token hands over as max_tokens does; the decode instance samples its own first token."""
         engine = make_disagg_engine(eos_after={"p-1": 0})
         seq = engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params={"do_remote_decode": True}), "p-1")
         final = [output for output in engine.step() + engine.step() if output.finished]
@@ -241,11 +243,11 @@ class TestPrefillSide:
 
 
 def test_a_load_counts_as_waiting(make_disagg_engine):
-    """As vLLM's num_requests_waiting, which includes WAITING_FOR_REMOTE_KVS."""
+    """Remote KV loads count as waiting: vLLM's num_requests_waiting includes WAITING_FOR_REMOTE_KVS."""
     engine = make_disagg_engine()
     engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params=remote_prefill()), "d-1")
     engine.step()
-    assert engine.metrics.waiting.value == 1 and engine.metrics.running.value == 0
+    assert total(engine.metrics.waiting) == 1 and total(engine.metrics.running) == 0
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
@@ -295,7 +297,7 @@ class TestMetrics:
         )
         engine.step()
         metrics = engine.metrics
-        assert metrics.kv_transfers.total == 1
-        assert (metrics.kv_transfer_failures.total, metrics.kv_transfer_expired.total) == (1, 1)
-        assert (metrics.kv_transfer_time.sum, metrics.kv_transfer_bytes.sum) == (0.25, 4096)
+        assert total(metrics.kv_transfers) == 1
+        assert (total(metrics.kv_transfer_failures), total(metrics.kv_transfer_expired)) == (1, 1)
+        assert (observed(metrics.kv_transfer_time, "_sum"), observed(metrics.kv_transfer_bytes, "_sum")) == (0.25, 4096)
         assert "lean_vllm:kv_transfers_total 1" in metrics.render()

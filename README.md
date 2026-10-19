@@ -7,7 +7,7 @@ features and includes benchmarks against vLLM. Runs on CPU or NVIDIA GPUs with C
 
 ## Beyond nano-vLLM
 
-Building on [nano-vLLM's foundation](#credit), lean-vLLM adds these vLLM concepts:
+On top of [nano-vLLM](#credit), lean-vLLM adds these vLLM features:
 
 - [Online serving](docs/online-serving.md): OpenAI-compatible streaming APIs,
   a separate engine process, cancellation, and Prometheus metrics.
@@ -22,7 +22,8 @@ Building on [nano-vLLM's foundation](#credit), lean-vLLM adds these vLLM concept
 - [Speculative decoding](lean_vllm/spec_decode/): DeepSeek-V3 MTP drafting
   with rejection sampling.
 - [Disaggregated prefill/decode](docs/disaggregated-prefill.md): separate
-  engines connected by TCP KV-cache transfer and a proxy.
+  engines connected by NIXL KV-cache transfer, GPU to GPU across different
+  tensor-parallel sizes, and a proxy.
 
 MTP and disaggregation have CPU checks; GPU validation is still pending.
 
@@ -74,21 +75,21 @@ See the [client example](example_serving.py) and
 
 ## Benchmarks
 
-Latest recorded results: 3 October 2026, one H100 80 GB, vLLM 0.26.0,
+Latest recorded results: 17 October 2026, one H100 80 GB, vLLM 0.26.0,
 1,000 requests per point, async scheduling enabled on both engines.
 
 ![Qwen3-8B: completed requests per second and median time per output token versus offered load](assets/benchmarks/qwen3-8b.png)
 
 ![DeepSeek-V2-Lite-Chat: completed requests per second and median time per output token versus offered load](assets/benchmarks/deepseek-v2-lite.png)
 
-The figures use numbers from the [results table](docs/benchmark-results-2026-10-03.md).
-For detailed analysis, see the 3 October reports for
-[Qwen3-8B](docs/benchmark-2026-10-03-Qwen3-8B.md) and
-[DeepSeek-V2-Lite](docs/benchmark-2026-10-03-DeepSeek-V2-Lite.md).
+The figures use numbers from the [results table](docs/benchmark-results-2026-10-17.md).
+For detailed analysis, see the 17 October reports for
+[Qwen3-8B](docs/benchmark-2026-10-17-Qwen3-8B.md) and
+[DeepSeek-V2-Lite](docs/benchmark-2026-10-17-DeepSeek-V2-Lite.md).
 
 ## Credit
 
 Forked from [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm) by Xingkai Yu
 at [`bb823b3`](https://github.com/GeeeekExplorer/nano-vllm/commit/bb823b3e06983d71485a8e1f23715ebd87d98ef8).
-Its scheduler, block manager, paged KV cache, and Qwen3 implementation form
-the foundation of this project. Both projects use the [MIT license](LICENSE).
+This project started from its scheduler, block manager, paged KV cache and
+Qwen3 implementation. Both projects use the [MIT license](LICENSE).

@@ -38,10 +38,10 @@ class BaseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model: str
-    max_tokens: int = 64
-    temperature: float = 1.0  # 0 is greedy
-    top_p: float | None = None  # None is 1.0, the whole vocab, as vLLM's
-    top_k: int | None = None  # None, 0 or -1 is the whole vocab, as vLLM's
+    max_tokens: int = Field(default=64, ge=1)
+    temperature: float = Field(default=1.0, ge=0)  # 0 is greedy
+    top_p: float | None = Field(default=None, gt=0, le=1)  # None is 1.0, the whole vocab
+    top_k: int | None = Field(default=None, ge=-1)  # None, 0 or -1 is the whole vocab
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
@@ -49,7 +49,7 @@ class BaseRequest(BaseModel):
     # Extras: the OpenAI schema has no field for these, so they ride in the body.
     ignore_eos: bool = False
     priority: int = 0
-    kv_transfer_params: dict[str, Any] | None = None  # disaggregated prefill, as vLLM's; the proxy sets it
+    kv_transfer_params: dict[str, Any] | None = None  # disaggregated prefill; the proxy sets it
 
     @model_validator(mode="before")
     @classmethod
@@ -66,17 +66,9 @@ class BaseRequest(BaseModel):
         return data
 
     @model_validator(mode="after")
-    def _check(self) -> "BaseRequest":
+    def _check_n(self) -> "BaseRequest":
         if self.n != 1:
             raise ValueError("n must be 1")
-        if self.max_tokens < 1:
-            raise ValueError("max_tokens must be at least 1")
-        if self.temperature < 0:
-            raise ValueError("temperature must not be negative")
-        if self.top_p is not None and not 0 < self.top_p <= 1:
-            raise ValueError("top_p must be in (0, 1]")
-        if self.top_k is not None and self.top_k < -1:
-            raise ValueError("top_k must be 0 or -1 (disable), or at least 1")
         return self
 
     @property

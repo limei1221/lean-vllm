@@ -79,6 +79,13 @@ def test_pending_count_survives_pickle():
     assert restored.num_planned_tokens == 4
 
 
+def test_sampling_params_survive_pickle():
+    """Every rank samples, so each needs the row's id and sampling params."""
+    seq = Sequence([1, 2, 3], SamplingParams(temperature=0.7, top_k=5, top_p=0.9))
+    restored = pickle.loads(pickle.dumps(seq))
+    assert (restored.seq_id, restored.temperature, restored.top_k, restored.top_p) == (seq.seq_id, 0.7, 5, 0.9)
+
+
 def test_commit_without_reservation_raises():
     """Prevent silent counter underflow."""
     seq = make()
@@ -99,6 +106,6 @@ def test_top_p_and_top_k_are_checked(bad):
 
 
 def test_greedy_drops_top_p_and_top_k():
-    """As vLLM's: the argmax needs no truncation, and the batch then skips the sort."""
+    """The argmax needs no truncation, and the batch then skips the sort."""
     params = SamplingParams(temperature=0, top_p=0.5, top_k=3)
     assert (params.top_p, params.top_k) == (1.0, 0)

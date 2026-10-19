@@ -103,12 +103,12 @@ and one with group-limited routing.
 
 ## Performance
 
-The [3 October report](benchmark-2026-10-03-DeepSeek-V2-Lite.md) compares V2-Lite-Chat against
+The [17 October report](benchmark-2026-10-17-DeepSeek-V2-Lite.md) compares V2-Lite-Chat against
 vLLM 0.26.0 on one H100. With no queueing, lean-vLLM's median time per output
-token is 6.5 ms against vLLM's 4.6 ms. Under load, lean-vLLM peaks at 23.2
-requests/s at load 48 and falls to 21.1 at load 64, while vLLM reaches 31.2.
-Large prefill steps now run compiled but outside graphs, and still take 55–63%
-of step time at the plateau.
+token is 4.7 ms against vLLM's 4.3 ms. Under load the two match: goodput is
+within 1.1% of vLLM's up to load 48, and lean-vLLM reaches 32.0 requests/s at
+load 80 against vLLM's 31.1. Large prefill steps run compiled but outside
+graphs, at about 41 ms each and 30–46% of step time past load 48.
 
 ## How it works
 

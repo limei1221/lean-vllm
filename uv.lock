@@ -683,6 +683,9 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "prometheus-client" },
+    { name = "pydantic" },
+    { name = "pyzmq" },
     { name = "safetensors" },
     { name = "tokenizers" },
     { name = "torch" },
@@ -698,11 +701,12 @@ cuda = [
     { name = "torch" },
     { name = "triton" },
 ]
+nixl = [
+    { name = "nixl", marker = "sys_platform == 'linux'" },
+]
 serve = [
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "pydantic" },
-    { name = "pyzmq" },
     { name = "uvicorn" },
 ]
 
@@ -727,9 +731,11 @@ requires-dist = [
     { name = "flash-attn-3", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda'", url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn_3-3.0.0%2Bcu130torch2.11gite2743ab-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux' and extra == 'cuda'" },
     { name = "httpx", marker = "extra == 'serve'" },
+    { name = "nixl", marker = "sys_platform == 'linux' and extra == 'nixl'", specifier = "==1.3.1" },
     { name = "numpy" },
-    { name = "pydantic", marker = "extra == 'serve'", specifier = ">=2" },
-    { name = "pyzmq", marker = "extra == 'serve'", specifier = ">=25" },
+    { name = "prometheus-client" },
+    { name = "pydantic", specifier = ">=2" },
+    { name = "pyzmq", specifier = ">=26.4" },
     { name = "safetensors" },
     { name = "tokenizers", specifier = ">=0.22" },
     { name = "torch", specifier = ">=2.10" },
@@ -740,7 +746,7 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'serve'", specifier = ">=0.30" },
     { name = "xxhash" },
 ]
-provides-extras = ["serve", "cuda"]
+provides-extras = ["serve", "cuda", "nixl"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1012,6 +1018,56 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/14/0f/696d96821fad1b5767fd311c1569dde8881a57412369bfe7b11bcbfde036/ninja-1.13.2-py3-none-musllinux_1_2_riscv64.whl", hash = "sha256:09de9ab04f7352f51570c73fd4913acb1e6c24be0a72cd8b80243d4d3ed04925", size = 533978, upload-time = "2026-08-30T15:49:43.451Z" },
     { url = "https://files.pythonhosted.org/packages/5d/69/28844ca579156776a202217a7cd66f60d06a0710a935e879bb89ce396ecc/ninja-1.13.2-py3-none-musllinux_1_2_s390x.whl", hash = "sha256:6a87bf42b123abe2f37737300185f0a303a891899da85d73a3613ee80547e578", size = 653822, upload-time = "2026-08-30T15:49:44.724Z" },
     { url = "https://files.pythonhosted.org/packages/f5/5f/c511f2952f94ab2966d60edd9c34e744ea32f2724b1184b62270bde55b3a/ninja-1.13.2-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:915bd482c4be41c75120fd67a22e0bb3f0fbb3bbc5f95b89787deadd59e27ef2", size = 544460, upload-time = "2026-08-30T15:49:46.29Z" },
+]
+
+[[package]]
+name = "nixl"
+version = "1.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nixl-cu12" },
+    { name = "nixl-cu13" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/80/4e/e8666531438b46c3e62f73f4b9aa9ff3792e6985b31663acced8d5879fe9/nixl-1.3.1-py3-none-any.whl", hash = "sha256:26a5031452bdd7983f2d1d3900e01f950286d4c5a4cb85831597835a4e4ebbcc", size = 10302, upload-time = "2026-07-07T23:22:49.569Z" },
+]
+
+[[package]]
+name = "nixl-cu12"
+version = "1.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cc/e7/9dd1d2ab0474bba47ab35570c20afe30bd15f2b8dcabf8b9ea51c76d3393/nixl_cu12-1.3.1-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:80a1203d2439c9ac8cd0abd979bd6f6e25a21f929576489efbc7aafcae81f96e", size = 64744868, upload-time = "2026-07-07T23:17:11.522Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/94/5c6f2c9c1a716b38d078193c00916f0089ae0a652742c22eec5284c1f8ed/nixl_cu12-1.3.1-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:8ea71c8b8c3a1dea388f92ab98efb04f8095014287e5abb330e32233daca90f3", size = 66585680, upload-time = "2026-07-07T23:15:21.35Z" },
+    { url = "https://files.pythonhosted.org/packages/78/02/d0f6ed621f7978cf7fe7bf72007b6a9923500070a6d9dc62f787fda79551/nixl_cu12-1.3.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:793f61879a508402ccc6938f3ddb3c9bb4b5702e0333f16263e30397aaf1dd41", size = 64747706, upload-time = "2026-07-07T23:17:31.707Z" },
+    { url = "https://files.pythonhosted.org/packages/86/a6/574f70cb1e0834cb112a056cd7a4c988e48607c45592dc3f2baa917eadf3/nixl_cu12-1.3.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:4479aabb7142f5e02292c9c256c34bbb96945da8e14bc589451166e6d5c63244", size = 66590685, upload-time = "2026-07-07T23:15:43.585Z" },
+    { url = "https://files.pythonhosted.org/packages/76/19/f1edc56e24cf640e8c071378b86082f1ad42ea84857ad3be3bef0a2e8c8f/nixl_cu12-1.3.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:c6558f594a1db715911a600d45689ef23a1ef5d95e379751654a3e8295cec3e0", size = 64759506, upload-time = "2026-07-07T23:17:54.09Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/b8/a1db75f7de7192979609f140e996662a5ef706594db0949ca9a499e2f782/nixl_cu12-1.3.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:e0f96d3b886bfc53b52014c5fca629038ab5a2aa43651b3d8ee614c4553a8580", size = 66605342, upload-time = "2026-07-07T23:16:02.91Z" },
+]
+
+[[package]]
+name = "nixl-cu13"
+version = "1.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e0/e3/4aa8476ee3357a157e68fd08be45535dfb1d9e30908d8c36b4070cfea34a/nixl_cu13-1.3.1-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:9b6bfae407b0ec768f53e79e8985b74aad5e51a458993ceb4edf4ddcc19eb551", size = 64393228, upload-time = "2026-07-07T23:20:52.342Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/2d/5100553f7ddbfe49a371cfc7433b11d54f878505de0b4368dd52a7e2d997/nixl_cu13-1.3.1-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:4663bff0eea59362bc1a7e0b5aa6faa78648bf774702ff0c78f706759a23af03", size = 66301336, upload-time = "2026-07-07T23:19:01.063Z" },
+    { url = "https://files.pythonhosted.org/packages/4c/35/1532fbc60f75741a8a8ac86d776a81d6eafcd787c52920a3f6f6a99b7dec/nixl_cu13-1.3.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:dd23c592cef4a8abe131d3d2ac130d5299f725dbfb4325475ee9748d64605314", size = 64401065, upload-time = "2026-07-07T23:21:17.242Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/98/ff06cf004e571bc0d4200d74df311642fdada1b44d68637762633a662bf8/nixl_cu13-1.3.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:7753db8806a099857fb332e0d03c32827657269a281c17e2f53679729427fdad", size = 66308326, upload-time = "2026-07-07T23:19:22.111Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/7e/3832d30e53a8e3dee50a704a4af27c96e50b566564ed32bad6ae3d5cd17b/nixl_cu13-1.3.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:0671bf75a81e3662e8108b619a1616926e27422b093270d64d0256198f9a35fb", size = 64420068, upload-time = "2026-07-07T23:21:44.87Z" },
+    { url = "https://files.pythonhosted.org/packages/f6/67/8e68e715bb0a48fe63d3eddd3b8e3428a459b20185908c156daa2f63def3/nixl_cu13-1.3.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:62c874d58871f45cdd2ce049c3513db72717965e998aa84033055e91a644e372", size = 66325200, upload-time = "2026-07-07T23:19:44.851Z" },
 ]
 
 [[package]]
@@ -1433,6 +1489,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+]
+
+[[package]]
+name = "prometheus-client"
+version = "0.26.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/52/73/f1334c29c2af4cd9dba6c7817e61b611bd0215e2eb5565c6064a4de18802/prometheus_client-0.26.0.tar.gz", hash = "sha256:04a91bcf94e2cf74a44a1a874d651a2e853ed354b6e822f3b7487751465d5c2b", size = 92910, upload-time = "2026-07-24T19:36:41.893Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/eb/a3/b69efbf4143b5b9859b977770bbbabcc2796b702fa69dc40271e45cd5a56/prometheus_client-0.26.0-py3-none-any.whl", hash = "sha256:fa93d06737aa02bacd05794768508bb97d2fbee28cb3bca04eaae92f0ca953d6", size = 64494, upload-time = "2026-07-24T19:36:40.854Z" },
 ]
 
 [[package]]

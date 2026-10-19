@@ -1,8 +1,9 @@
 """A step's input tensors on the device with no per-step allocation, as vLLM's InputBatch keeps them.
 
-On CUDA each tensor has a pinned host buffer and a device buffer, both kept and grown by doubling. A step writes the
-host side from numpy and copies it over once. The copy runs asynchronously, so an event keeps the next step from
-rewriting the host side before it has. Elsewhere a step's arrays become fresh tensors, as there is nothing to stage.
+On CUDA, each input uses a reusable pinned host buffer and a device buffer. When more space is needed, both buffers
+grow to at least twice their current capacity. Each step writes the NumPy data into the host buffer, then copies it
+asynchronously to the device. A CUDA event ensures that the copy finishes before the next step overwrites the host
+buffer. On other devices, each step creates tensors directly from its input arrays without reusable staging buffers.
 """
 
 import numpy as np
@@ -23,26 +24,30 @@ class InputBuffers:
         self._copied: torch.cuda.Event | None = None
 
     def begin(self):
-        """Before a step writes: the last step's copies must have read the host buffers."""
+        """Wait for the previous step's copies to finish before reusing the host buffers."""
         if self._copied is not None:
-            self._copied.synchronize()  # long done in a steady state: they queue behind the step before it
+            self._copied.synchronize()  # copies may still be reading the host buffers; wait before overwriting them
             self._copied = None
 
     def end(self):
-        """After a step's last put."""
+        """Call after the step's final put() to record a CUDA event marking completion of its host-to-device copies."""
         if self.staged:
             self._copied = torch.cuda.Event()
             self._copied.record()
 
     def put(self, name: str, values: ArrayLike, dtype: torch.dtype) -> torch.Tensor:
-        """values on the device. On CUDA a view of name's buffer, which the next step's put of name overwrites."""
+        """Return the values as a tensor on the configured device.
+
+        On CUDA, the tensor shares a reusable buffer for this name, so a later put() with the same name
+        may overwrite its contents.
+        """
         values = np.asarray(values, NUMPY_DTYPES[dtype])
         if not self.staged:
             return torch.from_numpy(np.ascontiguousarray(values)).to(self.device)
         n = values.size
         if name not in self._device or self._device[name].numel() < n:
             capacity = max(n, 2 * (self._device[name].numel() if name in self._device else 0), MIN_CAPACITY)
-            self._pinned[name] = torch.empty(capacity, dtype=dtype, pin_memory=True)
+            self._pinned[name] = torch.empty(capacity, dtype=dtype, device="cpu", pin_memory=True)
             self._host[name] = self._pinned[name].numpy()
             self._device[name] = torch.empty(capacity, dtype=dtype, device=self.device)
         self._host[name][:n] = values.reshape(-1)

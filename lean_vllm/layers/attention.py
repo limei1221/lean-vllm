@@ -1,8 +1,8 @@
 import dataclasses
+from collections.abc import Callable
 from itertools import accumulate
-from typing import Callable, cast
+from typing import cast
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -83,11 +83,16 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.layer_name = ""
 
-    def kv_cache_shape(self, num_blocks: int, block_size: int) -> tuple[int, ...]:
-        """This layer's cache: a key and a value tensor, stacked, in the backend's layout."""
-        return (2, *self.backend.get_kv_cache_shape(num_blocks, block_size, self.num_kv_heads, self.head_dim))
+    def kv_cache_shape(self, num_blocks: int, block_size: int, layout: str = "NHD") -> tuple[int, ...]:
+        """This layer's cache: a key and a value tensor, stacked, in the backend's layout, heads before tokens if HND."""
+        shape = self.backend.get_kv_cache_shape(num_blocks, block_size, self.num_kv_heads, self.head_dim)
+        if layout == "HND":
+            shape = (shape[0], shape[2], shape[1], shape[3])
+        return (2, *shape)
 
-    def bind_kv_cache(self, cache: torch.Tensor):
+    def bind_kv_cache(self, cache: torch.Tensor, layout: str = "NHD"):
+        if layout == "HND":  # backends see (block, token, head, dim) either way, and read an HND cache by its strides
+            cache = cache.transpose(2, 3)
         self.k_cache, self.v_cache = cache[0], cache[1]
 
     def output_shape(self, num_tokens: int) -> tuple[int, ...]:
@@ -97,10 +102,6 @@ class Attention(nn.Module):
     def supports_full_cudagraph(self) -> bool:
         """Whether a full graph may hold this layer's decode."""
         return self.backend.supports_full_cudagraph()
-
-    def use_cascade_attention(self, common_prefix_len: int, query_lens: np.ndarray) -> bool:
-        """Whether this layer would attend the rows' shared prefix once for all of them this step."""
-        return self.backend.use_cascade_attention(common_prefix_len, query_lens)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         # Through an opaque op, so the compiled model splits here and attention runs eager between the pieces.
@@ -190,7 +191,7 @@ class MLAAttention(Attention):
     """Multi-head latent attention: the cache holds one compressed latent per token.
 
     Cached latents expand max_context_chunk at a time, merged by log-sum-exp; MLA decode backends skip expanding.
-    This plays vLLM's MLACommonImpl, so it splits a step into decode and prefill itself.
+    Corresponds to vLLM's MLACommonImpl; splits each step into decode and prefill.
     """
 
     max_context_chunk = 8192  # the runner sets its step token budget
@@ -212,23 +213,21 @@ class MLAAttention(Attention):
         super().__init__(num_heads, qk_head_dim, scale, num_heads, backend)
         self.v_head_dim = v_head_dim
         self.latent_dim = latent_dim
-        # Values stay narrower than keys, so no vLLM _pad_v (FA2's): FA3 and FlashInfer build
-        # DeepSeek's (192, 128), SDPA any.
+        # Values stay narrower than keys: FA3 and FlashInfer support DeepSeek's (192, 128)
+        # key/value dimensions, and SDPA supports arbitrary dimensions.
+        # No equivalent of vLLM's _pad_v for FlashAttention-2 is needed here.
         self.expand = expand  # methods of the owning layer, so not a registered submodule
         self.latent_projections = latent_projections
         self.latent_cache = torch.tensor([])
 
-    def kv_cache_shape(self, num_blocks: int, block_size: int) -> tuple[int, ...]:
-        return (1, num_blocks, block_size, self.latent_dim)
+    def kv_cache_shape(self, num_blocks: int, block_size: int, layout: str = "NHD") -> tuple[int, ...]:
+        return (1, num_blocks, block_size, self.latent_dim)  # no heads, so one layout
 
-    def bind_kv_cache(self, cache: torch.Tensor):
+    def bind_kv_cache(self, cache: torch.Tensor, layout: str = "NHD"):
         self.latent_cache = cache[0]
 
     def output_shape(self, num_tokens: int) -> tuple[int, ...]:
         return (num_tokens, self.num_heads, self.v_head_dim)
-
-    def use_cascade_attention(self, common_prefix_len: int, query_lens: np.ndarray) -> bool:
-        return False  # it attends through mla_decode and _prefill, which have no cascade path
 
     def supports_full_cudagraph(self) -> bool:
         # Decode must attend latents, as expanding them needs the step's host plan, and be safe to replay.
@@ -273,7 +272,7 @@ class MLAAttention(Attention):
             # No row has cached context (vLLM's has_context), so a plain prefill with no page table covers it.
             unpaged = dataclasses.replace(context, block_tables=None)
             return self.backend.prefill(q, k, v, self.k_cache, self.v_cache, unpaged, out)
-        # New tokens attend each other causally, and each chunk of cached keys unmasked. As vLLM's, the chunks
+        # New tokens attend each other causally, and each chunk of cached keys unmasked. The chunks
         # merge among themselves, then with the new tokens straight into out.
         cu_seqlens_q, max_seqlen_q = context.cu_seqlens_q, context.max_seqlen_q
         assert cu_seqlens_q is not None

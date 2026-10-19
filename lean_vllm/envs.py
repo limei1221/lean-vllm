@@ -1,7 +1,8 @@
 """Every environment variable lean-vLLM reads, parsed in one place and read at access."""
 
 import os
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -23,6 +24,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # A folder of tuned MoE launch configs, searched before the shipped ones; as vLLM's VLLM_TUNED_CONFIG_FOLDER.
     "LEAN_VLLM_TUNED_CONFIG_FOLDER": lambda: os.getenv("LEAN_VLLM_TUNED_CONFIG_FOLDER") or None,
+    # "NHD" (block, token, head, dim) or "HND" (block, head, token, dim) key/value caches; kv_transfer_config forces HND.
+    # As vLLM's VLLM_KV_CACHE_LAYOUT.
+    "LEAN_VLLM_KV_CACHE_LAYOUT": lambda: os.getenv("LEAN_VLLM_KV_CACHE_LAYOUT", "NHD").upper(),
     # Seconds a prefill instance holds a request's KV blocks for a decode instance to read; as VLLM_NIXL_ABORT_REQUEST_TIMEOUT.
     "LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT": lambda: float(os.getenv("LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT", "480")),
     # Enables the step-loop profiler, which writes its trace here.

@@ -11,7 +11,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "docs/benchmark-results-2026-10-03.md"
+SOURCE = ROOT / "docs/benchmark-results-2026-10-17.md"
 DESTINATION = ROOT / "assets/benchmarks"
 
 
@@ -58,14 +58,15 @@ def main():
         fig.subplots_adjust(left=0.075, right=0.98, bottom=0.29, top=0.70, wspace=0.30)
         fig.suptitle(model, x=0.075, y=0.97, ha="left", fontsize=19, fontweight="bold")
         fig.text(
-            0.075, 0.865, "H100 80 GB  |  3 Oct 2026  |  1,000 requests / point  |  Async scheduling on", fontsize=10
+            0.075, 0.865, "H100 80 GB  |  17 Oct 2026  |  1,000 requests / point  |  Async scheduling on", fontsize=10
         )
+        loads = sorted(row[0] for row in results[model]["vllm"])
         for system, label, color, marker, style in (
             ("lean-vllm", "lean-vLLM", "#2563eb", "o", "-"),
             ("vllm", "vLLM 0.26.0", "#c05621", "s", "--"),
         ):
             rows = sorted(results[model][system])
-            assert [row[0] for row in rows] == [1, 24, 32, 48, 64], (model, system)
+            assert [row[0] for row in rows] == loads, (model, system)
             rates, goodput, tpot = zip(*rows)
             for ax, values in zip(axes, (goodput, tpot)):
                 ax.plot(
@@ -80,7 +81,7 @@ def main():
             ax.set_title(title, loc="left", fontsize=12, pad=12)
             ax.set_xlabel("Offered load (requests / s)", labelpad=8)
             ax.set_ylabel(ylabel)
-            ax.set_xticks([1, 24, 32, 48, 64])
+            ax.set_xticks(loads)
             ax.set_ylim(0, ymax)
             ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
             ax.set_axisbelow(True)

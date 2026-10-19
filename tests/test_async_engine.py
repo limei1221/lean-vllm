@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("zmq", reason="the serve extra is not installed")
 
-from conftest import FakeConfig, FakeLLMEngine, FakeModelRunner, asyncio_test
+from conftest import FakeConfig, FakeLLMEngine, FakeModelRunner, asyncio_test, by_label, observed, total
 
 from lean_vllm.engine.async_llm import AsyncLLM
 from lean_vllm.engine.exceptions import EngineDeadError
@@ -221,7 +221,7 @@ class TestAbort:
 
         engine = make_async_engine(gated=True)
         blocks = fake_of(engine).scheduler.block_manager
-        free_before = len(blocks.free_block_ids)
+        free_before = blocks.free_block_queue.num_free_blocks
         body = ChatCompletionRequest(
             model="fake",
             messages=[{"role": "user", "content": "hi"}],
@@ -252,25 +252,25 @@ class TestAbort:
         await settle(engine)
         assert not engine.output_processor.request_states
         assert not fake_of(engine).scheduler.seqs
-        assert len(blocks.free_block_ids) == free_before
-        assert fake_of(engine).metrics.requests_aborted.total == 1
+        assert blocks.free_block_queue.num_free_blocks == free_before
+        assert total(fake_of(engine).metrics.requests_aborted) == 1
 
     @asyncio_test
     async def test_closing_the_generator_frees_the_blocks(self, make_async_engine):
         """This is what makes a client disconnect release KV, so it is the load-bearing test."""
         engine = make_async_engine(gated=True)
         blocks = fake_of(engine).scheduler.block_manager
-        free_before = len(blocks.free_block_ids)
+        free_before = blocks.free_block_queue.num_free_blocks
 
         outputs = await engine.add_request(prompt(8), FOREVER)
         runner_of(engine).release(2)  # the launch that emits nothing, then the one that drains it
         await outputs.__anext__()
-        assert len(blocks.free_block_ids) < free_before
+        assert blocks.free_block_queue.num_free_blocks < free_before
 
         await outputs.aclose()
         runner_of(engine).release()  # the abort lands once the step in flight returns
         await settle(engine)
-        assert len(blocks.free_block_ids) == free_before
+        assert blocks.free_block_queue.num_free_blocks == free_before
         assert not fake_of(engine).scheduler.seqs
 
     @asyncio_test
@@ -278,7 +278,7 @@ class TestAbort:
         """Cancelled while waiting out the step in flight, so it never reaches the engine."""
         engine = make_async_engine(gated=True)
         blocks = fake_of(engine).scheduler.block_manager
-        free_before = len(blocks.free_block_ids)
+        free_before = blocks.free_block_queue.num_free_blocks
         await engine.add_request(prompt(8), FOREVER, "running")
         await wait_until(engine.engine_core._lock.locked)  # its step is blocked in the runner
 
@@ -293,7 +293,7 @@ class TestAbort:
         await settle(engine)
         assert not fake_of(engine).scheduler.seqs
         assert not engine.output_processor.request_states
-        assert len(blocks.free_block_ids) == free_before
+        assert blocks.free_block_queue.num_free_blocks == free_before
 
     @asyncio_test
     async def test_abort_ends_a_waiting_reader(self, make_async_engine):
@@ -329,9 +329,9 @@ class TestAbort:
         await outputs.aclose()  # its own abort lands after, on a finished request
         runner_of(engine).release()
         await settle(engine)
-        assert fake_of(engine).metrics.requests_aborted.total == 0
-        assert fake_of(engine).metrics.requests_finished.values == {"stop": 1}
-        assert fake_of(engine).metrics.ttft.count == 1
+        assert total(fake_of(engine).metrics.requests_aborted) == 0
+        assert by_label(fake_of(engine).metrics.requests_finished) == {"stop": 1}
+        assert observed(fake_of(engine).metrics.ttft) == 1
 
 
 class TestAdmission:

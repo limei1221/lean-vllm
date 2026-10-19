@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 import pytest
+from conftest import by_label, total
 
 from lean_vllm.engine import sequence
 from lean_vllm.engine.scheduler import DuplicateRequestId, SchedulerOutput
@@ -47,7 +48,7 @@ class TestGeneration:
         engine.run_to_completion()
         block_manager = engine.scheduler.block_manager
         assert not block_manager.used_block_ids
-        assert len(block_manager.free_block_ids) == engine.config.num_kvcache_blocks
+        assert block_manager.free_block_queue.num_free_blocks == engine.config.num_kvcache_blocks
 
 
 class TestStreaming:
@@ -83,7 +84,7 @@ class TestFinishReason:
         assert seq.finish_reason == "stop"
 
     def test_a_client_stop_token_is_honoured_even_with_ignore_eos(self, make_engine):
-        """ignore_eos covers the eos token only, as in vLLM."""
+        """ignore_eos covers the eos token only."""
         engine = make_engine()
         seq = engine.add(prompt(8), SamplingParams(max_tokens=64, ignore_eos=True, stop_token_ids=[1002]))
         engine.run_to_completion()
@@ -258,7 +259,7 @@ class TestPrefixCache:
         engine.step()
         assert dict(engine.model_runner.batches[1][1])[second.request_id] == 16
         assert not engine.scheduler.block_manager.hash_to_block_id
-        assert engine.metrics.prefix_cache_queries.total and not engine.metrics.prefix_cache_hits.total
+        assert total(engine.metrics.prefix_cache_queries) and not total(engine.metrics.prefix_cache_hits)
 
     def test_a_block_is_hashed_on_arrival_and_never_again(self, make_engine, monkeypatch):
         """The queue head is re-queried every step, and rehashing it is the whole cost."""
@@ -420,7 +421,7 @@ class TestAdmission:
         assert engine.is_finished()
         assert not engine.scheduler.seqs
         assert not engine.scheduler.block_manager.used_block_ids
-        assert engine.metrics.requests_finished.values == {"length": 1, "capacity": 1}
+        assert by_label(engine.metrics.requests_finished) == {"length": 1, "capacity": 1}
 
     def test_a_duplicate_request_id_is_refused(self, make_engine):
         """Both would queue behind one entry in seqs, and the second to finish would KeyError."""

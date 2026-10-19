@@ -3,11 +3,12 @@
 import pickle
 import random
 
+import numpy as np
 import pytest
 import torch
 
 from lean_vllm.attention import TorchAttention
-from lean_vllm.engine.model_runner import ModelRunner, cudagraph_capture_sizes
+from lean_vllm.engine.model_runner import ModelRunner, cudagraph_capture_sizes, decode_query_len
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.layers.attention import Attention, MLAAttention
 from lean_vllm.sampling_params import SamplingParams
@@ -48,10 +49,7 @@ def test_batch_preparation_on_tensor_parallel_ranks(runner, rank, decode):
         assert context["logits_indices"] is None
     else:
         assert context["logits_indices"].tolist() == [2]
-    if rank:
-        assert temperatures is None
-    else:
-        assert temperatures.tolist() == [0.5]
+    assert temperatures.tolist() == [0.5]  # every rank samples
 
 
 def test_run_returns_tokens_that_are_not_yet_fetched(runner, make_engine):
@@ -199,7 +197,7 @@ def test_one_query_rows_lead_the_batch_but_sample_in_the_schedulers_order(runner
 
 @pytest.mark.parametrize("decodes_latents", [True, False], ids=["latents", "expanded"])
 def test_rows_verifying_as_many_drafts_decode_whole_when_latents_are_attended(runner, decodes_latents):
-    """As vLLM's uniform decode: MLA decodes them in one call, every token samples, and a full graph can hold them.
+    """MLA decodes them in one call, every token samples, and a full graph can hold them.
     A backend that expands latents prefills them, and rows of other lengths split."""
     runner.num_speculative_tokens = 2
     runner.decodes_latents = decodes_latents
@@ -219,55 +217,6 @@ def test_rows_verifying_as_many_drafts_decode_whole_when_latents_are_attended(ru
     rows[1].spec_token_ids, rows[1].num_scheduled_tokens = [41], 2
     _, _, _, context = runner.prepare_batch(rows)
     assert context["is_prefill"]
-
-
-class CascadeLayer:
-    """Stands in for a layer: records what it was asked and answers as told."""
-
-    def __init__(self, answer: bool):
-        self.answer, self.asked = answer, []
-
-    def use_cascade_attention(self, common_prefix_len, query_lens):
-        self.asked.append((common_prefix_len, query_lens.tolist()))
-        return self.answer
-
-
-def decoding_rows(tables: list[list[int]], cached: list[int]) -> list[Sequence]:
-    rows = []
-    for table, num_cached in zip(tables, cached):
-        seq = Sequence(list(range(num_cached)))
-        seq.append_token(7)
-        seq.num_cached_tokens, seq.num_scheduled_tokens, seq.is_prefill = num_cached, 1, False
-        seq.block_table = table
-        rows.append(seq)
-    return rows
-
-
-@pytest.mark.parametrize("answers, want", [((True, True), 16), ((True, False), 0)], ids=["all_agree", "one_declines"])
-def test_cascade_takes_the_pages_every_row_shares_up_to_the_fewest_cached(runner, answers, want):
-    """Rows share blocks 1 and 2, and the third page only in part; every layer kind must agree, as vLLM's groups."""
-    runner.cascade_layers = [CascadeLayer(answer) for answer in answers]
-    rows = decoding_rows([[1, 2, 3, 9], [1, 2, 3, 10], [1, 2, 4, 11]], [30, 25, 28])
-
-    *_, context = runner.prepare_batch(rows)
-
-    assert context["common_prefix_len"] == want
-    assert runner.cascade_layers[0].asked == [(16, [1, 1, 1])]
-
-
-def test_cascade_never_covers_a_query(runner):
-    """Shared pages past a row's cached tokens hold its new ones, which must stay masked: the prefix stops short."""
-    runner.cascade_layers = [CascadeLayer(True)]
-    rows = decoding_rows([[1, 2, 3, 4], [1, 2, 3, 4]], [30, 15])  # the second row's token is on page 1
-
-    *_, context = runner.prepare_batch(rows)
-
-    assert context["common_prefix_len"] == 8
-
-
-def test_a_runner_without_layers_never_cascades(runner):
-    *_, context = runner.prepare_batch(decoding_rows([[1, 2, 3, 9], [1, 2, 3, 10]], [30, 30]))
-    assert context["common_prefix_len"] == 0
 
 
 def test_a_failed_step_leaves_no_context_behind(runner):
@@ -332,14 +281,9 @@ class TestStepKind:
         assert runner._step_kind(is_prefill=False, num_tokens=51, query_len=3) == "decode"
 
     def test_one_query_rows_skip_graphs_of_verifying_rows(self, runner):
-        """As vLLM's: the full graphs hold the uniform 1 + drafts decode alone."""
+        """The full graphs hold the uniform 1 + drafts decode alone."""
         runner.graph_query_len = 3
         assert runner._step_kind(is_prefill=False, num_tokens=8) == "decode"
-
-    def test_a_cascade_decode_skips_the_full_graph(self, runner):
-        """The full graphs hold one-kernel decode, so a cascade step falls back, as vLLM's dispatcher does."""
-        assert runner._step_kind(is_prefill=False, num_tokens=8, cascade=True) == "decode"
-        assert runner._step_kind(is_prefill=False, num_tokens=512, cascade=True) == "piecewise"
 
     def test_a_decode_batch_past_the_buckets_runs_eager(self, runner):
         assert runner._step_kind(is_prefill=False, num_tokens=17) == "decode"
@@ -446,8 +390,8 @@ def test_preemption_recomputes_the_generated_suffix(runner, make_engine, chunked
     for _ in range(16):
         engine.step()
     # Drain the in-flight step without launching another, so schedule() below sees fresh state.
-    _, rows, pending = engine.in_flight
-    engine.scheduler.reconcile(rows, pending.tolist())
+    pending = engine.in_flight
+    engine.scheduler.reconcile(pending.rows, pending.pending.tolist())
     engine.in_flight = None
     assert first.is_finished
     assert second.num_preemptions == 1
@@ -508,7 +452,7 @@ def test_recomputed_suffix_stays_prefill_across_chunks(runner, make_engine):
 
 
 class TestDummySamplerRun:
-    """Warmup must reach the peak of sampling one row per sequence, as vLLM's profile run does."""
+    """Warmup must reach the peak of sampling one row per sequence."""
 
     @pytest.fixture
     def sampling_runner(self, runner):
@@ -542,10 +486,10 @@ class TestDummySamplerRun:
         sampling_runner._dummy_sampler_run()
         assert sampling_runner.sampled[0][0] == (4, 32)
 
-    def test_only_rank_zero_samples(self, sampling_runner):
+    def test_every_rank_samples(self, sampling_runner):
         sampling_runner.rank = 1
         sampling_runner._dummy_sampler_run()
-        assert sampling_runner.sampled == []
+        assert sampling_runner.sampled
 
     def test_running_out_of_memory_names_the_knobs(self, sampling_runner):
         def oom(logits, temperatures, *top_k_top_p):
@@ -556,11 +500,17 @@ class TestDummySamplerRun:
             sampling_runner._dummy_sampler_run()
 
 
-def reference_batch(seqs: list[Sequence], block_size: int, rank: int) -> dict:
+def decodes_first(seqs: list[Sequence], num_speculative_tokens: int = 0) -> list[Sequence]:
+    """prepare_batch's row order: rows of decode_query_len first, scheduler order kept within each group."""
+    query_len = decode_query_len(np.array([seq.num_scheduled_tokens for seq in seqs]), num_speculative_tokens)
+    return sorted(seqs, key=lambda seq: seq.num_scheduled_tokens != query_len)
+
+
+def reference_batch(seqs: list[Sequence], block_size: int) -> dict:
     """The per-token loops prepare_batch replaced, kept as its oracle; pending tokens aside."""
     out = dict(input_ids=[], positions=[], slot_mapping=[], cu_seqlens_q=[0], cu_seqlens_k=[0], context_lens=[])
     last_tokens = {}
-    for seq in ModelRunner.decodes_first(seqs):
+    for seq in decodes_first(seqs):
         start, end = seq.num_cached_tokens, seq.num_cached_tokens + seq.num_scheduled_tokens
         out["input_ids"] += seq[start:end] if seq.is_prefill else [seq.last_token]
         out["positions"] += range(start, end)
@@ -575,9 +525,9 @@ def reference_batch(seqs: list[Sequence], block_size: int, rank: int) -> dict:
             ]
     sampling = [seq for seq in seqs if id(seq) in last_tokens]
     out["logits_indices"] = [last_tokens[id(seq)] for seq in sampling]
-    temperatures = [seq.temperature for seq in sampling] if rank == 0 else []
+    temperatures = [seq.temperature for seq in sampling]
     out["temperatures"] = None if all(t == 0 for t in temperatures) else temperatures
-    tables = [seq.block_table for seq in ModelRunner.decodes_first(seqs)]
+    tables = [seq.block_table for seq in decodes_first(seqs)]
     width = max(map(len, tables))
     out["block_tables"] = [table + [-1] * (width - len(table)) for table in tables] if width else None
     return out
@@ -615,7 +565,7 @@ def test_the_numpy_batch_matches_the_per_token_loops(runner, device, rank):
     rng = random.Random(rank)
     for step in range(20):
         seqs = random_batch(rng, runner.block_size, with_tables=step % 5 != 0)  # every fifth is warmup-like
-        check_batch(runner, seqs, reference_batch(seqs, runner.block_size, rank))
+        check_batch(runner, seqs, reference_batch(seqs, runner.block_size))
 
 
 def check_batch(runner, seqs: list[Sequence], want: dict):

@@ -114,6 +114,17 @@ class TestEndpoints:
     def test_models_lists_the_served_name(self, client):
         assert [card["id"] for card in client.get("/v1/models").json()["data"]] == [MODEL]
 
+    def test_openapi_describes_the_sampling_limits(self, client):
+        schemas = client.get("/openapi.json").json()["components"]["schemas"]
+        for name in ("CompletionRequest", "ChatCompletionRequest"):
+            fields = schemas[name]["properties"]
+            assert fields["max_tokens"]["minimum"] == 1
+            assert fields["temperature"]["minimum"] == 0
+            top_p = next(option for option in fields["top_p"]["anyOf"] if option["type"] == "number")
+            assert (top_p["exclusiveMinimum"], top_p["maximum"]) == (0, 1)
+            top_k = next(option for option in fields["top_k"]["anyOf"] if option["type"] == "integer")
+            assert top_k["minimum"] == -1
+
     def test_metrics_is_prometheus_text(self, client):
         complete(client)
         response = client.get("/metrics")
@@ -147,11 +158,17 @@ class TestCompletions:
         assert complete(client, top_p=None, top_k=None).status_code == 200
         assert (engine.requests[0][1].top_p, engine.requests[0][1].top_k) == (1.0, 0)
 
-    @pytest.mark.parametrize("field, value", [("top_p", 0), ("top_p", 1.5), ("top_k", -2)])
-    def test_an_out_of_range_top_p_or_top_k_is_a_400(self, client, field, value):
+    @pytest.mark.parametrize(
+        "field, value", [("max_tokens", 0), ("temperature", -0.1), ("top_p", 0), ("top_p", 1.5), ("top_k", -2)]
+    )
+    def test_an_out_of_range_sampling_parameter_is_a_400(self, client, field, value):
         response = complete(client, **{field: value})
         assert response.status_code == 400
         assert field in response.json()["error"]["message"]
+
+    @pytest.mark.parametrize("top_k", [-1, 0, 1])
+    def test_sampling_limits_accept_their_inclusive_boundaries(self, client, top_k):
+        assert complete(client, max_tokens=1, temperature=0, top_p=1, top_k=top_k).status_code == 200
 
     def test_the_priority_extra_reaches_the_sampling_params(self, client, engine):
         complete(client, priority=3, ignore_eos=True)

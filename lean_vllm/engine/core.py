@@ -1,4 +1,4 @@
-"""The engine in a process of its own, as vLLM's EngineCore, so the HTTP server's event loop never holds its GIL.
+"""Run the engine in a separate process, as vLLM's EngineCore, with a separate GIL from the HTTP server.
 
 Requests come in and outputs go out over two ZMQ sockets, as pickled tuples:
 in:  ("add", request_id, prompt_token_ids, sampling_params), ("abort", request_id, reason),
@@ -9,9 +9,9 @@ out: ("added", request_id, error or None), ("outputs", [RequestOutput]), ("metri
 import logging
 import pickle
 import signal
+from collections.abc import Callable
 from multiprocessing import parent_process
 from multiprocessing.connection import Connection
-from typing import Callable
 
 import zmq
 
@@ -24,14 +24,14 @@ PARENT_POLL_MS = 1000  # how often an idle core checks that the client is still 
 
 
 def make_engine(model: str, **kwargs):
-    """The engine a core serves. Detokenization stays with the client, as in vLLM, so the step loop skips it."""
+    """The engine a core serves. Detokenization stays with the client, so the step loop skips it."""
     from lean_vllm.engine.llm_engine import LLMEngine
 
     return LLMEngine(model, detokenize=False, **kwargs)
 
 
 def picklable(error: BaseException) -> BaseException:
-    """The error itself if the other side can rebuild it, else its repr in a RuntimeError."""
+    """Return error if it survives a pickle round trip, otherwise wrap its repr in a RuntimeError."""
     try:
         pickle.loads(pickle.dumps(error))
         return error
@@ -40,7 +40,7 @@ def picklable(error: BaseException) -> BaseException:
 
 
 class EngineCore:
-    """vLLM's busy loop: take every queued request, step, send the outputs; block only when there is nothing to run."""
+    """Take every queued request, step, send the outputs; block only when there is nothing to run."""
 
     def __init__(self, engine, input_socket: zmq.Socket, output_socket: zmq.Socket):
         self.engine = engine
@@ -60,7 +60,7 @@ class EngineCore:
                 self._handle_inputs(wait_ms=IDLE_POLL_MS)
 
     def _handle_inputs(self, wait_ms: int | None):
-        """Everything queued. Waits up to wait_ms for the first, or, with None, for as long as the client lives."""
+        """Handle queued messages, waiting up to wait_ms for the first. None waits until a message or parent exit."""
         if wait_ms is None:
             while not self.input.poll(PARENT_POLL_MS):
                 parent = parent_process()
@@ -114,7 +114,7 @@ def run_engine_core(
     output_address: str,
     ready: Connection,
 ):
-    """A spawned process's target: build the engine, report on ready, then serve until shutdown."""
+    """Build the engine in the spawned process, report startup status through ready, then serve until shutdown."""
     # Ctrl-C reaches the whole process group; the client decides when this process stops. SIGTERM exits cleanly,
     # so atexit still stops the TP workers.
     signal.signal(signal.SIGINT, signal.SIG_IGN)

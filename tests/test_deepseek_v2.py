@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
+from test_model_runner import decodes_first
 from transformers import DeepseekV2Config, DeepseekV3Config
 from transformers import DeepseekV2ForCausalLM as HFDeepseekV2ForCausalLM
 from transformers import DeepseekV3ForCausalLM as HFDeepseekV3ForCausalLM
@@ -137,7 +138,7 @@ def step(runner, model, seqs: list[Sequence]) -> list[torch.Tensor]:
     context["logits_indices"] = None
     with torch.inference_mode(), set_context(**context):
         logits = model.compute_logits(model(input_ids, positions))
-    batch = ModelRunner.decodes_first(seqs, runner.num_speculative_tokens)  # the batch's row order, decodes first
+    batch = decodes_first(seqs, runner.num_speculative_tokens)  # the batch's row order, decodes first
     by_row = dict(zip(map(id, batch), logits.split([seq.num_scheduled_tokens for seq in batch])))
     return [by_row[id(seq)] for seq in seqs]
 
@@ -241,8 +242,8 @@ def test_mixed_rows_keep_latent_decode_and_original_order(models, runner, monkey
 
 
 def test_rows_verifying_drafts_decode_their_latents(models, runner, monkeypatch):
-    """Rows of 1 + drafts queries attend the latents through mla_decode, as vLLM's MLA backends with
-    reorder_batch_threshold raised by the drafts; a row of another length, and a prompt, expand beside them."""
+    """Rows of 1 + drafts queries attend the latents through mla_decode; rows of other lengths and prompts
+    expand beside them."""
     reference, model = models
     runner.num_speculative_tokens = 2
     layers = [module for module in model.modules() if isinstance(module, MLAAttention)]

@@ -8,9 +8,10 @@ from lean_vllm.spec_decode.config import PLACEHOLDER_TOKEN_ID
 class RejectionSampler(nn.Module):
     """Verifies each row's drafts against the target's logits, as vLLM's RejectionSampler (Leviathan et al. 2023).
 
-    MTP drafts greedily, so a draft is its own whole distribution: it is kept with the target's probability of it,
-    and the first one rejected is replaced by a sample from the target with that token taken out. A greedy row keeps
-    a draft only if it is the target's argmax. A row that keeps every draft adds a bonus token from its last position.
+    MTP drafts greedily, so its draft distribution puts all probability on one token. Accept that token with its
+    target probability; replace the first rejected draft by sampling from the target with that token excluded.
+    A greedy row keeps a draft only if it is the target's argmax. A row that keeps every draft adds a bonus token
+    from its last position.
     """
 
     def forward(
@@ -23,11 +24,11 @@ class RejectionSampler(nn.Module):
         top_k: torch.Tensor | None = None,
         top_p: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """The tokens each row produced, [rows, max_num_drafts + 1], PLACEHOLDER_TOKEN_ID past its last.
+        """Return tokens with shape [rows, max_num_drafts + 1], padded with PLACEHOLDER_TOKEN_ID.
 
         logits holds each row's draft positions, then its bonus position, row after row: [sum(n + 1), vocab].
         draft_token_ids is every row's drafts in the same order, and num_draft_tokens how many each row has.
-        temperatures, top_k and top_p are per row; the target's probabilities are taken after all three, as vLLM's.
+        temperatures, top_k and top_p are per row; the target's probabilities are taken after all three.
         """
         num_rows, num_drafts = num_draft_tokens.numel(), draft_token_ids.numel()
         device = logits.device
@@ -58,7 +59,7 @@ class RejectionSampler(nn.Module):
             accepted = torch.where(
                 is_greedy, greedy[draft_index] == draft_token_ids, torch.rand_like(draft_probs) < draft_probs
             )
-            # Where a draft is rejected, the next token comes from what the target wanted beyond it.
+            # Sample replacements from the target distribution with the rejected draft token excluded.
             probs[draft_index, draft_token_ids] = 0
             sampled = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
             candidates = torch.where(row_temperatures == 0, greedy, sampled)
