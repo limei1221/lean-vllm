@@ -1,4 +1,5 @@
-"""Disaggregated prefill end to end: a prefill and a decode engine, each in its own process, on a real model on CPU.
+"""Disaggregated prefill end to end: a prefill and a decode engine, each in its own process, on a real model on CPU,
+reading over a real NIXL agent.
 
 The decode engine recomputes the last prompt token against the pulled KV, so its greedy tokens are
 compared with the prefill engine running the same prompt split the same way: all but one token, then that one.
@@ -8,6 +9,7 @@ import json
 import multiprocessing as mp
 import os
 import socket
+from importlib.util import find_spec
 from time import sleep
 
 import pytest
@@ -64,6 +66,31 @@ def _decode(conn):
     conn.send((outputs[0]["token_ids"], total(engine.metrics.prefill_tokens)))
 
 
+def _generate(conn, layout: str):
+    from lean_vllm.sampling_params import SamplingParams
+
+    os.environ["LEAN_VLLM_KV_CACHE_LAYOUT"] = layout
+    outputs = _engine().generate([PROMPT], SamplingParams(temperature=0, max_tokens=MAX_TOKENS), use_tqdm=False)
+    conn.send(outputs[0]["token_ids"])
+
+
+def test_hnd_caches_generate_what_nhd_ones_do():
+    """HND is the layout every disaggregated engine runs on, so the whole model must run on it, NIXL or not."""
+    ctx = mp.get_context("spawn")
+    token_ids = {}
+    for layout in ("NHD", "HND"):
+        conn, child = ctx.Pipe()
+        process = ctx.Process(target=_generate, args=(child, layout))
+        process.start()
+        try:
+            assert conn.poll(300), f"the {layout} engine never finished"
+            token_ids[layout] = conn.recv()
+        finally:
+            process.join(timeout=60)
+    assert token_ids["HND"] == token_ids["NHD"]
+
+
+@pytest.mark.skipif(find_spec("nixl") is None, reason="needs NIXL: uv sync --extra nixl")
 def test_the_decode_engine_continues_from_the_prefill_engine_s_kv():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))

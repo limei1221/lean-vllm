@@ -109,11 +109,12 @@ class TestDecodeSide:
         assert engine.model_runner.batches[0] == (True, [("d-1", len(PROMPT))])
         assert "2 remote blocks for a 3-block prompt" in caplog.text
 
-    def test_a_different_tensor_parallel_size_prefills_here(self, make_disagg_engine):
+    def test_a_different_tensor_parallel_size_still_loads(self, make_disagg_engine):
+        """Each rank reads its heads from whichever producer ranks hold them."""
         engine = make_disagg_engine()
         engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params=remote_prefill(tp_size=2)), "d-1")
-        engine.run_to_completion()
-        assert recvs(engine) == {}
+        engine.step()
+        assert recvs(engine)["d-1"].remote_tp_size == 2
 
     def test_an_abort_mid_load_frees_the_blocks_only_once_the_load_ends(self, make_disagg_engine):
         """The loader is still writing them."""

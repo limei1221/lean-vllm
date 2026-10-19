@@ -6,6 +6,7 @@ from typing import Any
 
 from transformers import AutoConfig
 
+from lean_vllm import envs
 from lean_vllm.attention import LayerSpec, get_attention_backend
 from lean_vllm.engine.sequence import HASH_ALGOS
 from lean_vllm.kv_transfer import KVTransferConfig, parse_kv_transfer_config
@@ -68,6 +69,7 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         if self.kv_transfer_config and self.kv_transfer is None:
             self.kv_transfer = parse_kv_transfer_config(self.kv_transfer_config)
+        assert self.kv_cache_layout in ("NHD", "HND"), f"unknown kv cache layout {self.kv_cache_layout!r}"
         if not self.dist_port:  # resolved here, so spawned workers get the same one
             self.dist_port = _free_port()
         self.hf_config = AutoConfig.from_pretrained(self.model)
@@ -85,6 +87,13 @@ class Config:
             if block_size and block_size != self.kvcache_block_size:
                 logger.warning("kvcache_block_size is %d: the MLA decode kernel reads no other page size", block_size)
                 self.kvcache_block_size = block_size
+
+    @property
+    def kv_cache_layout(self) -> str:
+        """HND keeps each head's slice of a block contiguous, so a NIXL read can take one rank's share of the heads."""
+        if self.kv_transfer is not None:  # NixlConnector, the one connector
+            return "HND"
+        return envs.LEAN_VLLM_KV_CACHE_LAYOUT
 
     def _mla_layer_spec(self) -> LayerSpec:
         """What each MLA layer of one rank will ask of a backend, so the page size follows the one it gets."""

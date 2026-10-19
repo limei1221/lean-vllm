@@ -59,3 +59,13 @@ def test_the_rendezvous_port_is_picked_unless_given(make_config):
     """A fixed port would keep a second engine on the host from starting."""
     assert make_config().dist_port > 0
     assert make_config(dist_port=29500).dist_port == 29500
+
+
+def test_the_kv_cache_layout_is_nhd_unless_nixl_or_the_environment_asks(make_config, monkeypatch):
+    assert make_config().kv_cache_layout == "NHD"
+    assert make_config(kv_transfer_config='{"kv_connector": "NixlConnector"}').kv_cache_layout == "HND"
+    monkeypatch.setenv("LEAN_VLLM_KV_CACHE_LAYOUT", "hnd")
+    assert make_config().kv_cache_layout == "HND"
+    monkeypatch.setenv("LEAN_VLLM_KV_CACHE_LAYOUT", "HDN")
+    with pytest.raises(AssertionError, match="unknown kv cache layout"):
+        make_config()

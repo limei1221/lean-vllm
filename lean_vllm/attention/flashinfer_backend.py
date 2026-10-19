@@ -61,10 +61,12 @@ class FlashInferBackend(AttentionBackend):
     def prefill(self, q, k, v, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
         if context.block_tables is None:  # no pages (warmup): k and v hold every key, as FA3's
             return self._planned_ragged(q, k, context).run(q, k, v, out=out)
-        return self._planned("paged", q, k_cache.dtype, context, k_cache.size(1)).run(q, (k_cache, v_cache), out=out)
+        layout, pages = _paged_kv(k_cache, v_cache)
+        return self._planned("paged", q, k_cache.dtype, context, k_cache.size(1), layout).run(q, pages, out=out)
 
     def decode(self, q, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
-        return self._planned("decode", q, k_cache.dtype, context, k_cache.size(1)).run(q, (k_cache, v_cache), out=out)
+        layout, pages = _paged_kv(k_cache, v_cache)
+        return self._planned("decode", q, k_cache.dtype, context, k_cache.size(1), layout).run(q, pages, out=out)
 
     @classmethod
     def before_full_graph_replay(cls, context: Context, batch_size: int) -> None:
@@ -104,7 +106,9 @@ class FlashInferBackend(AttentionBackend):
             entry[1] = lengths
         return entry[0]
 
-    def _planned(self, kind: str, q: torch.Tensor, kv_dtype: torch.dtype, context: Context, page_size: int = 0):
+    def _planned(
+        self, kind: str, q: torch.Tensor, kv_dtype: torch.dtype, context: Context, page_size: int, layout: str
+    ):
         """This step's wrapper for kind, planned by the first layer to ask and reused by every layer alike."""
         graph_size = context.full_graph_size if kind == "decode" else None
         key = (
@@ -116,6 +120,7 @@ class FlashInferBackend(AttentionBackend):
             q.dtype,
             kv_dtype,
             page_size,
+            layout,
             graph_size,
         )
         if context.attn_metadata is None:
@@ -124,7 +129,7 @@ class FlashInferBackend(AttentionBackend):
             return context.attn_metadata[key]
         wrapper = FlashInferBackend._wrappers.get(key)
         if wrapper is None:
-            wrapper = FlashInferBackend._wrappers[key] = self._make_wrapper(kind, q.device, context, graph_size)
+            wrapper = FlashInferBackend._wrappers[key] = self._make_wrapper(kind, q.device, context, layout, graph_size)
         shape = (self.num_heads, self.num_kv_heads, self.head_dim)
         options = dict(sm_scale=self.scale, q_data_type=q.dtype, kv_data_type=kv_dtype)
         if kind == "decode":
@@ -143,14 +148,14 @@ class FlashInferBackend(AttentionBackend):
             FlashInferBackend._workspace = torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
         return FlashInferBackend._workspace
 
-    def _make_wrapper(self, kind: str, device: torch.device, context: Context, graph_size: int | None):
+    def _make_wrapper(self, kind: str, device: torch.device, context: Context, layout: str, graph_size: int | None):
         workspace = self._workspace_for(device)
         if kind == "paged":
-            return BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
+            return BatchPrefillWithPagedKVCacheWrapper(workspace, layout)
         # Wide query groups decode on tensor cores; the CUDA-core kernel takes few group sizes.
         use_tensor_cores = self.num_heads // self.num_kv_heads > 4
         if graph_size is None:
-            return BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD", use_tensor_cores=use_tensor_cores)
+            return BatchDecodeWithPagedKVCacheWrapper(workspace, layout, use_tensor_cores=use_tensor_cores)
         # One per captured batch size, over slices of one fixed page table.
         if FlashInferBackend._graph_pages is None:
             assert context.block_tables is not None
@@ -164,7 +169,7 @@ class FlashInferBackend(AttentionBackend):
         assert graph_size <= last_page_len.numel(), "full graphs must capture their largest batch size first"
         return BatchDecodeWithPagedKVCacheWrapper(
             workspace,
-            "NHD",
+            layout,
             use_cuda_graph=True,
             use_tensor_cores=use_tensor_cores,
             paged_kv_indptr_buffer=indptr[: graph_size + 1],
@@ -197,10 +202,17 @@ class FlashInferBackend(AttentionBackend):
 
 def _plan_decode(wrapper, key: tuple, pages: tuple[torch.Tensor, ...]) -> None:
     """Plan a decode wrapper from its key alone, so a replay hook re-plans with no layer at hand."""
-    _, num_heads, num_kv_heads, head_dim, scale, q_dtype, kv_dtype, page_size, _ = key
+    _, num_heads, num_kv_heads, head_dim, scale, q_dtype, kv_dtype, page_size, _, _ = key
     wrapper.plan(
         *pages, num_heads, num_kv_heads, head_dim, page_size, sm_scale=scale, q_data_type=q_dtype, kv_data_type=kv_dtype
     )
+
+
+def _paged_kv(k_cache: torch.Tensor, v_cache: torch.Tensor) -> tuple[str, tuple[torch.Tensor, torch.Tensor]]:
+    """The caches as FlashInfer takes them: an HND cache, bound as a transposed view, goes back to its own layout."""
+    if k_cache.stride(1) < k_cache.stride(2):  # tokens closer than heads: (block, head, token, dim) underneath
+        return "HND", (k_cache.transpose(1, 2), v_cache.transpose(1, 2))
+    return "NHD", (k_cache, v_cache)
 
 
 def _host_cumulative(host: list[int] | None, device: torch.Tensor | None, lens: torch.Tensor | None = None):

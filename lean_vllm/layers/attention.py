@@ -83,11 +83,16 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.layer_name = ""
 
-    def kv_cache_shape(self, num_blocks: int, block_size: int) -> tuple[int, ...]:
-        """This layer's cache: a key and a value tensor, stacked, in the backend's layout."""
-        return (2, *self.backend.get_kv_cache_shape(num_blocks, block_size, self.num_kv_heads, self.head_dim))
+    def kv_cache_shape(self, num_blocks: int, block_size: int, layout: str = "NHD") -> tuple[int, ...]:
+        """This layer's cache: a key and a value tensor, stacked, in the backend's layout, heads before tokens if HND."""
+        shape = self.backend.get_kv_cache_shape(num_blocks, block_size, self.num_kv_heads, self.head_dim)
+        if layout == "HND":
+            shape = (shape[0], shape[2], shape[1], shape[3])
+        return (2, *shape)
 
-    def bind_kv_cache(self, cache: torch.Tensor):
+    def bind_kv_cache(self, cache: torch.Tensor, layout: str = "NHD"):
+        if layout == "HND":  # backends see (block, token, head, dim) either way, and read an HND cache by its strides
+            cache = cache.transpose(2, 3)
         self.k_cache, self.v_cache = cache[0], cache[1]
 
     def output_shape(self, num_tokens: int) -> tuple[int, ...]:
@@ -215,10 +220,10 @@ class MLAAttention(Attention):
         self.latent_projections = latent_projections
         self.latent_cache = torch.tensor([])
 
-    def kv_cache_shape(self, num_blocks: int, block_size: int) -> tuple[int, ...]:
-        return (1, num_blocks, block_size, self.latent_dim)
+    def kv_cache_shape(self, num_blocks: int, block_size: int, layout: str = "NHD") -> tuple[int, ...]:
+        return (1, num_blocks, block_size, self.latent_dim)  # no heads, so one layout
 
-    def bind_kv_cache(self, cache: torch.Tensor):
+    def bind_kv_cache(self, cache: torch.Tensor, layout: str = "NHD"):
         self.latent_cache = cache[0]
 
     def output_shape(self, num_tokens: int) -> tuple[int, ...]:

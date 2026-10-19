@@ -22,7 +22,8 @@ On top of [nano-vLLM](#credit), lean-vLLM adds these vLLM features:
 - [Speculative decoding](lean_vllm/spec_decode/): DeepSeek-V3 MTP drafting
   with rejection sampling.
 - [Disaggregated prefill/decode](docs/disaggregated-prefill.md): separate
-  engines connected by TCP KV-cache transfer and a proxy.
+  engines connected by NIXL KV-cache transfer, GPU to GPU across different
+  tensor-parallel sizes, and a proxy.
 
 MTP and disaggregation have CPU checks; GPU validation is still pending.
 

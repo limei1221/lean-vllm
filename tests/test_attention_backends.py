@@ -564,6 +564,62 @@ def test_store_kvcache_skips_negative_slots(backend, device, block_size, dtype):
     assert (flat_k[1:5] == 7.0).all(), "untouched slots were overwritten"
 
 
+def make_hnd_cache(num_blocks, device, block_size, dtype):
+    """As the runner binds an HND cache: (block, head, token, dim) underneath, seen as (block, token, head, dim)."""
+    shape = (num_blocks, NUM_KV_HEADS, block_size, HEAD_DIM)
+    return tuple(torch.zeros(shape, device=device, dtype=dtype).transpose(1, 2) for _ in range(2))
+
+
+def test_an_hnd_cache_stores_and_attends_as_an_nhd_one(backend, device, block_size, dtype, tol):
+    """The same keys through both layouts: equal caches, then equal decode and paged prefill."""
+    seqlens = [block_size + 3, 5]
+    block_tables_list = [[0, 3], [1, -1]]
+    nhd, hnd = make_cache(4, device, block_size, dtype), make_hnd_cache(4, device, block_size, dtype)
+    slot_mapping = slots_for(block_tables_list[0], block_size, 0, seqlens[0])
+    slot_mapping += slots_for(block_tables_list[1], block_size, 0, seqlens[1]) + [-1]
+    key = randn(len(slot_mapping), NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype)
+    value = randn(len(slot_mapping), NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype)
+    for k_cache, v_cache in (nhd, hnd):
+        backend.store_kvcache(
+            key, value, k_cache, v_cache, torch.tensor(slot_mapping, dtype=torch.int32, device=device)
+        )
+    assert torch.equal(hnd[0], nhd[0]) and torch.equal(hnd[1], nhd[1])
+
+    block_tables = torch.tensor(block_tables_list, dtype=torch.int32, device=device)
+    q = randn(len(seqlens), NUM_HEADS, HEAD_DIM, device=device, dtype=dtype)
+    decode = Context(
+        is_prefill=False,
+        context_lens=torch.tensor(seqlens, dtype=torch.int32, device=device),
+        block_tables=block_tables,
+    )
+    torch.testing.assert_close(backend.decode(q, *hnd, decode), backend.decode(q, *nhd, decode), atol=tol, rtol=tol)
+
+    num_tokens = sum(seqlens)
+    q = randn(num_tokens, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype)
+    cu = torch.tensor([0, seqlens[0], num_tokens], dtype=torch.int32, device=device)
+    prefill = Context(
+        is_prefill=True,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=max(seqlens),
+        max_seqlen_k=max(seqlens),
+        context_lens=torch.tensor(seqlens, dtype=torch.int32, device=device),
+        block_tables=block_tables,
+    )
+    k, v = key[:num_tokens], value[:num_tokens]
+    torch.testing.assert_close(
+        backend.prefill(q, k, v, *hnd, prefill), backend.prefill(q, k, v, *nhd, prefill), atol=tol, rtol=tol
+    )
+
+
+def test_flashinfer_takes_an_hnd_cache_in_its_own_layout():
+    """FlashInfer reads HND pages itself, so it gets the contiguous tensor under the transposed view."""
+    layout, (k_pages, v_pages) = flashinfer_backend._paged_kv(*make_hnd_cache(3, "cpu", BLOCK_SIZE, torch.float16))
+    assert layout == "HND" and k_pages.is_contiguous() and v_pages.is_contiguous()
+    assert k_pages.shape == (3, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM)
+    assert flashinfer_backend._paged_kv(*make_cache(3, "cpu", BLOCK_SIZE, torch.float16))[0] == "NHD"
+
+
 def test_decode_matches_equivalent_prefill(backend, device, block_size, dtype, tol):
     """Decode must equal a 1-token prefill over the same context."""
     seqlen = 2 * block_size + 1

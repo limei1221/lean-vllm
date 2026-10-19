@@ -75,6 +75,17 @@ When an MLA model's layers would take `flashmla`, `Config` switches the KV cache
 to 64-token pages and logs a warning. It resolves the backend from the spec the
 layers will build, before any layer exists.
 
+### KV cache layout
+
+Backends see each layer's key and value caches as `(block, token, head, dim)`.
+Underneath they are NHD, that shape itself, or HND, `(block, head, token, dim)`,
+bound as a transposed view. HND keeps each head's slice of a block contiguous,
+which `NixlConnector` needs to read one rank's share of the heads, so every
+disaggregated engine runs on HND. `LEAN_VLLM_KV_CACHE_LAYOUT=HND` sets it otherwise, as
+vLLM's `VLLM_KV_CACHE_LAYOUT`. The Triton store and `torch` write by the cache's
+strides, FlashAttention-3 reads them, and FlashInfer is handed the HND tensor
+with its `HND` layout. MLA latents have no heads, so their layout never changes.
+
 Graphs depend on every layer: the runner stays eager if any layer's backend
 reports `supports_cuda_graph()` false, and drops full graphs for piecewise if
 any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
@@ -95,6 +106,7 @@ any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
 | Check | Where | Result |
 |---|---|---|
 | Every available backend against a dense reference: prefill, paged prefill, prefix-cache hits, decode, mixed batches, `varlen_with_lse` | Every machine the suite runs on | Pass |
+| An HND cache stores and attends as an NHD one | Every machine the suite runs on | Pass on CPU (`torch`); the GPU backends not run yet |
 | `mla_decode` against the reference at FlashMLA's shapes | CPU (`torch`); H100 (`flashmla`) | Pass on CPU; H100 result not recorded |
 | The CUDA backend against the reference | A100, back when that backend was FlashAttention-2 | Pass |
 | FlashAttention-3 suite | H100 | Not recorded, though both FA3 backends have served benchmarks there |

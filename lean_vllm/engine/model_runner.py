@@ -264,16 +264,17 @@ class ModelRunner:
         layers = [module for module in self.model.modules() if isinstance(module, Attention)]
         if self.proposer is not None:  # drafter caches use the target model's block tables
             layers += [module for module in self.proposer.drafter.modules() if isinstance(module, Attention)]
+        layout = config.kv_cache_layout
         block_numel = sum(math.prod(layer.kv_cache_shape(1, self.block_size)) for layer in layers)
         block_bytes = block_numel * config.hf_config.dtype.itemsize
         if config.num_kvcache_blocks <= 0:
             config.num_kvcache_blocks = dev.kvcache_bytes(self.device, config) // block_bytes
         assert config.num_kvcache_blocks > 0, "no memory left for the kv cache"
         self.kv_cache = [
-            torch.empty(layer.kv_cache_shape(config.num_kvcache_blocks, self.block_size)) for layer in layers
+            torch.empty(layer.kv_cache_shape(config.num_kvcache_blocks, self.block_size, layout)) for layer in layers
         ]
         for layer, cache in zip(layers, self.kv_cache):
-            layer.bind_kv_cache(cache)
+            layer.bind_kv_cache(cache, layout)
 
     def loop(self):
         while True:

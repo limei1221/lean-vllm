@@ -34,7 +34,6 @@ class TorchAttention(AttentionBackend):
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
         num_tokens = key.size(0)
         assert slot_mapping.numel() == num_tokens
-        dim = self.num_kv_heads * self.head_dim
 
         slots = slot_mapping.long()
         keep = slots >= 0
@@ -43,8 +42,10 @@ class TorchAttention(AttentionBackend):
             key = key[keep]
             value = value[keep]
 
-        k_cache.view(-1, dim)[slots] = key.flatten(1)
-        v_cache.view(-1, dim)[slots] = value.flatten(1)
+        # By block and offset, not a flat view, so an HND cache's transposed view takes it too.
+        blocks, offsets = slots // k_cache.size(1), slots % k_cache.size(1)
+        k_cache[blocks, offsets] = key
+        v_cache[blocks, offsets] = value
 
     def store_latents(self, latent, latent_cache, slot_mapping) -> None:
         dim = latent_cache.size(-1)

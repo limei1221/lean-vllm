@@ -15,17 +15,24 @@ else:
         k_cache_ptr,
         v_cache_ptr,
         slot_mapping_ptr,
+        block_size,
+        block_stride,
+        token_stride,
+        head_stride,
+        HEAD_DIM: tl.constexpr,
         D: tl.constexpr,
     ):
         idx = tl.program_id(0)
-        slot = tl.load(slot_mapping_ptr + idx)
+        slot = tl.load(slot_mapping_ptr + idx).to(tl.int64)
         if slot == -1:
             return
-        key_offsets = idx * key_stride + tl.arange(0, D)
-        value_offsets = idx * value_stride + tl.arange(0, D)
-        key = tl.load(key_ptr + key_offsets)
-        value = tl.load(value_ptr + value_offsets)
-        cache_offsets = slot * D + tl.arange(0, D)
+        offsets = tl.arange(0, D)
+        key = tl.load(key_ptr + idx * key_stride + offsets)
+        value = tl.load(value_ptr + idx * value_stride + offsets)
+        # The cache's own strides, so an NHD and an HND cache take the same kernel.
+        block, token = slot // block_size, slot % block_size
+        head, dim = offsets // HEAD_DIM, offsets % HEAD_DIM
+        cache_offsets = block * block_stride + token * token_stride + head * head_stride + dim
         tl.store(k_cache_ptr + cache_offsets, key)
         tl.store(v_cache_ptr + cache_offsets, value)
 
@@ -49,14 +56,29 @@ else:
 
 
 def store_kvcache(key, value, k_cache, v_cache, slot_mapping) -> None:
-    """Scatter keys/values [num_tokens, heads, dim] into [num_blocks, block_size, heads, dim] caches. Slot -1 skips."""
+    """Scatter keys/values [num_tokens, heads, dim] into [num_blocks, block_size, heads, dim] caches, by their strides,
+    so an HND cache's transposed view takes it too. Slot -1 skips."""
     num_tokens, num_heads, head_dim = key.shape
-    dim = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
-    assert k_cache.stride(1) == dim and v_cache.stride(1) == dim
+    assert k_cache.stride() == v_cache.stride() and k_cache.stride(-1) == 1
     assert slot_mapping.numel() == num_tokens
-    store_kvcache_kernel[(num_tokens,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, dim)
+    block_stride, token_stride, head_stride, _ = k_cache.stride()
+    store_kvcache_kernel[(num_tokens,)](
+        key,
+        key.stride(0),
+        value,
+        value.stride(0),
+        k_cache,
+        v_cache,
+        slot_mapping,
+        k_cache.size(1),
+        block_stride,
+        token_stride,
+        head_stride,
+        head_dim,
+        num_heads * head_dim,
+    )
 
 
 def store_latents(latent, latent_cache, slot_mapping) -> None:

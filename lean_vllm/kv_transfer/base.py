@@ -18,7 +18,7 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 class KVTransferConfig:
     """vLLM's --kv-transfer-config, as JSON. A producer serves prefilled KV, a consumer loads it, both does either."""
 
-    kv_connector: str = "TcpConnector"
+    kv_connector: str = "NixlConnector"
     kv_role: Literal["kv_producer", "kv_consumer", "kv_both"] = "kv_both"
     kv_ip: str = "127.0.0.1"  # where a producer listens, and what it tells consumers to dial
     kv_port: int = 14579  # rank r listens on kv_port + r
@@ -50,6 +50,7 @@ class _RemotePrefill(BaseModel):
     remote_engine_id: str
     remote_host: str
     remote_port: int
+    tp_size: int = 1
 
 
 def check_kv_transfer_params(params, kv_transfer: KVTransferConfig | None) -> str | None:
@@ -81,6 +82,7 @@ class ReqToRecv:
     remote_engine_id: str
     remote_host: str
     remote_port: int
+    remote_tp_size: int = 1
 
 
 @dataclass(slots=True)
