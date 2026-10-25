@@ -6,14 +6,14 @@ from lean_vllm.models.qwen3 import Qwen3ForCausalLM
 
 ModelClass = type[DeepseekV2ForCausalLM] | type[Qwen3ForCausalLM]
 
-# Keyed by the architectures field of a checkpoint's config.json.
+# Map architecture names from a checkpoint's config.json to model classes.
 MODELS: dict[str, ModelClass] = {
     "DeepseekV2ForCausalLM": DeepseekV2ForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
 }
 
-# The checkpoint's own multi-token prediction layers, run as a drafter, by the same field.
+# Map architecture names to drafters that use the checkpoint's multi-token prediction layers.
 DRAFTERS: dict[str, type[DeepSeekMTP]] = {
     "DeepseekV3ForCausalLM": DeepSeekMTP,
 }

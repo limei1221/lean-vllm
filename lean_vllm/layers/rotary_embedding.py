@@ -11,7 +11,7 @@ def apply_rotary_emb(
     sin: torch.Tensor,
     is_neox_style: bool = True,
 ) -> torch.Tensor:
-    if not is_neox_style:
+    if not is_neox_style:  # DeepSeek-V2
         # GPT-J style: rotate adjacent pairs rather than the two halves.
         x1, x2 = x.float()[..., ::2], x.float()[..., 1::2]
         return torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1).flatten(-2).to(x.dtype)
@@ -22,7 +22,7 @@ def apply_rotary_emb(
 
 
 def rope_config(config) -> tuple[float, dict]:
-    """rope_parameters from transformers 5, or rope_theta and rope_scaling before it."""
+    """Return the RoPE base and settings, preferring transformers 5's rope_parameters over rope_scaling."""
     params = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
     return params.get("rope_theta", getattr(config, "rope_theta", 10000)), params
 
@@ -32,11 +32,11 @@ def yarn_get_mscale(scale: float, mscale: float = 1.0) -> float:
 
 
 def yarn_inv_freq(rotary_dim: int, base: float, scaling: dict) -> torch.Tensor:
-    """YaRN: long wavelengths interpolated by the factor, short ones kept, a linear ramp between."""
+    """Divide low RoPE frequencies by factor, keep high ones, and blend linearly in between."""
     factor = scaling["factor"]
     original_max_position = scaling["original_max_position_embeddings"]
 
-    # index of the RoPE pair that completes num_rotations turns over the original context
+    # Find the RoPE pair index for num_rotations turns over the original context.
     def correction_dim(num_rotations: float) -> float:
         return rotary_dim * math.log(original_max_position / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
 
@@ -107,7 +107,7 @@ def get_rope(
     is_neox_style: bool = True,
     rope_scaling: dict | None = None,
 ):
-    # A dict cannot key the cache, so its items do.
+    # Use sorted items in the cache key because dicts are not hashable.
     scaling = tuple(sorted(rope_scaling.items())) if rope_scaling else None
     return _get_rope(head_size, rotary_dim, max_position, base, is_neox_style, scaling)
 
