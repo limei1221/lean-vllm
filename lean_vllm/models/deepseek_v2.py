@@ -19,8 +19,12 @@ from lean_vllm.layers.rotary_embedding import get_rope, rope_config, yarn_get_ms
 from lean_vllm.models.qwen3 import Qwen3MLP as DeepseekV2MLP  # the same gated silu MLP
 
 
+# T = num_tokens, H = hidden_size, N = num_local_heads, L = kv_lora_rank,
+# P = qk_nope_head_dim, R = qk_rope_head_dim, V = v_head_dim, n = number of latents expanded
+
+
 class DeepseekV2Attention(nn.Module):
-    """MLA: keys and values come from a low-rank latent, with rope on a separate shared key."""
+    """MLA: expand keys and values from a low-rank latent, with a separate rope key shared across heads."""
 
     def __init__(
         self,
@@ -45,7 +49,7 @@ class DeepseekV2Attention(nn.Module):
                 hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=bias
             )
         else:
-            # q_a_proj and kv_a_proj_with_mqa read the same input, so one GEMM does both
+            # q_a_proj and kv_a_proj_with_mqa share an input, so combine them into one matrix multiply
             self.fused_qkv_a_proj = MergedReplicatedLinear(
                 hidden_size,
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -72,7 +76,7 @@ class DeepseekV2Attention(nn.Module):
         )
         self.scaling = self.qk_head_dim**-0.5
         mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-        if mscale_all_dim:  # YaRN also sharpens the softmax
+        if mscale_all_dim:  # apply YaRN's attention score scaling
             scaling_factor = rope_scaling["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
@@ -88,17 +92,17 @@ class DeepseekV2Attention(nn.Module):
         )
 
     def expand(self, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Keys and values, [n, heads, dim] each, from cached latents [n, kv_lora_rank + qk_rope_head_dim]."""
+        """Keys [n, N, P + R] and values [n, N, V] from cached latents [n, L + R]."""
         kv_c_normed, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_nope = self.kv_b_proj(kv_c_normed).view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k = k_nope.new_empty((*k_nope.shape[:-1], self.qk_head_dim))
+        k = k_nope.new_empty((*k_nope.shape[:-1], self.qk_head_dim))  # [n, N, P + R]
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim :] = k_pe.unsqueeze(1)  # broadcast the shared rope key to every head
         return k, v
 
     def latent_projections(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """kv_b_proj per head: W_UK_T [heads, qk_nope_head_dim, kv_lora_rank] and W_UV [heads, kv_lora_rank, v_head_dim]."""
+        """Per-head views of kv_b_proj for attention in latent space: W_UK_T [N, P, L] and W_UV [N, L, V]."""
         if self._latent_projections is not None:
             return self._latent_projections
         kv_b_proj_weight = self.kv_b_proj.weight.T.view(
@@ -107,12 +111,11 @@ class DeepseekV2Attention(nn.Module):
             self.qk_nope_head_dim + self.v_head_dim,
         )
         W_UK, W_UV = kv_b_proj_weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        # (L, N, P) -> (N, P, L) and (L, N, V) -> (N, L, V)
-        # L kv_lora_rank, N num_local_heads, P qk_nope_head_dim, V v_head_dim
+        # [L, N, P] -> [N, P, L] and [L, N, V] -> [N, L, V]
         return W_UK.permute(1, 2, 0), W_UV.transpose(0, 1)
 
     def process_weights_after_loading(self):
-        """Views, so no memory and no copy: bmm takes their strides as they are. Spares each step their setup."""
+        """Cache projection views after loading so each step can reuse them without copying weight data."""
         self._latent_projections = None
         self._latent_projections = self.latent_projections()
 
@@ -121,7 +124,7 @@ class DeepseekV2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Up to attention: the query, and the latent this step caches."""
+        """Return the query and the latent that attention will store in the KV cache."""
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)
@@ -136,11 +139,13 @@ class DeepseekV2Attention(nn.Module):
         kv_c_normed = self.kv_a_layernorm(kv_c)
         k_pe = k_pe.unsqueeze(1)  # add head dim of 1
         q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(positions, q[..., self.qk_nope_head_dim :], k_pe)
-        # The latent is cached normalized and with rope applied, so a read needs only kv_b_proj.
+        # Cache the normalized latent and rope key so expansion need not repeat normalization or rope.
+        # q: [T, N, P + R], latent: [T, L + R]
         return q, torch.cat([kv_c_normed, k_pe.squeeze(1)], dim=-1)
 
     def combine(self, attn_out: torch.Tensor) -> torch.Tensor:
-        """From attention's output back to the residual stream."""
+        """Merge local attention heads and project back to the model's hidden size."""
+        # [T, N, V] -> [T, N * V] -> [T, H]
         return self.o_proj(attn_out.view(-1, self.num_local_heads * self.v_head_dim))
 
 
@@ -151,7 +156,8 @@ class DeepseekV2MoE(nn.Module):
         enable_expert_parallel: bool = False,
     ) -> None:
         super().__init__()
-        # transformers' V3 config has neither field: its router is always noaux_tc over sigmoid scores
+        # transformers' V3 config has neither field, so a missing topk_method means V3's noaux_tc;
+        # a missing scoring_func is sigmoid under noaux_tc and softmax otherwise.
         self.topk_method = getattr(config, "topk_method", "noaux_tc")
         self.scoring_func = getattr(config, "scoring_func", "sigmoid" if self.topk_method == "noaux_tc" else "softmax")
         assert self.topk_method in ("greedy", "group_limited_greedy", "noaux_tc"), (
@@ -164,9 +170,9 @@ class DeepseekV2MoE(nn.Module):
         self.renormalize = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
         self.gate = ReplicatedLinear(config.hidden_size, config.n_routed_experts, bias=False)
-        self.gate.weight.data = self.gate.weight.data.float()  # held in fp32, so no step casts it
+        self.gate.weight.data = self.gate.weight.data.float()  # keep router weights in fp32 to avoid casting each step
         if self.topk_method == "noaux_tc":
-            # Added to the scores to pick experts, as V3's auxiliary-loss-free balancing; the weights ignore it.
+            # V3's balancing bias affects expert selection, but not the weights used to combine expert outputs.
             self.gate.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts, dtype=torch.float32))
         self.experts = FusedMoE(
             config.n_routed_experts,
@@ -177,7 +183,7 @@ class DeepseekV2MoE(nn.Module):
         )
         self.shared_experts = None
         if config.n_shared_experts:
-            # Holds the weights only: FusedMoE runs them, beside the routed experts, and reduces both at once.
+            # Store weights here; FusedMoE adds shared and routed expert outputs before any all-reduce.
             self.shared_experts = DeepseekV2MLP(
                 config.hidden_size,
                 config.moe_intermediate_size * config.n_shared_experts,
@@ -185,7 +191,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # hidden_states: [N, D]; the gate runs in fp32, as transformers'
+        # Compute router logits in fp32, as transformers does, from hidden_states [tokens, hidden_size].
         router_logits = F.linear(hidden_states.float(), self.gate.weight)
         grouped = self.topk_method != "greedy"
         return torch.ops.lean_vllm.select_experts(
@@ -233,7 +239,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The layer up to attention. Touches no KV cache, so it is capturable."""
+        """Prepare the query, latent, and residual; touches no KV cache, so it is CUDA-graph capturable."""
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
@@ -245,7 +251,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         attn_out: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The layer after attention. Capturable for the same reason."""
+        """Apply the output projection, residual update, normalization, and MLP; capturable for the same reason."""
         hidden_states = self.self_attn.combine(attn_out)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         return self.mlp(hidden_states), residual
@@ -287,7 +293,7 @@ class DeepseekV2Model(nn.Module):
 
 
 def packed_modules_mapping(config: PretrainedConfig) -> dict[str, tuple[str, int]]:
-    """Checkpoint projections that load as shards of one fused parameter."""
+    """Map checkpoint projection names to fused module names and shard indices."""
     mapping = {
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
@@ -309,7 +315,7 @@ class DeepseekV2ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.packed_modules_mapping = packed_modules_mapping(config)
-        # The checkpoint's multi-token prediction layers follow the last one; the drafter loads them.
+        # Skip multi-token prediction layers after the last decoder layer; the drafter loads them separately.
         self.skipped_weight_prefixes = tuple(
             f"model.layers.{config.num_hidden_layers + i}."
             for i in range(getattr(config, "num_nextn_predict_layers", None) or 0)
@@ -334,4 +340,4 @@ class DeepseekV2ForCausalLM(nn.Module):
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
-    """V2's layers; V3 differs in its router (noaux_tc over sigmoid scores), which the config selects."""
+    """Reuse V2's layers with config-driven routing; V3 uses noaux_tc with sigmoid scores."""

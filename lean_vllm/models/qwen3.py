@@ -73,7 +73,7 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Up to attention: qkv, the per-head norms, and rope."""
+        """Project q, k, and v, normalize q and k when qkv_bias is disabled, then apply RoPE to q and k."""
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -85,7 +85,8 @@ class Qwen3Attention(nn.Module):
         return self.rotary_emb(positions, q, k) + (v,)
 
     def combine(self, attn_output: torch.Tensor) -> torch.Tensor:
-        """From attention's output back to the residual stream."""
+        """Flatten the attention heads and project back to the hidden size."""
+        # (num_tokens, num_heads, head_dim) -> (num_tokens, hidden_size)
         return self.o_proj(attn_output.flatten(1))
 
 
@@ -149,7 +150,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The layer up to attention. Touches no KV cache, so it is capturable."""
+        """Prepare q, k, v, and the residual for attention. Touches no KV cache, so it is capturable."""
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
@@ -161,7 +162,11 @@ class Qwen3DecoderLayer(nn.Module):
         attn_out: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The layer after attention. Capturable for the same reason."""
+        """Project the attention output, add the residual, normalize, and run the MLP.
+
+        Return the MLP output and the updated residual (attention output + residual).
+        Touches no KV cache, so it is capturable.
+        """
         hidden_states = self.self_attn.combine(attn_out)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         return self.mlp(hidden_states), residual
@@ -201,7 +206,7 @@ class Qwen3Model(nn.Module):
 
 class Qwen3ForCausalLM(nn.Module):
     supports_cuda_graph = True
-    supports_expert_parallel = False  # dense: no experts to place
+    supports_expert_parallel = False  # Dense model with no experts to distribute across ranks.
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),

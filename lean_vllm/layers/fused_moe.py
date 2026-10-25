@@ -1,8 +1,9 @@
-"""A fused MoE implemented in Triton.
+"""A fused mixture-of-experts (MoE) layer implemented in Triton.
 
-Pairs are sorted by expert and padded to whole row blocks, so each block reads one expert's weight.
-No shape is decided on the host, so the layer stays capturable.
-Tile sizes come from a tuned JSON file per shape and GPU, or vLLM's defaults; benchmarks/tune_moe.py writes them.
+Token-expert pairs are sorted by expert and padded to whole row blocks, so each block uses one expert's weights.
+Buffer sizes depend on input shapes; the padded row count stays on the GPU to support CUDA graph capture.
+Tile sizes come from tuned JSON files for each expert count, intermediate size, and GPU, or from defaults.
+benchmarks/tune_moe.py writes these config files.
 """
 
 import functools
@@ -56,29 +57,29 @@ else:
         BLOCK_SIZE_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr,
     ):
-        """One block of padded rows against one expert: C[pair] = A[pair // TOP_K] @ B[expert]."""
+        """Compute one output tile: C[pair] = A[pair // TOP_K] @ B[expert].T, optionally scaled by routing weights."""
         pid = tl.program_id(0)
         num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-        # Grouped order: GROUP_SIZE_M row blocks in turn take each column tile, sharing it in L2.
+        # Process nearby row blocks for each column tile to encourage reuse of weight tiles in L2.
         num_pid_in_group = GROUP_SIZE_M * num_pid_n
         first_pid_m = (pid // num_pid_in_group) * GROUP_SIZE_M
         group_size_m = min(num_blocks - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
         pid_n = (pid % num_pid_in_group) // group_size_m
         if pid_m * BLOCK_SIZE_M >= tl.load(num_rows_ptr):
-            return  # a block the padding left empty
+            return  # beyond the padded row count
 
         offs_pair = tl.load(sorted_pairs_ptr + pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))
-        pair_mask = offs_pair < num_valid_pairs  # the tail of an expert's run overhangs its last block
+        pair_mask = offs_pair < num_valid_pairs  # exclude padding rows, which hold an out-of-range pair index
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + offs_pair[:, None] * stride_cm + offs_cn[None, :] * stride_cn
         c_mask = pair_mask[:, None] & (offs_cn < N)[None, :]
         expert = tl.load(block_experts_ptr + pid_m)
-        if expert == -1:  # another EP rank's expert: its pairs add zero here
+        if expert == -1:  # another expert-parallel rank's expert: write zeros for its pairs
             tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=c_ptr.dtype.element_ty), mask=c_mask)
             return
 
-        offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N  # wrapped, so only the store masks N
+        offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N  # wrap weight loads; mask output stores
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         a_ptrs = a_ptr + (offs_pair // TOP_K)[:, None] * stride_am + offs_k[None, :] * stride_ak
         b_ptrs = b_ptr + expert * stride_be + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
@@ -117,8 +118,9 @@ else:
         RENORMALIZE: tl.constexpr,
         BLOCK_T: tl.constexpr,
     ):
-        """Route BLOCK_T tokens: score experts, select groups if grouped, then select top-k experts, all in
-        registers. A correction bias steers the picks, not the weights.
+        """Route BLOCK_T tokens: score experts, optionally select groups, then select top-k experts.
+
+        The correction bias affects expert selection; routing weights use the scores without that bias.
 
         Corresponds to vLLM's topk_softmax and grouped_topk.
         """
@@ -142,8 +144,8 @@ else:
             choice += tl.load(bias_ptr + cols, mask=col_mask, other=0.0)[None, :]
         choice = tl.where(col_mask[None, :], choice, float("-inf"))  # padding is never picked
         if NUM_GROUPS > 1:
-            # A group scores its best expert, or its best two with a bias, as V3's; only the TOPK_GROUP best groups
-            # stay eligible.
+            # A group's score is its highest selection score, or the sum of its two highest with a bias.
+            # Only experts in the TOPK_GROUP best groups stay eligible.
             group = cols // (NUM_EXPERTS // NUM_GROUPS)
             group_cols = tl.arange(0, GROUPS_POW2)
             group_scores = tl.full((BLOCK_T, GROUPS_POW2), float("-inf"), tl.float32)
@@ -160,7 +162,7 @@ else:
                 group_scores = tl.where(group_cols[None, :] == picked[:, None], float("-inf"), group_scores)
             choice = tl.where(eligible != 0, choice, float("-inf"))
 
-        # Top-k by repeated argmax: k is small, and a tie goes to the lower expert.
+        # Select top-k experts by repeated argmax; ties go to the lower expert ID.
         k_cols = tl.arange(0, TOP_K_POW2)
         weights = tl.zeros((BLOCK_T, TOP_K_POW2), dtype=tl.float32)
         ids = tl.zeros((BLOCK_T, TOP_K_POW2), dtype=tl.int32)
@@ -179,12 +181,13 @@ else:
         tl.store(weights_ptr + out, weights, mask=out_mask)
         tl.store(ids_ptr + out, ids, mask=out_mask)
 
-    # align_blocks in three launches. A program owns BLOCK pairs, so a pair's slot is its expert's padded start,
-    # plus the pairs of that expert in earlier programs, plus its rank in its own: no atomics, and a fixed order.
+    # Align pairs in three kernel launches. Each program handles BLOCK pairs. A pair's output slot is its
+    # expert's padded start plus the count for that expert in earlier programs plus its rank in this program.
+    # This preserves pair order within each expert without atomics.
 
     @triton.jit
     def count_experts_kernel(topk_ids_ptr, counts_ptr, num_pairs, EXPERTS_POW2: tl.constexpr, BLOCK: tl.constexpr):
-        """counts[program, expert]: how many of the program's pairs go to the expert."""
+        """Write counts[program, expert]: the number of this program's pairs assigned to each expert."""
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         ids = tl.load(topk_ids_ptr + offs, mask=offs < num_pairs, other=-1)
@@ -205,7 +208,10 @@ else:
         ROWS: tl.constexpr,
         TAIL: tl.constexpr,
     ):
-        """One program: counts becomes each program's offset within an expert's run, and runs are padded to BLOCK_M."""
+        """Replace counts with per-program offsets and pad each expert's rows to a multiple of BLOCK_M.
+
+        One program computes the expert starts and total padded row count, then fills padding with num_pairs.
+        """
         experts = tl.arange(0, EXPERTS_POW2)
         totals = tl.zeros((EXPERTS_POW2,), dtype=tl.int32)
         for start in range(0, num_programs, ROWS):
@@ -219,7 +225,7 @@ else:
         starts = tl.cumsum(padded, axis=0) - padded
         tl.store(expert_starts_ptr + experts, starts)
         tl.store(num_rows_ptr, tl.sum(padded, axis=0))
-        # The overhang of each run's last block: rows the GEMMs mask out.
+        # Mark padding rows with an out-of-range pair index so the GEMMs skip them.
         for offset in tl.static_range(0, BLOCK_M, TAIL):
             cols = offset + tl.arange(0, TAIL)
             overhang = totals[:, None] + cols[None, :]
@@ -242,14 +248,15 @@ else:
         BLOCK: tl.constexpr,
         HAS_EXPERT_MAP: tl.constexpr,
     ):
-        """Each pair to its slot, and each block's expert; program i does BLOCK of each."""
+        """Write sorted pair indices and block expert IDs; each program handles up to BLOCK entries of each."""
         pid = tl.program_id(0)
         experts = tl.arange(0, EXPERTS_POW2)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < num_pairs
         ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
         one_hot = (ids[:, None] == experts[None, :]).to(tl.int32)
-        rank = tl.sum(tl.cumsum(one_hot, axis=0) * one_hot, axis=1) - 1  # among this program's pairs of the expert
+        # Zero-based rank among this program's pairs for the same expert.
+        rank = tl.sum(tl.cumsum(one_hot, axis=0) * one_hot, axis=1) - 1
         ids = tl.where(mask, ids, 0)
         slots = (
             tl.load(expert_starts_ptr + ids, mask=mask, other=0)
@@ -258,7 +265,7 @@ else:
         )
         tl.store(sorted_pairs_ptr + slots, offs, mask=mask)
 
-        # A block belongs to the last expert starting at or before it, so an empty expert owns none.
+        # Within num_rows, a block belongs to the last expert starting at or before it; empty experts own none.
         blocks = pid * BLOCK + tl.arange(0, BLOCK)
         block_mask = blocks < num_blocks
         first_blocks = tl.load(expert_starts_ptr + experts) // BLOCK_M
@@ -270,7 +277,7 @@ else:
 
     @triton.jit
     def silu_and_mul_kernel(x_ptr, out_ptr, d, stride_x, stride_out, BLOCK: tl.constexpr):
-        """out = silu(gate) * up for one row and BLOCK columns, in fp32."""
+        """Compute silu(gate) * up in fp32 for one row and up to BLOCK columns, then cast to the output dtype."""
         row = tl.program_id(0).to(tl.int64)
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         mask = cols < d
@@ -281,7 +288,10 @@ else:
 
 
 def use_triton(x: torch.Tensor) -> bool:
-    """Triton when it can run here, unless $LEAN_VLLM_MOE_BACKEND asks for one by name."""
+    """Return whether to use Triton for x, honoring $LEAN_VLLM_MOE_BACKEND.
+
+    Reject unknown backend names and raise if Triton is explicitly requested but unavailable for x.
+    """
     name = envs.LEAN_VLLM_MOE_BACKEND
     if name not in (None, "triton", "torch"):
         raise ValueError(f"unknown moe backend {name!r}, expected one of ['torch', 'triton']")
@@ -292,7 +302,7 @@ def use_triton(x: torch.Tensor) -> bool:
 
 
 def get_config_file_name(E: int, N: int, device_name: str | None = None) -> str:
-    """vLLM's name for bf16, so its tuned files load here too. N is the intermediate size per expert, after TP."""
+    """Return a vLLM-compatible bf16 config filename. N is each expert's intermediate size after tensor parallelism."""
     if device_name is None:
         device_name = re.sub(r"[\s/]+", "_", torch.cuda.get_device_name())
     if "H200" in device_name.split("_"):  # one file serves the H200 family
@@ -302,7 +312,7 @@ def get_config_file_name(E: int, N: int, device_name: str | None = None) -> str:
 
 @functools.lru_cache
 def get_moe_configs(E: int, N: int) -> dict[int, dict] | None:
-    """Batch size -> launch config, from the first file found; None if there is none."""
+    """Return a batch-size-to-config mapping from the first file found, or None if no file exists."""
     file_name = get_config_file_name(E, N)
     folders = [envs.LEAN_VLLM_TUNED_CONFIG_FOLDER, CONFIG_DIR]
     for path in (os.path.join(folder, file_name) for folder in folders if folder):
@@ -317,7 +327,7 @@ def get_moe_configs(E: int, N: int) -> dict[int, dict] | None:
 
 
 def get_default_config(M: int, E: int) -> dict:
-    """vLLM's bf16 defaults: small batches are memory-bound and take tall K tiles, large ones big tiles and more warps."""
+    """Return default launch settings, using larger K tiles for small batches and more warps for large batches."""
     block_m = 16 if M <= 32 else 32 if M <= 96 else 64 if M <= 512 else 128
     return dict(
         BLOCK_SIZE_M=block_m,
@@ -331,35 +341,35 @@ def get_default_config(M: int, E: int) -> dict:
 
 
 def try_get_optimal_moe_config(E: int, N: int, M: int) -> dict:
-    """The tuned config for the nearest batch size M (tokens, not pairs), else the default."""
+    """Return the tuned config for the nearest batch size M (in tokens), or the default if none is available."""
     configs = get_moe_configs(E, N)
     if configs:
         config = configs[min(configs, key=lambda m: abs(m - M))]
-        return {k: v for k, v in config.items() if k != "SPLIT_K"}  # vLLM writes it; the kernel has no split
+        return {k: v for k, v in config.items() if k != "SPLIT_K"}  # this kernel does not support splitting K
     return get_default_config(M, E)
 
 
 def align_blocks(topk_ids: torch.Tensor, num_experts: int, block_m: int) -> tuple[torch.Tensor, ...]:
-    """Sort the token-expert pairs by expert, and pad each expert's run to a multiple of block_m.
+    """Sort token-expert pairs by expert and pad each expert's rows to a multiple of block_m.
 
-    Returns each padded row's pair (out of range in an overhang), each block's expert, and the row count. No sync.
-    The reference for align_blocks_triton, which the Triton path runs.
+    Return pair indices (num_pairs for padding), block expert IDs, and the padded row count as a tensor.
+    Buffers may extend beyond that row count. This is the PyTorch reference for align_blocks_triton.
     """
     pairs = topk_ids.flatten()
     num_pairs = pairs.numel()
     experts = torch.arange(num_experts, device=pairs.device, dtype=pairs.dtype)
-    expert_of_pair, order = pairs.sort(stable=True)  # a run in pair order, as the kernels lay it out
+    expert_of_pair, order = pairs.sort(stable=True)  # preserve pair order within each expert, as the kernels do
     starts = torch.searchsorted(expert_of_pair, experts)
     counts = torch.searchsorted(expert_of_pair, experts, right=True) - starts
     padded = (counts + block_m - 1) // block_m * block_m
     padded_starts = padded.cumsum(0) - padded
-    # Each pair keeps its rank within its expert's run, moved to where that run was padded to start.
+    # Keep each pair's rank within its expert, then add that expert's padded start when writing below.
     ranks = torch.arange(num_pairs, device=pairs.device) - starts[expert_of_pair]
-    # An upper bound on the blocks: every expert wastes under one whole block.
+    # Reserve an upper bound on the blocks: each expert adds fewer than block_m padding rows.
     num_blocks = (num_pairs + block_m - 1) // block_m + num_experts
     sorted_pairs = torch.full((num_blocks * block_m,), num_pairs, dtype=torch.int32, device=pairs.device)
     sorted_pairs[padded_starts[expert_of_pair] + ranks] = order.to(torch.int32)
-    # A block belongs to the last expert starting at or before it, so an empty expert owns none.
+    # Within num_rows, a block belongs to the last expert starting at or before it; empty experts own none.
     blocks = torch.arange(num_blocks, device=pairs.device)
     block_experts = torch.searchsorted(padded_starts // block_m, blocks, right=True) - 1
     num_rows = (padded_starts[-1] + padded[-1]).to(torch.int32)
@@ -372,16 +382,17 @@ def align_blocks_triton(
     block_m: int,
     expert_map: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """align_blocks in three launches where it takes about twenty, with expert_map applied to each block.
+    """Align pairs in three kernel launches, optionally mapping each block's global expert ID to a local ID.
 
-    Rows past num_rows are left unwritten, as no GEMM program reads them.
+    Return pair indices, block expert IDs, and the padded row count.
+    Pair entries past num_rows are left unwritten; GEMMs skip them.
     """
     pairs = topk_ids.flatten()
     num_pairs = pairs.numel()
     experts_pow2 = triton.next_power_of_2(num_experts)
-    tile = max(16, 8192 // experts_pow2)  # rows of a one-hot tile, so a tile stays near 8K elements
+    tile = max(16, 8192 // experts_pow2)  # target 8K elements per one-hot tile, with at least 16 rows
     num_programs = triton.cdiv(num_pairs, tile)
-    num_blocks = triton.cdiv(num_pairs, block_m) + num_experts  # every expert wastes under one whole block
+    num_blocks = triton.cdiv(num_pairs, block_m) + num_experts  # allow fewer than block_m padding rows per expert
     device = pairs.device
     counts = torch.empty(num_programs, experts_pow2, dtype=torch.int32, device=device)
     expert_starts = torch.empty(experts_pow2, dtype=torch.int32, device=device)
@@ -429,7 +440,10 @@ def topk_softmax(
     scoring_func: str = "softmax",
     e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Routing in one launch: fp32 weights and int32 expert ids, [T, top_k] each, in descending order of pick."""
+    """Return fp32 routing weights and int32 expert IDs, each shaped [T, top_k], in one kernel launch.
+
+    Experts are ordered by decreasing selection score, including any correction bias.
+    """
     num_tokens, num_experts = router_logits.shape
     assert num_experts % num_groups == 0, f"{num_experts} experts do not split into {num_groups} groups"
     weights = torch.empty(num_tokens, top_k, dtype=torch.float32, device=router_logits.device)
@@ -460,7 +474,10 @@ def topk_softmax(
 
 
 def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
-    """[N, 2D] -> [N, D] in one launch. layers.activation's is torch.compiled: a Dynamo call per layer in an eager op."""
+    """Compute silu(gate) * up in one kernel launch, mapping [N, 2D] to [N, D].
+
+    A direct Triton launch avoids calling the torch.compile wrapper used by layers.activation.SiluAndMul.
+    """
     num_rows, d = x.size(0), x.size(1) // 2
     out = torch.empty(num_rows, d, dtype=x.dtype, device=x.device)
     block = min(triton.next_power_of_2(d), 1024)
@@ -478,22 +495,23 @@ def fused_experts(
     expert_map: torch.Tensor | None = None,
     config: dict | None = None,
 ) -> torch.Tensor:
-    """x through its top-k experts: sort into blocks, a GEMM either side of the activation, then sum.
+    """Run x through its top-k experts: align pairs, multiply, apply the activation, multiply again, and sum.
 
-    With expert_map, the weights hold this rank's experts, and blocks of other ranks' experts write zeros.
-    config overrides the looked-up launch config, for the tuner.
+    The second matrix multiply applies routing weights before outputs are summed for each token.
+    With expert_map, the weights hold this rank's experts, and blocks for other ranks' experts write zeros.
+    A nonempty config overrides the selected launch settings, allowing the tuner to try different settings.
     """
     num_tokens, _ = x.shape  # [T, D]
     num_experts, gate_up_size, hidden_size = gate_up_proj.shape  # [E, 2I, D]
     launch = config or try_get_optimal_moe_config(num_experts, down_proj.size(2), num_tokens)
     if expert_map is not None:
-        num_experts = expert_map.numel()  # blocked by global id, as vLLM's moe_align_block_size
+        num_experts = expert_map.numel()  # group pairs by global expert ID before mapping blocks to local IDs
     top_k = topk_ids.size(1)
     num_pairs = num_tokens * top_k
     sorted_pairs, block_experts, num_rows = align_blocks_triton(
         topk_ids, num_experts, launch["BLOCK_SIZE_M"], expert_map
     )
-    topk_weights = topk_weights.flatten()  # the kernel scales its fp32 accumulator by them, in their own dtype
+    topk_weights = topk_weights.flatten()  # one weight per pair; the second GEMM scales its fp32 accumulator
 
     def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, pairs_per_row: int, mul_routed_weight: bool):
         n, k = b.shape[1], b.shape[2]
@@ -522,7 +540,7 @@ def fused_experts(
             **launch,
         )
 
-    # The first GEMM writes every pair's row before the second reads it, so empty is safe.
+    # Each GEMM writes every pair's output row, so its output buffer needs no initialization.
     h = torch.empty(num_pairs, gate_up_size, device=x.device, dtype=x.dtype)  # [T*K, 2I]
     gemm(x, gate_up_proj, h, top_k, mul_routed_weight=False)  # x has one row per token
     h = act_fn(h)  # [T*K, 2I] -> [T*K, I]

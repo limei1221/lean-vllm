@@ -6,7 +6,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-# Routed experts are stored one by one, and load into one stacked parameter per projection.
+# Checkpoints store routed experts separately; the model stacks them in gate_up_proj and down_proj.
 EXPERT_WEIGHT = re.compile(r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight")
 STACKED_EXPERT_PARAMS = {"gate_proj": "gate_up_proj", "up_proj": "gate_up_proj", "down_proj": "down_proj"}
 
@@ -18,7 +18,7 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 def load_model(model: nn.Module, path: str):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     skipped_weight_prefixes = getattr(model, "skipped_weight_prefixes", ())
-    remap_weight_name = getattr(model, "remap_weight_name", None)  # a drafter's name for a checkpoint weight, or None
+    remap_weight_name = getattr(model, "remap_weight_name", None)  # optional hook to rename or skip checkpoint weights
     loaded: set[str] = set()
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
@@ -56,7 +56,7 @@ def load_model(model: nn.Module, path: str):
 
 
 def check_loaded(model: nn.Module, loaded: set[str], path: str):
-    """Reject parameters with no loaded weights, allowing tied parameters that share a loaded tensor's data pointer."""
+    """Raise if a parameter was not loaded and does not share a data pointer with a loaded one (tied weights)."""
     loaded_storage = {model.get_parameter(name).data_ptr() for name in loaded}
     missing = [
         name

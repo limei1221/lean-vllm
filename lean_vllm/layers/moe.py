@@ -13,7 +13,7 @@ _aux_stream: torch.cuda.Stream | None = None
 
 
 def aux_stream() -> torch.cuda.Stream:
-    """One side stream per process, made on first use, which a warmup reaches before any graph captures."""
+    """Return the process's shared-expert stream, created on first use, which warmup reaches before graph capture."""
     global _aux_stream
     if _aux_stream is None:
         _aux_stream = torch.cuda.Stream()
@@ -21,14 +21,18 @@ def aux_stream() -> torch.cuda.Stream:
 
 
 def shared_mlp(x: torch.Tensor, gate_up: torch.Tensor, down: torch.Tensor, act_fn) -> torch.Tensor:
-    """The shared experts, one gated MLP. Under TP its output is a partial sum, for the routed experts' all-reduce."""
+    """Run the shared experts as one gated MLP.
+
+    With tensor-parallel weights, the output is a partial sum, reduced together with the routed experts' output.
+    """
     return F.linear(act_fn(F.linear(x, gate_up)), down)
 
 
 def determine_expert_map(ep_size: int, ep_rank: int, num_experts: int) -> tuple[int, torch.Tensor | None]:
-    """Linear placement: each rank gets a contiguous run, with one extra expert on the first ranks if needed.
+    """Assign consecutive expert IDs to each rank, giving the first ranks one extra expert if needed.
 
-    The map takes a global expert id to its local one, or -1 for another rank's. None when there is one rank.
+    Return the local expert count and a map from global IDs to local IDs, with -1 for experts on other ranks.
+    The map is None when there is only one rank.
     """
     if ep_size == 1:
         return num_experts, None
@@ -48,15 +52,15 @@ def torch_experts(
     topk_ids: torch.Tensor,
     expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """The portable path: one row per token-expert pair, two grouped matrix multiplies, scatter back."""
+    """Group token-expert pairs for two matrix multiplies, then sum their weighted outputs for each token."""
     num_experts, top_k = gate_up_proj.size(0), topk_ids.size(1)
     if expert_map is not None:
-        # Another rank's pairs sort past every local run, so no group holds them.
+        # Map other ranks' experts to num_experts so their rows sort after all local experts' rows.
         topk_ids = expert_map[topk_ids]
         topk_ids = topk_ids.masked_fill(topk_ids < 0, num_experts)
     expert_ids, order = topk_ids.flatten().sort()
     token_ids = order // top_k
-    # Where each expert's run of sorted rows ends; searchsorted, unlike bincount, does not sync.
+    # End of each expert's rows; searchsorted, unlike bincount, does not sync.
     experts = torch.arange(num_experts, device=x.device, dtype=expert_ids.dtype)
     offsets = torch.searchsorted(expert_ids, experts, right=True).to(torch.int32)
     h = F.grouped_mm(x[token_ids], gate_up_proj.transpose(1, 2), offs=offsets)
@@ -78,9 +82,9 @@ def torch_select_experts(
     scoring_func: str = "softmax",
     e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The portable routing: score, the best groups when grouped, then top-k. fp32 weights, int32 ids.
+    """Score experts, optionally limit selection to the best groups, then return top-k weights and int32 IDs.
 
-    With a correction bias (V3's noaux_tc) the bias steers which experts are picked, but not their weights.
+    The correction bias affects which experts are selected; weights come from the scores without that bias.
     """
     scores = router_logits.softmax(dim=-1) if scoring_func == "softmax" else router_logits.sigmoid()
     # scores: [N, E]
@@ -91,7 +95,7 @@ def torch_select_experts(
         grouped = choice.view(num_token, num_groups, -1)
         if e_score_correction_bias is None:
             group_scores = grouped.max(dim=-1).values  # [N, G]
-        else:  # a group scores its best two experts, as V3's
+        else:  # With a correction bias, a group's score is the sum of its two highest expert scores.
             group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)  # [N, G]
         group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]  # [N, topk_group]
         group_mask = torch.zeros_like(group_scores)
@@ -109,7 +113,7 @@ def torch_select_experts(
     return topk_weights, topk_ids.to(torch.int32)
 
 
-# One launch on the Triton path, where the traced softmax, topk and scaling took several.
+# The Triton path combines scoring, expert selection, and weight scaling in one kernel launch.
 @torch.library.custom_op("lean_vllm::select_experts", mutates_args=())
 def select_experts(
     router_logits: torch.Tensor,
@@ -142,7 +146,7 @@ def _(
     return router_logits.new_empty(shape, dtype=torch.float32), router_logits.new_empty(shape, dtype=torch.int32)
 
 
-# Opaque to torch.compile: the Triton path picks its launch from the batch size, which a trace would fix.
+# Keep this op opaque to torch.compile so Triton can choose its launch configuration for each batch size.
 @torch.library.custom_op("lean_vllm::moe_experts", mutates_args=())
 def moe_experts(
     x: torch.Tensor,
@@ -154,19 +158,19 @@ def moe_experts(
     shared_gate_up: torch.Tensor | None = None,
     shared_down: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """The routed experts, plus the shared ones when given."""
+    """Run the routed experts and add the shared experts' output when their weights are provided."""
     if not fused_moe.use_triton(x):
         out = torch_experts(x, gate_up_proj, down_proj, topk_weights, topk_ids, expert_map)
         if shared_gate_up is not None and shared_down is not None:
             out = out + shared_mlp(x, shared_gate_up, shared_down, silu_and_mul)
         return out
     has_shared = shared_gate_up is not None
-    # A small step leaves SMs idle, so the shared experts take them on a side stream.
+    # Small batches may leave GPU capacity for shared experts to run alongside routed experts on another stream.
     overlap = has_shared and x.size(0) <= envs.LEAN_VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
     if overlap:
         stream, current = aux_stream(), torch.cuda.current_stream()
         stream.wait_stream(current)
-        # No record_stream for x or the output: the current stream waits on the side one before either is freed.
+        # No record_stream needed: the current stream waits on this one before x or shared can be freed.
         with torch.cuda.stream(stream):
             shared = shared_mlp(x, shared_gate_up, shared_down, fused_moe.silu_and_mul)  # type: ignore[arg-type]
     out = fused_moe.fused_experts(
@@ -196,11 +200,11 @@ def _(
 
 
 class FusedMoE(nn.Module):
-    """Routed experts, stacked per projection and run as two grouped matrix multiplies.
+    """Run routed experts with weights stacked by projection and two grouped matrix multiplies.
 
-    Triton kernels from `fused_moe.py` on CUDA, `grouped_mm` elsewhere. TP shards each expert's intermediate size;
-    with expert parallelism each rank holds whole experts instead. Either way the ranks'
-    partial sums meet in one all-reduce.
+    Use Triton kernels from `fused_moe.py` when enabled on CUDA, and `grouped_mm` otherwise.
+    Tensor parallelism splits each expert's intermediate dimension across ranks. Expert parallelism assigns
+    whole experts to each rank. Both modes combine the ranks' partial outputs with one all-reduce.
     """
 
     def __init__(
@@ -216,11 +220,11 @@ class FusedMoE(nn.Module):
         use_ep = enable_expert_parallel and world_size > 1
         self.tp_rank, self.tp_size = (0, 1) if use_ep else (rank, world_size)
         self.ep_rank, self.ep_size = (rank, world_size) if use_ep else (0, 1)
-        self.num_experts = num_experts  # global; the stacked weights hold local_num_experts
+        self.num_experts = num_experts  # global count; the weight tensors hold only this rank's experts
         self.top_k = top_k
         self.intermediate_size = divide(intermediate_size, self.tp_size)
         self.local_num_experts, expert_map = determine_expert_map(self.ep_size, self.ep_rank, num_experts)
-        self.local_expert_ids = expert_map.tolist() if expert_map is not None else None  # for the loader
+        self.local_expert_ids = expert_map.tolist() if expert_map is not None else None  # global-to-local map
         self.gate_up_proj = nn.Parameter(torch.empty(self.local_num_experts, 2 * self.intermediate_size, hidden_size))
         self.down_proj = nn.Parameter(torch.empty(self.local_num_experts, hidden_size, self.intermediate_size))
         self.gate_up_proj.weight_loader = self.weight_loader  # type: ignore[attr-defined]
@@ -250,7 +254,7 @@ class FusedMoE(nn.Module):
         shared_gate_up: torch.Tensor | None = None,
         shared_down: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """With the shared experts' weights, their output is added in, before the one all-reduce both need."""
+        """Add any shared-expert output before reducing the combined output across ranks, if needed."""
         out = torch.ops.lean_vllm.moe_experts(
             x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids, self.expert_map, shared_gate_up, shared_down
         )
