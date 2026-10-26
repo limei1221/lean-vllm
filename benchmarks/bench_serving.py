@@ -126,47 +126,6 @@ def prefix_trace(rng: random.Random, args) -> list[Request]:
     return trace
 
 
-def _with_unrelated(rng: random.Random, args, trace: list[Request]) -> list[Request]:
-    """Swap --unique-fraction of the requests for unrelated prompts, which share nothing to reuse."""
-    return [
-        Request(_prompt(rng, args.input_len, args.vocab_size), args.output_len, label="unrelated")
-        if rng.random() < args.unique_fraction
-        else request
-        for request in trace
-    ]
-
-
-def multiturn_trace(rng: random.Random, args) -> list[Request]:
-    """Conversations whose turn k+1 resends turn k's prompt and adds --turn-len tokens of reply and question.
-
-    The added tokens stand in for the assistant's reply, so only the earlier prompt is reusable. Turns of
-    --num-conversations conversations interleave, so a follow-up arrives after other traffic has used the cache.
-    """
-    turns = max(1, args.num_requests // args.num_conversations)
-    histories = [_prompt(rng, args.input_len, args.vocab_size) for _ in range(args.num_conversations)]
-    trace = []
-    for turn in range(turns):
-        for c in range(args.num_conversations):
-            if turn:
-                histories[c] = histories[c] + _prompt(rng, args.turn_len, args.vocab_size)
-            if len(histories[c]) + args.output_len > args.max_model_len:
-                histories[c] = _prompt(rng, args.input_len, args.vocab_size)  # a new conversation
-            trace.append(Request(histories[c], args.output_len, label=f"turn{min(turn, 3)}"))
-    return _with_unrelated(rng, args, trace[: args.num_requests])
-
-
-def branching_trace(rng: random.Random, args) -> list[Request]:
-    """A tree: one --prefix-len root, --num-prefixes branches of --turn-len below it, a unique leaf on each request."""
-    root = _prompt(rng, args.prefix_len, args.vocab_size)
-    branches = [root + _prompt(rng, args.turn_len, args.vocab_size) for _ in range(args.num_prefixes)]
-    leaf_len = max(1, args.input_len - args.prefix_len - args.turn_len)
-    trace = [
-        Request(rng.choice(branches) + _prompt(rng, leaf_len, args.vocab_size), args.output_len)
-        for _ in range(args.num_requests)
-    ]
-    return _with_unrelated(rng, args, trace)
-
-
 def sharegpt_trace(rng: random.Random, args) -> list[Request]:
     """Real conversations from a ShareGPT-format JSON, first turn and its answer."""
     from transformers import AutoTokenizer
@@ -202,8 +161,6 @@ TRACES = {
     "lognormal": lognormal_trace,
     "mixed": mixed_trace,
     "prefix": prefix_trace,
-    "multiturn": multiturn_trace,
-    "branching": branching_trace,
     "sharegpt": sharegpt_trace,
 }
 
@@ -371,15 +328,11 @@ def server_run_stats(before: dict | None, after: dict | None, duration: float) -
     busy = delta("lean_vllm:model_busy_seconds_total")
     tokens, steps = delta("lean_vllm:iteration_tokens_total_sum"), delta("lean_vllm:iteration_tokens_total_count")
     preemptions = delta("lean_vllm:num_preemptions_total")
-    # lean-vLLM counts blocks and vLLM tokens; the ratio means the same on both.
-    queries = delta("lean_vllm:prefix_cache_queries_total") or delta("vllm:prefix_cache_queries_total")
-    hits = delta("lean_vllm:prefix_cache_hits_total") or delta("vllm:prefix_cache_hits_total")
     return {
         # Fraction of the run's wall clock in a forward pass; nvidia-smi's figure reads higher.
         "model_busy_fraction": busy / duration if busy is not None and duration else None,
         "mean_batch_tokens": tokens / steps if tokens is not None and steps else None,
         "preemptions": int(preemptions) if preemptions is not None else None,
-        "prefix_cache_hit_rate": hits / queries if hits is not None and queries else None,
     }
 
 
@@ -510,9 +463,6 @@ def parse_args(argv: list[str] | None = None):
     trace.add_argument("--long-priority", type=int, default=0, help="0 leaves the policy nothing to act on")
     trace.add_argument("--num-prefixes", type=int, default=8, help="--dataset prefix: distinct shared prefixes")
     trace.add_argument("--prefix-len", type=int, default=1024, help="--dataset prefix: tokens each one shares")
-    trace.add_argument("--num-conversations", type=int, default=32, help="--dataset multiturn: interleaved")
-    trace.add_argument("--turn-len", type=int, default=128, help="multiturn: tokens a turn adds; branching: branch")
-    trace.add_argument("--unique-fraction", type=float, default=0.0, help="multiturn, branching: unrelated share")
     trace.add_argument("--max-model-len", type=int, default=4096, help="clamp, so no request is refused for length")
     trace.add_argument("--vocab-size", type=int, default=10000, help="ids are drawn below this")
     trace.add_argument("--seed", type=int, default=0)

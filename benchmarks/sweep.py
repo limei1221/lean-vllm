@@ -212,7 +212,6 @@ def row(arm: Arm, rate: float, result: dict) -> dict:
         "model_busy_fraction": server.get("model_busy_fraction"),
         "mean_batch_tokens": server.get("mean_batch_tokens"),
         "preemptions": server.get("preemptions"),
-        "prefix_cache_hit_rate": server.get("prefix_cache_hit_rate"),
         "started_at": result.get("started_at"),
         "finished_at": result.get("finished_at"),
     }

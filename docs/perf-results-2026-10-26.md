@@ -38,7 +38,7 @@ The main findings:
 
 The host is shared: its load average was 14–19 on 16 cores throughout, from other users' jobs, and is logged beside
 every run (`loadavg.log`). Busy SM clocks matched between engines within 0.2% (DeepSeek-V2-Lite 1,963 against
-1,962 MHz; Qwen3-8B 1,871 against 1,868 MHz; `benchmarks/gpu_conditions.py`).
+1,962 MHz; Qwen3-8B 1,871 against 1,868 MHz; `gpu_conditions.py`).
 
 Before any timing, the GPU gates of the runbook ran and none skipped: MLA backends (14), the CUDA MoE (3) and
 DeepSeek-V2 against transformers (70). They were re-run after every kernel change.
@@ -48,13 +48,15 @@ DeepSeek-V2 against transformers (70). They were re-run after every kernel chang
 - `bench_serving.py --slo-ttft --slo-tpot`: SLO goodput, the requests meeting both limits per second of the whole run,
   queue drain included. A failed request misses; a one-token answer has no inter-token interval and is judged on TTFT
   alone. The existing goodput (completions per second, no latency cutoff) is unchanged.
-- `bench_serving.py` traces `multiturn` and `branching`, with `--unique-fraction` unrelated prompts, and a prefix-cache
-  hit rate read from either engine's counters, for the cache-aware scheduling experiment.
-- `benchmarks/repeat_sweep.sh`: repeated, alternating-order curves with environment, GPU and host-load logs.
-- `benchmarks/aggregate_reps.py`: mean and range per engine and load across repetitions.
-- `benchmarks/bench_fixed_batch.py`: identical batches through either engine's offline `LLM` (cold prefill, cached
-  prefix, pure decode), with an optional per-kernel breakdown.
 - `--max-cudagraph-capture-size`: graphs past vLLM's default 512 tokens.
+
+One-off scripts, kept out of the repository under `results/perf-2026-10-25/scripts/` and in commit `b052aa5`:
+
+- `repeat_sweep.sh`: repeated, alternating-order curves with environment, GPU and host-load logs.
+- `aggregate_reps.py`: mean and range per engine and load across repetitions.
+- `gpu_conditions.py`: busy SM clock, temperature and power per engine from the sweep's nvidia-smi log.
+- `bench_fixed_batch.py`: identical batches through either engine's offline `LLM` (cold prefill, cached prefix, pure
+  decode), with an optional per-kernel breakdown.
 
 ## 1. Baseline
 
@@ -243,7 +245,7 @@ remain comparable out of the box; for latency-sensitive Qwen3-8B serving on an H
 ## 5. Cache-aware scheduling
 
 Not run. The plan conditions it on shared-prefix workloads being the target deployment. The traces and the hit-rate
-counter it needs now exist (`--dataset multiturn|branching`, `prefix_cache_hit_rate` in every sweep row).
+counter it needs were drafted in `b052aa5` and removed until the experiment runs.
 
 ## 6. Speculative decoding
 
