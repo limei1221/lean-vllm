@@ -254,6 +254,17 @@ class TestCaptureSizes:
         assert cudagraph_capture_sizes(4, 8192) == [1, 2, 4, 8]
         assert cudagraph_capture_sizes(1, 8192) == [1, 2]
 
+    def test_a_larger_capture_size_extends_the_schedule_past_512(self):
+        sizes = cudagraph_capture_sizes(256, 8192, max_capture_size=1024)
+        assert sizes[:51] == cudagraph_capture_sizes(256, 8192)
+        assert sizes[51:] == list(range(528, 1025, 16))
+
+    def test_the_capture_size_stays_within_the_budget(self):
+        assert cudagraph_capture_sizes(256, 1000, max_capture_size=2048)[-2:] == [992, 1000]
+
+    def test_a_smaller_capture_size_lowers_the_top(self):
+        assert cudagraph_capture_sizes(256, 8192, max_capture_size=64)[-1] == 64
+
     @pytest.mark.parametrize("max_num_seqs, budget", [(1, 1), (3, 4096), (100, 8192), (256, 200), (2048, 16384)])
     def test_sizes_are_sorted_unique_and_within_both_limits(self, max_num_seqs, budget):
         sizes = cudagraph_capture_sizes(max_num_seqs, budget)

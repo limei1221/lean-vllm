@@ -38,14 +38,15 @@ logger = logging.getLogger(__name__)
 CALL_TIMEOUT = timedelta(days=365)
 
 
-def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int) -> list[int]:
+def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int, max_capture_size: int = 0) -> list[int]:
     """Return graph capture sizes using vLLM's default size schedule.
 
     Start with 1, 2, 4, then multiples of 8 below 256 and multiples of 16 from 256 onward. Limit the sizes to
-    min(2 * max_num_seqs, 512, max_num_batched_tokens). Include the token budget itself if it fits this limit.
-    Piecewise graphs use these sizes as token counts; full decode graphs also apply row and token limits.
+    max_capture_size, or min(2 * max_num_seqs, 512) when it is 0, and to max_num_batched_tokens. Include the token
+    budget itself if it fits this limit. Piecewise graphs use these sizes as token counts; full decode graphs also
+    apply row and token limits.
     """
-    top = min(max_num_seqs * 2, 512, max_num_batched_tokens)
+    top = min(max_capture_size or min(max_num_seqs * 2, 512), max_num_batched_tokens)
     sizes = [size for size in (1, 2, 4) if size <= top]
     sizes += range(8, min(top + 1, 256), 8)
     sizes += range(256, top + 1, 16)
@@ -649,7 +650,9 @@ class ModelRunner:
     def _decode_graph_sizes(self) -> list[int]:
         """Return candidate full decode graph sizes in sequence rows, capped at max_num_seqs."""
         config = self.config
-        sizes = cudagraph_capture_sizes(config.max_num_seqs, config.max_num_batched_tokens)
+        sizes = cudagraph_capture_sizes(
+            config.max_num_seqs, config.max_num_batched_tokens, config.max_cudagraph_capture_size
+        )
         return [size for size in sizes if size <= config.max_num_seqs]
 
     def _max_num_blocks(self) -> int:
@@ -708,7 +711,10 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_piecewise(self):
         """Run each bucket from largest to smallest, capturing each piece's graph for that bucket."""
-        self.piecewise_bs = cudagraph_capture_sizes(self.config.max_num_seqs, self.config.max_num_batched_tokens)
+        config = self.config
+        self.piecewise_bs = cudagraph_capture_sizes(
+            config.max_num_seqs, config.max_num_batched_tokens, config.max_cudagraph_capture_size
+        )
         largest = self.piecewise_bs[-1]
         input_ids = torch.zeros(largest, dtype=torch.int64)
         positions = torch.zeros(largest, dtype=torch.int64)

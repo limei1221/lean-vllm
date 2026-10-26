@@ -59,6 +59,17 @@ class Result:
             return None
         return (self.latency - self.ttft) / (self.output_len - 1)
 
+    def meets_slo(self, ttft_limit: float, tpot_limit: float) -> bool:
+        """Completed, first token within `ttft_limit`, and mean inter-token latency (TPOT) within `tpot_limit`.
+
+        A one-token answer has no interval to judge, so only its TTFT counts. A limit of 0 is not checked.
+        """
+        if self.status != "ok" or self.ttft is None:
+            return False
+        if ttft_limit and self.ttft > ttft_limit:
+            return False
+        return not (tpot_limit and self.tpot is not None and self.tpot > tpot_limit)
+
 
 # ---------------------------------------------------------------- traces
 
@@ -115,6 +126,47 @@ def prefix_trace(rng: random.Random, args) -> list[Request]:
     return trace
 
 
+def _with_unrelated(rng: random.Random, args, trace: list[Request]) -> list[Request]:
+    """Swap --unique-fraction of the requests for unrelated prompts, which share nothing to reuse."""
+    return [
+        Request(_prompt(rng, args.input_len, args.vocab_size), args.output_len, label="unrelated")
+        if rng.random() < args.unique_fraction
+        else request
+        for request in trace
+    ]
+
+
+def multiturn_trace(rng: random.Random, args) -> list[Request]:
+    """Conversations whose turn k+1 resends turn k's prompt and adds --turn-len tokens of reply and question.
+
+    The added tokens stand in for the assistant's reply, so only the earlier prompt is reusable. Turns of
+    --num-conversations conversations interleave, so a follow-up arrives after other traffic has used the cache.
+    """
+    turns = max(1, args.num_requests // args.num_conversations)
+    histories = [_prompt(rng, args.input_len, args.vocab_size) for _ in range(args.num_conversations)]
+    trace = []
+    for turn in range(turns):
+        for c in range(args.num_conversations):
+            if turn:
+                histories[c] = histories[c] + _prompt(rng, args.turn_len, args.vocab_size)
+            if len(histories[c]) + args.output_len > args.max_model_len:
+                histories[c] = _prompt(rng, args.input_len, args.vocab_size)  # a new conversation
+            trace.append(Request(histories[c], args.output_len, label=f"turn{min(turn, 3)}"))
+    return _with_unrelated(rng, args, trace[: args.num_requests])
+
+
+def branching_trace(rng: random.Random, args) -> list[Request]:
+    """A tree: one --prefix-len root, --num-prefixes branches of --turn-len below it, a unique leaf on each request."""
+    root = _prompt(rng, args.prefix_len, args.vocab_size)
+    branches = [root + _prompt(rng, args.turn_len, args.vocab_size) for _ in range(args.num_prefixes)]
+    leaf_len = max(1, args.input_len - args.prefix_len - args.turn_len)
+    trace = [
+        Request(rng.choice(branches) + _prompt(rng, leaf_len, args.vocab_size), args.output_len)
+        for _ in range(args.num_requests)
+    ]
+    return _with_unrelated(rng, args, trace)
+
+
 def sharegpt_trace(rng: random.Random, args) -> list[Request]:
     """Real conversations from a ShareGPT-format JSON, first turn and its answer."""
     from transformers import AutoTokenizer
@@ -150,6 +202,8 @@ TRACES = {
     "lognormal": lognormal_trace,
     "mixed": mixed_trace,
     "prefix": prefix_trace,
+    "multiturn": multiturn_trace,
+    "branching": branching_trace,
     "sharegpt": sharegpt_trace,
 }
 
@@ -317,11 +371,15 @@ def server_run_stats(before: dict | None, after: dict | None, duration: float) -
     busy = delta("lean_vllm:model_busy_seconds_total")
     tokens, steps = delta("lean_vllm:iteration_tokens_total_sum"), delta("lean_vllm:iteration_tokens_total_count")
     preemptions = delta("lean_vllm:num_preemptions_total")
+    # lean-vLLM counts blocks and vLLM tokens; the ratio means the same on both.
+    queries = delta("lean_vllm:prefix_cache_queries_total") or delta("vllm:prefix_cache_queries_total")
+    hits = delta("lean_vllm:prefix_cache_hits_total") or delta("vllm:prefix_cache_hits_total")
     return {
         # Fraction of the run's wall clock in a forward pass; nvidia-smi's figure reads higher.
         "model_busy_fraction": busy / duration if busy is not None and duration else None,
         "mean_batch_tokens": tokens / steps if tokens is not None and steps else None,
         "preemptions": int(preemptions) if preemptions is not None else None,
+        "prefix_cache_hit_rate": hits / queries if hits is not None and queries else None,
     }
 
 
@@ -340,7 +398,9 @@ def distribution(values) -> dict | None:
     }
 
 
-def summarize(results: list[Result], duration: float, split_labels: bool = True) -> dict:
+def summarize(
+    results: list[Result], duration: float, split_labels: bool = True, slo_ttft: float = 0.0, slo_tpot: float = 0.0
+) -> dict:
     completed = [result for result in results if result.status == "ok"]
     failed = sum(result.status == "failed" for result in results)
     total = len(results)
@@ -362,10 +422,17 @@ def summarize(results: list[Result], duration: float, split_labels: bool = True)
         "itl_seconds": distribution(itl for result in completed for itl in result.itls),
         "e2e_seconds": distribution(result.latency for result in completed),
     }
+    if slo_ttft or slo_tpot:
+        # Unlike goodput above, a completion counts only if it met both latency limits.
+        met = sum(result.meets_slo(slo_ttft, slo_tpot) for result in results)
+        summary["slo"] = {"ttft_seconds": slo_ttft, "tpot_seconds": slo_tpot, "met": met}
+        summary["slo_attainment"] = met / total if total else None
+        summary["slo_goodput_requests_per_second"] = met / duration
     labels = sorted({result.label for result in results})
     if split_labels and len(labels) > 1:
         summary["by_label"] = {
-            label: summarize([r for r in results if r.label == label], duration, split_labels=False) for label in labels
+            label: summarize([r for r in results if r.label == label], duration, False, slo_ttft, slo_tpot)
+            for label in labels
         }
     return summary
 
@@ -385,6 +452,12 @@ def report(summary: dict, title: str = "") -> str:
         f"offered {summary['attempted_requests_per_second']:.2f} req/s, "
         f"output {summary['output_token_throughput']:.0f} tok/s"
     )
+    if "slo" in summary:
+        lines.append(
+            f"slo goodput {summary['slo_goodput_requests_per_second']:.2f} req/s "
+            f"({summary['slo_attainment']:.1%} within ttft {summary['slo']['ttft_seconds']}s, "
+            f"tpot {summary['slo']['tpot_seconds']}s)"
+        )
     for name in ("ttft", "tpot", "itl", "e2e"):
         lines.append(_row(name, summary[f"{name}_seconds"]))
     for label, part in (summary.get("by_label") or {}).items():
@@ -409,7 +482,7 @@ async def benchmark(args, api: AsyncOpenAI, http: httpx.AsyncClient) -> dict:
     return {
         "config": vars(args) | {"num_requests": len(trace)},
         "aborted": run.aborted,
-        "summary": summarize(results, duration),
+        "summary": summarize(results, duration, slo_ttft=args.slo_ttft, slo_tpot=args.slo_tpot),
         "server": {"before": before, "after": after, "run": server_run_stats(before, after, duration)},
         "requests": [asdict(result) for result in results],
     }
@@ -437,6 +510,9 @@ def parse_args(argv: list[str] | None = None):
     trace.add_argument("--long-priority", type=int, default=0, help="0 leaves the policy nothing to act on")
     trace.add_argument("--num-prefixes", type=int, default=8, help="--dataset prefix: distinct shared prefixes")
     trace.add_argument("--prefix-len", type=int, default=1024, help="--dataset prefix: tokens each one shares")
+    trace.add_argument("--num-conversations", type=int, default=32, help="--dataset multiturn: interleaved")
+    trace.add_argument("--turn-len", type=int, default=128, help="multiturn: tokens a turn adds; branching: branch")
+    trace.add_argument("--unique-fraction", type=float, default=0.0, help="multiturn, branching: unrelated share")
     trace.add_argument("--max-model-len", type=int, default=4096, help="clamp, so no request is refused for length")
     trace.add_argument("--vocab-size", type=int, default=10000, help="ids are drawn below this")
     trace.add_argument("--seed", type=int, default=0)
@@ -447,6 +523,8 @@ def parse_args(argv: list[str] | None = None):
     run.add_argument("--timeout", type=float, default=600.0, help="per-request, seconds")
     run.add_argument("--max-connections", type=int, default=8192, help="never let the client be the queue")
     run.add_argument("--max-failure-rate", type=float, default=0.05, help="failures that abort the run")
+    run.add_argument("--slo-ttft", type=float, default=0.0, help="SLO goodput: TTFT limit, seconds; 0 unset")
+    run.add_argument("--slo-tpot", type=float, default=0.0, help="SLO goodput: per-request TPOT limit, seconds")
     run.add_argument("--output-json", default="")
     run.add_argument("--quiet", action="store_true")
     return parser.parse_args(argv)

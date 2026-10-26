@@ -41,6 +41,8 @@ class Config:
     enable_expert_parallel: bool = False  # MoE layers hold whole experts per rank, not slices of each
     enforce_eager: bool = False
     cudagraph_mode: str = "full_and_piecewise"  # none | full | piecewise | full_and_piecewise
+    # Largest graph size in tokens; 0 is vLLM's default, min(2 * max_num_seqs, 512). Larger steps run without a graph.
+    max_cudagraph_capture_size: int = 0
     hf_config: Any = None  # the checkpoint's transformers config, loaded in __post_init__
     eos: int = -1
     kvcache_block_size: int = 16

@@ -19,6 +19,9 @@ from lean_vllm import envs
 
 logger = logging.getLogger(__name__)
 
+# Largest one-hot tile, in pairs times experts, that align_blocks_triton aligns in a single program. Past it, or past
+# 128 experts, the three-kernel path is faster on an H100.
+SMALL_ALIGN_ELEMENTS = 4096
 # Shipped tuned configs; $LEAN_VLLM_TUNED_CONFIG_FOLDER is searched first.
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "moe_configs")
 
@@ -276,6 +279,60 @@ else:
         tl.store(block_experts_ptr + blocks, block_experts, mask=block_mask)
 
     @triton.jit
+    def align_small_kernel(
+        topk_ids_ptr,
+        expert_map_ptr,
+        sorted_pairs_ptr,
+        block_experts_ptr,
+        num_rows_ptr,
+        num_pairs,
+        num_blocks,
+        NUM_EXPERTS: tl.constexpr,
+        EXPERTS_POW2: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        PAIRS_POW2: tl.constexpr,
+        TAIL: tl.constexpr,
+        BLOCK_CHUNK: tl.constexpr,
+        HAS_EXPERT_MAP: tl.constexpr,
+    ):
+        """The three align kernels in one program, for a decode-sized batch whose pairs fit one one-hot tile."""
+        offs = tl.arange(0, PAIRS_POW2)
+        mask = offs < num_pairs
+        ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
+        experts = tl.arange(0, EXPERTS_POW2)
+        one_hot = (ids[:, None] == experts[None, :]).to(tl.int32)
+        counts = tl.sum(one_hot, axis=0)
+        padded = (counts + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+        starts = tl.cumsum(padded, axis=0) - padded
+        tl.store(num_rows_ptr, tl.sum(padded, axis=0))
+        rank = tl.sum(tl.cumsum(one_hot, axis=0) * one_hot, axis=1) - 1
+        tl.store(sorted_pairs_ptr + tl.sum(one_hot * starts[None, :], axis=1) + rank, offs, mask=mask)
+        # Padding rows hold num_pairs; they are disjoint from the pair slots above.
+        for offset in tl.static_range(0, BLOCK_M, TAIL):
+            overhang = counts[:, None] + offset + tl.arange(0, TAIL)[None, :]
+            sentinel = tl.zeros((EXPERTS_POW2, TAIL), dtype=tl.int32) + num_pairs
+            tl.store(sorted_pairs_ptr + starts[:, None] + overhang, sentinel, mask=overhang < padded[:, None])
+        first_blocks = starts // BLOCK_M
+        for start in range(0, num_blocks, BLOCK_CHUNK):
+            blocks = start + tl.arange(0, BLOCK_CHUNK)
+            block_mask = blocks < num_blocks
+            owners = (first_blocks[None, :] <= blocks[:, None]) & (experts < NUM_EXPERTS)[None, :]
+            block_experts = tl.sum(owners.to(tl.int32), axis=1) - 1
+            if HAS_EXPERT_MAP:
+                block_experts = tl.load(expert_map_ptr + block_experts, mask=block_mask, other=-1)
+            tl.store(block_experts_ptr + blocks, block_experts, mask=block_mask)
+
+    @triton.jit
+    def moe_sum_kernel(x_ptr, out_ptr, d, TOP_K: tl.constexpr, TOP_K_POW2: tl.constexpr, BLOCK: tl.constexpr):
+        """out[t] = sum over k of x[t, k], in fp32, for one token and up to BLOCK columns of contiguous [T, K, D]."""
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        k = tl.arange(0, TOP_K_POW2)
+        mask = (k < TOP_K)[:, None] & (cols < d)[None, :]
+        x = tl.load(x_ptr + (row * TOP_K + k[:, None]) * d + cols[None, :], mask=mask, other=0.0)
+        tl.store(out_ptr + row * d + cols, tl.sum(x.to(tl.float32), axis=0).to(out_ptr.dtype.element_ty), mask=cols < d)
+
+    @triton.jit
     def silu_and_mul_kernel(x_ptr, out_ptr, d, stride_x, stride_out, BLOCK: tl.constexpr):
         """Compute silu(gate) * up in fp32 for one row and up to BLOCK columns, then cast to the output dtype."""
         row = tl.program_id(0).to(tl.int64)
@@ -382,7 +439,8 @@ def align_blocks_triton(
     block_m: int,
     expert_map: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Align pairs in three kernel launches, optionally mapping each block's global expert ID to a local ID.
+    """Align pairs, optionally mapping each block's global expert ID to a local ID: in one kernel launch when the
+    pairs fit one one-hot tile, as in decode, else in three.
 
     Return pair indices, block expert IDs, and the padded row count.
     Pair entries past num_rows are left unwritten; GEMMs skip them.
@@ -390,15 +448,37 @@ def align_blocks_triton(
     pairs = topk_ids.flatten()
     num_pairs = pairs.numel()
     experts_pow2 = triton.next_power_of_2(num_experts)
-    tile = max(16, 8192 // experts_pow2)  # target 8K elements per one-hot tile, with at least 16 rows
-    num_programs = triton.cdiv(num_pairs, tile)
     num_blocks = triton.cdiv(num_pairs, block_m) + num_experts  # allow fewer than block_m padding rows per expert
     device = pairs.device
-    counts = torch.empty(num_programs, experts_pow2, dtype=torch.int32, device=device)
-    expert_starts = torch.empty(experts_pow2, dtype=torch.int32, device=device)
     sorted_pairs = torch.empty(num_blocks * block_m, dtype=torch.int32, device=device)
     block_experts = torch.empty(num_blocks, dtype=torch.int32, device=device)
     num_rows = torch.empty(1, dtype=torch.int32, device=device)
+    pairs_pow2 = triton.next_power_of_2(num_pairs)
+    elements = pairs_pow2 * experts_pow2
+    if elements <= SMALL_ALIGN_ELEMENTS and experts_pow2 <= 128:
+        align_small_kernel[(1,)](
+            pairs,
+            block_experts if expert_map is None else expert_map,
+            sorted_pairs,
+            block_experts,
+            num_rows,
+            num_pairs,
+            num_blocks,
+            NUM_EXPERTS=num_experts,
+            EXPERTS_POW2=experts_pow2,
+            BLOCK_M=block_m,
+            PAIRS_POW2=pairs_pow2,
+            TAIL=max(1, min(block_m, 4096 // experts_pow2)),
+            BLOCK_CHUNK=max(16, 4096 // experts_pow2),
+            HAS_EXPERT_MAP=expert_map is not None,
+            num_warps=1 if elements <= 2048 else 8,
+        )
+        return sorted_pairs, block_experts, num_rows
+    # Rows per one-hot tile: more for more pairs, at most 8K elements a tile. Measured on an H100.
+    tile = max(16, min(8192 // experts_pow2, 16 if num_pairs <= 512 else 64 if num_pairs <= 8192 else 128))
+    num_programs = triton.cdiv(num_pairs, tile)
+    counts = torch.empty(num_programs, experts_pow2, dtype=torch.int32, device=device)
+    expert_starts = torch.empty(experts_pow2, dtype=torch.int32, device=device)
     count_experts_kernel[(num_programs,)](pairs, counts, num_pairs, EXPERTS_POW2=experts_pow2, BLOCK=tile)
     scan_experts_kernel[(1,)](
         counts,
@@ -449,7 +529,8 @@ def topk_softmax(
     weights = torch.empty(num_tokens, top_k, dtype=torch.float32, device=router_logits.device)
     ids = torch.empty(num_tokens, top_k, dtype=torch.int32, device=router_logits.device)
     experts_pow2 = triton.next_power_of_2(num_experts)
-    block_t = max(1, 4096 // experts_pow2)
+    # Tiles of 512 scores, or one token and one warp when grouped: the fastest on an H100 from 1 to 8K tokens.
+    block_t, num_warps = (1, 1) if num_groups > 1 else (max(1, 512 // experts_pow2), 4)
     topk_softmax_kernel[(triton.cdiv(num_tokens, block_t),)](
         router_logits,
         e_score_correction_bias,
@@ -469,6 +550,7 @@ def topk_softmax(
         HAS_BIAS=e_score_correction_bias is not None,
         RENORMALIZE=renormalize,
         BLOCK_T=block_t,
+        num_warps=num_warps,
     )
     return weights, ids
 
@@ -546,4 +628,15 @@ def fused_experts(
     h = act_fn(h)  # [T*K, 2I] -> [T*K, I]
     out = torch.empty(num_pairs, hidden_size, device=x.device, dtype=x.dtype)  # [T*K, D]
     gemm(h, down_proj, out, 1, mul_routed_weight=True)  # h is already one row per pair
-    return out.view(num_tokens, top_k, hidden_size).sum(dim=1)  # [T, D]
+    return moe_sum(out.view(num_tokens, top_k, hidden_size))  # [T, D]
+
+
+def moe_sum(x: torch.Tensor) -> torch.Tensor:
+    """Sum contiguous [T, K, D] over K in one kernel launch; torch's generic reduction takes twice as long."""
+    num_tokens, top_k, d = x.shape
+    out = torch.empty(num_tokens, d, dtype=x.dtype, device=x.device)
+    block = min(triton.next_power_of_2(d), 1024)
+    moe_sum_kernel[(num_tokens, triton.cdiv(d, block))](
+        x, out, d, TOP_K=top_k, TOP_K_POW2=triton.next_power_of_2(top_k), BLOCK=block
+    )
+    return out

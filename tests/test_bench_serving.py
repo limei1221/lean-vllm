@@ -100,6 +100,74 @@ class TestTrace:
         assert all(request.prompt_len == 24 for request in trace)
         assert len({tuple(request.prompt_token_ids) for request in trace}) == 50
 
+    def test_multiturn_resends_the_last_turn_and_interleaves_conversations(self):
+        args = make_args("--num-requests", "12", "--num-conversations", "3", "--input-len", "8", "--turn-len", "4")
+        trace = bench.multiturn_trace(bench.random.Random(0), args)
+        assert len(trace) == 12
+        for c in range(3):
+            turns = trace[c::3]
+            assert [request.prompt_len for request in turns] == [8, 12, 16, 20]
+            for earlier, later in zip(turns, turns[1:]):
+                assert later.prompt_token_ids[: earlier.prompt_len] == earlier.prompt_token_ids
+        assert trace[0].prompt_token_ids[:8] != trace[1].prompt_token_ids[:8]
+
+    def test_a_conversation_past_the_context_starts_over(self):
+        args = make_args(
+            "--num-requests",
+            "4",
+            "--num-conversations",
+            "1",
+            "--input-len",
+            "8",
+            "--turn-len",
+            "8",
+            "--max-model-len",
+            "28",
+        )
+        trace = bench.multiturn_trace(bench.random.Random(0), args)
+        assert [request.prompt_len for request in trace] == [8, 16, 24, 8]  # 24 + 4 output fits; 32 would not
+        bench.validate(trace, args)
+
+    def test_branching_shares_a_root_and_one_of_a_few_branches(self):
+        args = make_args(
+            "--num-requests",
+            "40",
+            "--num-prefixes",
+            "3",
+            "--prefix-len",
+            "8",
+            "--turn-len",
+            "4",
+            "--input-len",
+            "16",
+        )
+        trace = bench.branching_trace(bench.random.Random(0), args)
+        assert len({tuple(request.prompt_token_ids[:8]) for request in trace}) == 1
+        assert len({tuple(request.prompt_token_ids[:12]) for request in trace}) == 3
+        assert len({tuple(request.prompt_token_ids) for request in trace}) == 40
+        assert all(request.prompt_len == 16 for request in trace)
+
+    def test_unrelated_requests_share_nothing(self):
+        args = make_args(
+            "--num-requests",
+            "200",
+            "--num-prefixes",
+            "1",
+            "--prefix-len",
+            "8",
+            "--turn-len",
+            "4",
+            "--input-len",
+            "16",
+            "--unique-fraction",
+            "0.5",
+        )
+        trace = bench.branching_trace(bench.random.Random(0), args)
+        unrelated = [request for request in trace if request.label == "unrelated"]
+        assert 60 < len(unrelated) < 140
+        root = trace[next(i for i, r in enumerate(trace) if r.label != "unrelated")].prompt_token_ids[:8]
+        assert all(request.prompt_token_ids[:8] != root for request in unrelated)
+
 
 class TestStatistics:
     def test_percentiles_interpolate(self):
@@ -124,6 +192,26 @@ class TestStatistics:
         assert summary["failure_rate"] == pytest.approx(1 / 2)
         assert summary["goodput_requests_per_second"] == pytest.approx(0.5)
         assert summary["attempted_requests_per_second"] == pytest.approx(1.0)
+        assert "slo" not in summary  # no limits, no SLO goodput
+
+    def test_slo_goodput_counts_requests_within_both_limits(self):
+        def ok(index, ttft, latency, output_len=5):
+            return bench.Result(index, "all", 0, 4, output_len, 0.0, "ok", output_len, ttft, latency)
+
+        results = [
+            ok(0, ttft=0.1, latency=0.5),  # tpot 0.1: passes both
+            ok(1, ttft=0.3, latency=0.7),  # ttft over the limit
+            ok(2, ttft=0.1, latency=1.3),  # tpot 0.3: over the limit
+            bench.Result(3, "all", 0, 4, 5, 0.0, "failed"),  # failed execution
+            ok(4, ttft=0.1, latency=0.1, output_len=1),  # one token, no interval: judged on ttft alone
+            ok(5, ttft=0.3, latency=0.3, output_len=1),  # one token over the ttft limit
+        ]
+        summary = bench.summarize(results, duration=4.0, slo_ttft=0.2, slo_tpot=0.15)
+        assert [result.meets_slo(0.2, 0.15) for result in results] == [True, False, False, False, True, False]
+        assert summary["slo"]["met"] == 2
+        assert summary["slo_attainment"] == pytest.approx(2 / 6)
+        assert summary["slo_goodput_requests_per_second"] == pytest.approx(0.5)
+        assert summary["goodput_requests_per_second"] == pytest.approx(5 / 4)  # unchanged: no latency cutoff
 
 
 class TestRun:
@@ -151,11 +239,23 @@ class TestServerStats:
             "lean_vllm:num_preemptions_total": 4.0,
         }
         stats = bench.server_run_stats(before, after, duration=2.0)
-        assert stats == {"model_busy_fraction": 0.75, "mean_batch_tokens": 30.0, "preemptions": 3}
+        assert stats == {
+            "model_busy_fraction": 0.75,
+            "mean_batch_tokens": 30.0,
+            "preemptions": 3,
+            "prefix_cache_hit_rate": None,
+        }
+
+    def test_the_hit_rate_reads_either_engines_counters(self):
+        for engine in ("lean_vllm", "vllm"):
+            before = {f"{engine}:prefix_cache_queries_total": 10.0, f"{engine}:prefix_cache_hits_total": 2.0}
+            after = {f"{engine}:prefix_cache_queries_total": 30.0, f"{engine}:prefix_cache_hits_total": 7.0}
+            assert bench.server_run_stats(before, after, 2.0)["prefix_cache_hit_rate"] == pytest.approx(0.25)
 
     def test_a_server_without_these_counters_reports_none(self):
         """vLLM names its own, and a server may expose no /metrics at all."""
         empty = {"model_busy_fraction": None, "mean_batch_tokens": None, "preemptions": None}
+        empty["prefix_cache_hit_rate"] = None
         assert bench.server_run_stats({"vllm:num_preemptions_total": 0.0}, {}, 2.0) == empty
         assert bench.server_run_stats(None, None, 2.0) == empty
 
@@ -176,7 +276,12 @@ class TestAgainstTheServer:
         assert all(len(record["itls"]) == 1 for record in result["requests"])
         server, received = result["server"], "lean_vllm:num_requests_received_total"
         assert (server["before"][received], server["after"][received]) == (0, 6)  # scraped from /metrics
-        assert server["run"] == {"model_busy_fraction": 0.0, "mean_batch_tokens": None, "preemptions": 0}
+        assert server["run"] == {
+            "model_busy_fraction": 0.0,
+            "mean_batch_tokens": None,
+            "preemptions": 0,
+            "prefix_cache_hit_rate": None,  # no queries, so no rate
+        }
 
     @asyncio_test
     async def test_the_model_name_comes_off_the_server(self):

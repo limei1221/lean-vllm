@@ -376,9 +376,10 @@ def dense_routing(weights: torch.Tensor, ids: torch.Tensor, num_experts: int) ->
 
 
 @requires_triton_gpu
-@pytest.mark.parametrize("num_tokens", [1, 20, 3000])  # 3000 * 6 pairs span many programs
+# Up to 10 tokens fit the one-program kernel for 64 experts; 3000 * 6 pairs span many programs.
+@pytest.mark.parametrize("num_tokens", [1, 5, 10, 11, 20, 3000])
 @pytest.mark.parametrize("num_experts", [8, 64, 160])  # 160 is not a power of two
-@pytest.mark.parametrize("block_m", [16, 64])
+@pytest.mark.parametrize("block_m", [16, 64, 128])
 @pytest.mark.parametrize("ep", [False, True], ids=["one_rank", "ep"])
 def test_triton_alignment_matches_the_reference(num_tokens, num_experts, block_m, ep):
     """Row for row up to num_rows, past which the kernels write nothing and no GEMM reads."""
@@ -409,9 +410,10 @@ def test_triton_alignment_matches_the_reference(num_tokens, num_experts, block_m
 )
 @pytest.mark.parametrize("renormalize, scaling", [(False, 1.0), (True, 2.5)])
 @pytest.mark.parametrize("num_experts", [64, 160])
-def test_triton_routing_matches_torch(routing, renormalize, scaling, num_experts):
+@pytest.mark.parametrize("num_tokens", [1, 7, 300])  # under one tile, a partial tile, and many
+def test_triton_routing_matches_torch(routing, renormalize, scaling, num_experts, num_tokens):
     torch.manual_seed(0)
-    router_logits = torch.randn(300, num_experts, device="cuda")
+    router_logits = torch.randn(num_tokens, num_experts, device="cuda")
     bias = torch.randn(num_experts, device="cuda") * 0.2 if routing.get("bias") else None
     scoring_func = routing.get("scoring_func", "softmax")
     args = (router_logits, 6, renormalize, scaling, routing["num_groups"], routing["topk_group"], scoring_func, bias)
@@ -430,6 +432,14 @@ def test_triton_silu_and_mul_matches_torch(width):
     x = torch.randn(37, 2 * width, device="cuda", dtype=torch.bfloat16)
     gate, up = x.float().chunk(2, dim=-1)
     torch.testing.assert_close(fused_moe.silu_and_mul(x), (torch.nn.functional.silu(gate) * up).to(torch.bfloat16))
+
+
+@requires_triton_gpu
+@pytest.mark.parametrize("top_k, width", [(6, 2048), (8, 7168), (1, 100)])  # V2-Lite, V3, and a partial block
+def test_triton_moe_sum_matches_torch(top_k, width):
+    torch.manual_seed(0)
+    x = torch.randn(37, top_k, width, device="cuda", dtype=torch.bfloat16)
+    torch.testing.assert_close(fused_moe.moe_sum(x), x.float().sum(dim=1).to(torch.bfloat16))
 
 
 def shared_weights(device="cpu", dtype=torch.float32) -> tuple[torch.Tensor, torch.Tensor]:
