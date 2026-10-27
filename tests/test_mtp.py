@@ -1,4 +1,4 @@
-"""DeepSeek-V3's MTP drafter end to end, on a tiny random checkpoint on CPU.
+"""DeepSeek-V3's MTP drafter end to end, on a tiny random checkpoint on CPU; test_mtp_cuda.py runs it on CUDA.
 
 Greedy speculative decoding must give the tokens plain decoding gives, whatever the drafts. A drafter whose weights
 make it predict the target exactly must have every draft kept; and the drafts the engine proposes step by step
@@ -37,55 +37,58 @@ ENGINE_ARGS = dict(
 PROMPTS = [[5, 9, 2, 77, 31], list(range(3, 70)), [100, 4] * 20, [64, 65]]
 
 
-def write_checkpoint(path, seed: int = 0):
+def write_checkpoint(path, seed: int = 0, dtype: torch.dtype = torch.float32, **overrides):
     """A V3 checkpoint as DeepSeek ships one: its MTP layer past the last, with copies of embed_tokens and lm_head."""
     torch.manual_seed(seed)
     config = DeepseekV3Config(
-        hidden_size=64,
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        intermediate_size=96,
-        moe_intermediate_size=24,
-        n_routed_experts=8,
-        num_experts_per_tok=3,
-        n_shared_experts=1,
-        n_group=2,
-        topk_group=1,
-        first_k_dense_replace=1,
-        num_hidden_layers=NUM_LAYERS + 1,  # the last becomes the MTP layer's decoder block
-        vocab_size=VOCAB,
-        max_position_embeddings=256,
-        q_lora_rank=24,
-        kv_lora_rank=16,
-        qk_nope_head_dim=12,
-        qk_rope_head_dim=8,
-        v_head_dim=10,
-        initializer_range=0.2,
-        dtype="float32",
+        **{
+            **dict(
+                hidden_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                intermediate_size=96,
+                moe_intermediate_size=24,
+                n_routed_experts=8,
+                num_experts_per_tok=3,
+                n_shared_experts=1,
+                n_group=2,
+                topk_group=1,
+                first_k_dense_replace=1,
+                num_hidden_layers=NUM_LAYERS + 1,  # the last becomes the MTP layer's decoder block
+                vocab_size=VOCAB,
+                max_position_embeddings=256,
+                q_lora_rank=24,
+                kv_lora_rank=16,
+                qk_nope_head_dim=12,
+                qk_rope_head_dim=8,
+                v_head_dim=10,
+                initializer_range=0.2,
+                dtype="float32",
+            ),
+            **overrides,
+        }
     )
     model = HFDeepseekV3ForCausalLM(config)
     with torch.no_grad():
         for name, buffer in model.named_buffers():
             if name.endswith("e_score_correction_bias"):
                 buffer.normal_(0, 0.2)
-    model.save_pretrained(path)
+    model.to(dtype).save_pretrained(path)
     mtp = f"model.layers.{NUM_LAYERS}."
     hidden = config.hidden_size
-    save_file(
-        {
-            mtp + "enorm.weight": 1 + 0.1 * torch.randn(hidden),
-            mtp + "hnorm.weight": 1 + 0.1 * torch.randn(hidden),
-            mtp + "eh_proj.weight": 0.2 * torch.randn(hidden, 2 * hidden),
-            mtp + "shared_head.norm.weight": 1 + 0.1 * torch.randn(hidden),
-            # Copies of the target's, which the drafter shares instead of loading.
-            mtp + "embed_tokens.weight": model.model.embed_tokens.weight.detach().clone(),
-            mtp + "shared_head.head.weight": model.lm_head.weight.detach().clone(),
-        },
-        path / "mtp.safetensors",
-    )
+    weights = {
+        mtp + "enorm.weight": 1 + 0.1 * torch.randn(hidden),
+        mtp + "hnorm.weight": 1 + 0.1 * torch.randn(hidden),
+        mtp + "eh_proj.weight": 0.2 * torch.randn(hidden, 2 * hidden),
+        mtp + "shared_head.norm.weight": 1 + 0.1 * torch.randn(hidden),
+        # Copies of the target's, which the drafter shares instead of loading.
+        mtp + "embed_tokens.weight": model.model.embed_tokens.weight.detach().clone(),
+        mtp + "shared_head.head.weight": model.lm_head.weight.detach().clone(),
+    }
+    save_file({name: weight.to(dtype) for name, weight in weights.items()}, path / "mtp.safetensors")
     with open(path / "config.json") as f:
         saved = json.load(f)
-    saved.update(num_hidden_layers=NUM_LAYERS, num_nextn_predict_layers=1)
+    saved.update(num_hidden_layers=NUM_LAYERS, num_nextn_predict_layers=1, dtype=str(dtype).removeprefix("torch."))
     with open(path / "config.json", "w") as f:
         json.dump(saved, f)
     tokenizer = Tokenizer(WordLevel({f"t{i}": i for i in range(VOCAB)}, unk_token="t0"))
@@ -195,9 +198,10 @@ def no_cache_context(n: int) -> dict:
 
 
 @torch.inference_mode()
-def reference_drafts(engine, token_ids: list[int], k: int) -> list[int]:
-    """The drafts after token_ids by passes over the whole sequence: the target's hidden states, then the drafter
-    over every position with the next token beside it, then again with each draft and its hidden state appended."""
+def reference_draft_logits(engine, token_ids: list[int], k: int, drafts: list[int] | None = None) -> list[torch.Tensor]:
+    """The drafter's logits for the k drafts after token_ids by passes over the whole sequence: the target's hidden
+    states, then the drafter over every position with the next token beside it, then again with each draft and its
+    hidden state appended. A pass appends drafts[step] if given, else its own pick."""
     runner = engine.model_runner
     model, drafter = runner.model, runner.proposer.drafter
     n = len(token_ids) - 1
@@ -205,29 +209,50 @@ def reference_drafts(engine, token_ids: list[int], k: int) -> list[int]:
     with set_context(**no_cache_context(n)):
         hidden_states = model(torch.tensor(token_ids[:-1]), positions[:n])
     inputs = list(token_ids[1:])
-    drafts = []
+    logits = []
     for step in range(k):
         m = len(inputs)
         with set_context(**no_cache_context(m)):
             out = drafter(model.model.embed_tokens(torch.tensor(inputs)), positions[:m], hidden_states, step)
-            drafts.append(int(model.compute_logits(out[-1:]).argmax()))
-        inputs.append(drafts[-1])
+            logits.append(model.compute_logits(out[-1:])[0])
+        inputs.append(drafts[step] if drafts is not None else int(logits[-1].argmax()))
         hidden_states = torch.cat([hidden_states, out[-1:]])
-    return drafts
+    return logits
+
+
+def reference_drafts(engine, token_ids: list[int], k: int) -> list[int]:
+    return [int(logits.argmax()) for logits in reference_draft_logits(engine, token_ids, k)]
 
 
 def keep_drafts_at_random(logits, draft_token_ids, num_draft_tokens, temperatures, max_num_drafts, top_k, top_p):
     """Stands in for the rejection sampler: random weights would keep almost no draft.
     Each row keeps a random number of its drafts, then the target's token after them."""
     generator = torch.Generator().manual_seed(len(draft_token_ids) * 1000 + logits.size(0))
-    output = torch.full((num_draft_tokens.numel(), max_num_drafts + 1), -1, dtype=torch.int64)
+    output = torch.full((num_draft_tokens.numel(), max_num_drafts + 1), -1, dtype=torch.int64, device=logits.device)
     first_draft = first_logits = 0
     for row, n in enumerate(num_draft_tokens.tolist()):
-        kept = int(torch.randint(0, n + 1, (), generator=generator))
+        kept = int(torch.randint(0, n + 1, (), generator=generator, device="cpu"))
         output[row, :kept] = draft_token_ids[first_draft : first_draft + kept]
         output[row, kept] = logits[first_logits + kept].argmax()
         first_draft, first_logits = first_draft + n, first_logits + n + 1
     return output
+
+
+def record_drafts(engine, monkeypatch) -> list[tuple[list[int], list[int]]]:
+    """Each row's drafts with the tokens before them, as the scheduler receives them; filled as the engine steps."""
+    proposed = []
+    reconcile = engine.scheduler.reconcile
+
+    def recording_reconcile(rows, token_ids, draft_token_ids=None):
+        """Async, a step in flight holds a row's drafts, not the sequence."""
+        stepped = reconcile(rows, token_ids, draft_token_ids)
+        for row, drafts in zip(rows, draft_token_ids or []):
+            if row.seq in stepped and not row.seq.is_finished:
+                proposed.append((list(row.seq.token_ids), list(drafts)))  # the scheduler trims its own
+        return stepped
+
+    monkeypatch.setattr(engine.scheduler, "reconcile", recording_reconcile)
+    return proposed
 
 
 class ReplayedPass:
@@ -274,18 +299,7 @@ def test_the_drafts_are_those_of_one_pass_over_the_sequence(
                 monkeypatch.setattr(module.backend, "supports_mla_decode", lambda: False)
         monkeypatch.setattr(runner, "decodes_latents", False)
     graphs = capture_draft_passes(engine, monkeypatch, graph_sizes) if graph_sizes else {}
-    proposed = []
-    reconcile = engine.scheduler.reconcile
-
-    def recording_reconcile(rows, token_ids, draft_token_ids=None):
-        """Each row's drafts with the tokens before them; async, a step in flight holds them, not the sequence."""
-        stepped = reconcile(rows, token_ids, draft_token_ids)
-        for row, drafts in zip(rows, draft_token_ids or []):
-            if row.seq in stepped and not row.seq.is_finished:
-                proposed.append((list(row.seq.token_ids), list(drafts)))  # the scheduler trims its own
-        return stepped
-
-    monkeypatch.setattr(engine.scheduler, "reconcile", recording_reconcile)
+    proposed = record_drafts(engine, monkeypatch)
     generate(engine, max_tokens=12)
 
     assert len(proposed) > len(PROMPTS)
@@ -335,17 +349,7 @@ def test_the_compiled_first_pass_drafts_as_the_eager_one(make_engine, monkeypatc
         with set_context(**no_cache_context(size), piecewise_size=size):
             proposer.capture_piecewise(size)
     capture_draft_passes(engine, monkeypatch, [4])
-    proposed = []
-    reconcile = engine.scheduler.reconcile
-
-    def recording_reconcile(rows, token_ids, draft_token_ids=None):
-        stepped = reconcile(rows, token_ids, draft_token_ids)
-        for row, drafts in zip(rows, draft_token_ids or []):
-            if row.seq in stepped and not row.seq.is_finished:
-                proposed.append((list(row.seq.token_ids), list(drafts)))
-        return stepped
-
-    monkeypatch.setattr(engine.scheduler, "reconcile", recording_reconcile)
+    proposed = record_drafts(engine, monkeypatch)
     generate(engine, max_tokens=12)
 
     assert proposer.piecewise_bs == [8, 32] and len(proposer.compile_backend.pieces) == 2
