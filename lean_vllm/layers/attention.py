@@ -11,12 +11,12 @@ from lean_vllm.attention.merge import merge_attention_
 from lean_vllm.utils import device as dev
 from lean_vllm.utils.context import Context, get_context, split_decodes_and_prefills
 
-# A custom op cannot take modules, so layers are looked up by name. One per process.
+# Attention ops look up modules by name in this process-wide registry.
 _LAYERS: dict[str, "Attention"] = {}
 
 
 def register_layers(model: nn.Module):
-    """Name every attention layer, so the `lean_vllm` attention ops can find it. Call before forward."""
+    """Register each attention layer by name so attention ops can find it. Call before forward."""
     for name, module in model.named_modules():
         if isinstance(module, Attention):
             module.layer_name = name
@@ -31,12 +31,12 @@ def _layer(layer_name: str) -> "Attention":
 
 
 def _actual_rows(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    """The step's own rows: a piecewise bucket pads the step, and padding must not reach the cache."""
+    """Remove piecewise graph padding so only actual token rows reach attention and the cache."""
     n = get_context().num_actual_tokens
     return tensors if n is None else tuple(tensor[:n] for tensor in tensors)
 
 
-# The ops write into out, which the piece before them allocates, so its address is fixed in a captured graph.
+# The preceding graph piece allocates out, so the ops write to the same address on every graph replay.
 @torch.library.custom_op("lean_vllm::attention", mutates_args=("out",))
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
     q, k, v = _actual_rows(q, k, v)
@@ -75,7 +75,7 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        # The default dtype is the model's while the runner builds it.
+        # The runner sets the default dtype to the model's dtype during construction.
         backend_cls = backend or get_attention_backend(
             LayerSpec(head_dim, num_heads, num_kv_heads, torch.get_default_dtype())
         )
@@ -84,33 +84,37 @@ class Attention(nn.Module):
         self.layer_name = ""
 
     def kv_cache_shape(self, num_blocks: int, block_size: int, layout: str = "NHD") -> tuple[int, ...]:
-        """This layer's cache: a key and a value tensor, stacked, in the backend's layout, heads before tokens if HND."""
+        """Return the stacked key/value cache shape, with heads before tokens for HND layout."""
+        # (num_blocks, block_size, num_kv_heads, head_dim)
         shape = self.backend.get_kv_cache_shape(num_blocks, block_size, self.num_kv_heads, self.head_dim)
         if layout == "HND":
             shape = (shape[0], shape[2], shape[1], shape[3])
         return (2, *shape)
 
     def bind_kv_cache(self, cache: torch.Tensor, layout: str = "NHD"):
-        if layout == "HND":  # backends see (block, token, head, dim) either way, and read an HND cache by its strides
+        if layout == "HND":  # expose (block, token, head, dim) as a view; strides preserve the HND storage layout
             cache = cache.transpose(2, 3)
         self.k_cache, self.v_cache = cache[0], cache[1]
 
     def output_shape(self, num_tokens: int) -> tuple[int, ...]:
-        """What attend returns for this many tokens; forward sizes the op's output with it."""
+        """Return the attention output shape used by forward to allocate out."""
         return (num_tokens, self.num_heads, self.head_dim)
 
     def supports_full_cudagraph(self) -> bool:
-        """Whether a full graph may hold this layer's decode."""
+        """Return whether this layer supports decode inside a full CUDA graph."""
         return self.backend.supports_full_cudagraph()
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        # Through an opaque op, so the compiled model splits here and attention runs eager between the pieces.
+        # The custom op marks where piecewise compilation splits the model; attention runs between graph pieces.
         out = q.new_empty(self.output_shape(q.size(0)))
         torch.ops.lean_vllm.attention(q, k, v, out, self.layer_name)
         return out
 
     def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor | None = None):
-        """The op's body, writing into out if given. Its KV cache write is undeclared, as the cache is module state."""
+        """Run attention, writing into out if provided.
+
+        The custom op declares the out mutation, but not writes to the KV cache stored on this module.
+        """
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
@@ -120,19 +124,22 @@ class Attention(nn.Module):
 
 @dataclasses.dataclass(slots=True)
 class ContextChunk:
-    """Cached keys of consecutive rows, and the queries of those rows."""
+    """Describe a chunk of cached keys and the queries for its consecutive batch rows."""
 
-    queries: slice  # the rows' tokens in the step's q
+    queries: slice  # query tokens for these batch rows in the q passed to _prefill
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
     max_seqlen_q: int
     max_seqlen_k: int
     slots: torch.Tensor  # the cache slot of each key
-    host_cu_seqlens: tuple[list[int], list[int]]  # cu_seqlens_q and _k on the host, for backends that plan there
+    host_cu_seqlens: tuple[list[int], list[int]]  # host copies of cu_seqlens_q and cu_seqlens_k for backend planning
 
 
 def plan_context_chunks(context_lens: list[int], budget: int) -> list[tuple[int, list[int], list[int]]]:
-    """Pack rows' cached keys into chunks of at most budget, as (first row, starts, lengths). Long rows split."""
+    """Pack cached keys into chunks of at most budget keys, splitting long rows across chunks.
+
+    Return (first row, starts, lengths) for each chunk. Starts and lengths count keys within each row.
+    """
     assert budget > 0
     chunks = []
     row = start = 0
@@ -154,10 +161,10 @@ def plan_context_chunks(context_lens: list[int], budget: int) -> list[tuple[int,
 
 
 def context_chunks(context: Context, block_size: int, budget: int) -> list[ContextChunk]:
-    """The step's cached keys in chunks, planned on the host once per step."""
+    """Plan cached-key chunks on the host and reuse them for subsequent calls with this context."""
     if context.context_chunks is None:
         cu_q, cu_k = context.cu_seqlens_q_host, context.cu_seqlens_k_host
-        if cu_k is None:  # a draft step's, whose kept drafts only the device knows: read back, a sync
+        if cu_k is None:  # a draft step's key lengths are only on the device; copying them to the host synchronizes
             assert context.cu_seqlens_k is not None
             cu_k = context.cu_seqlens_k.tolist()
         assert cu_q is not None and context.block_tables is not None
@@ -190,11 +197,12 @@ def context_chunks(context: Context, block_size: int, budget: int) -> list[Conte
 class MLAAttention(Attention):
     """Multi-head latent attention: the cache holds one compressed latent per token.
 
-    Cached latents expand max_context_chunk at a time, merged by log-sum-exp; MLA decode backends skip expanding.
+    Expand cached latents in chunks of at most max_context_chunk tokens and merge attention outputs using log-sum-exp.
+    Backends with MLA decode support attend directly to cached latents during decode.
     Corresponds to vLLM's MLACommonImpl; splits each step into decode and prefill.
     """
 
-    max_context_chunk = 8192  # the runner sets its step token budget
+    max_context_chunk = 8192  # the runner replaces this with its per-step token budget
 
     def __init__(
         self,
@@ -216,7 +224,7 @@ class MLAAttention(Attention):
         # Values stay narrower than keys: FA3 and FlashInfer support DeepSeek's (192, 128)
         # key/value dimensions, and SDPA supports arbitrary dimensions.
         # No equivalent of vLLM's _pad_v for FlashAttention-2 is needed here.
-        self.expand = expand  # methods of the owning layer, so not a registered submodule
+        self.expand = expand  # the owning layer passes a bound method, not a registered submodule
         self.latent_projections = latent_projections
         self.latent_cache = torch.tensor([])
 
@@ -230,7 +238,7 @@ class MLAAttention(Attention):
         return (num_tokens, self.num_heads, self.v_head_dim)
 
     def supports_full_cudagraph(self) -> bool:
-        # Decode must attend latents, as expanding them needs the step's host plan, and be safe to replay.
+        # A full graph needs latent decode, as expansion needs the step's host plan, and mla_decode safe to replay.
         return self.backend.supports_mla_decode() and self.backend.supports_full_cudagraph_mla_decode()
 
     def forward(self, q: torch.Tensor, latent: torch.Tensor):  # type: ignore[override]
@@ -248,7 +256,8 @@ class MLAAttention(Attention):
             return self._prefill(q, latent, context, out)  # decode rows expand like prompt rows
         if not context.is_prefill:
             return self._decode_latents(q, context, out)  # pure decode
-        # Rows verifying drafts decode too, several queries each, as vLLM's reorder_batch_threshold of 1 + drafts.
+        # Draft verification gives decode rows several queries; decode_query_len is the batch's most common length
+        # up to 1 + drafts, the bound vLLM's reorder_batch_threshold sets.
         n, decodes, prefills = split_decodes_and_prefills(context, context.decode_query_len)
         if decodes is None:
             assert prefills is not None
@@ -269,11 +278,11 @@ class MLAAttention(Attention):
         k, v = self.expand(latent)
         chunks = [] if context.block_tables is None else context_chunks(context, cache.size(1), self.max_context_chunk)
         if not chunks:
-            # No row has cached context (vLLM's has_context), so a plain prefill with no page table covers it.
+            # No cached keys to chunk (vLLM's has_context is False); attend to the current tokens without a page table.
             unpaged = dataclasses.replace(context, block_tables=None)
             return self.backend.prefill(q, k, v, self.k_cache, self.v_cache, unpaged, out)
-        # New tokens attend each other causally, and each chunk of cached keys unmasked. The chunks
-        # merge among themselves, then with the new tokens straight into out.
+        # New tokens attend to one another causally and to cached keys without a causal mask.
+        # Merge the cached-chunk outputs first, then combine with the current-token output, writing to out if given.
         cu_seqlens_q, max_seqlen_q = context.cu_seqlens_q, context.max_seqlen_q
         assert cu_seqlens_q is not None
         host = context.cu_seqlens_q_host
@@ -290,7 +299,7 @@ class MLAAttention(Attention):
             host_cu_seqlens=None if host is None else (host, host),
         )
         del k, v
-        # Rows with no cached keys keep an lse of -inf, which the merge weighs at zero.
+        # Rows with no cached keys keep context_lse at -inf, giving cached attention zero weight in the final merge.
         # compute and accumulate attention over cached chunks
         context_o = o.new_zeros(o.size(0), self.num_heads, self.v_head_dim)
         context_lse = torch.full_like(lse, float("-inf"))
@@ -310,16 +319,17 @@ class MLAAttention(Attention):
                 host_cu_seqlens=chunk.host_cu_seqlens,
             )
             del k, v
-            # rows is a slice, so these are views
+            # rows is a slice, so the merge updates views of context_o and context_lse
             merge_attention_(context_o[rows], context_lse[rows], o_chunk, lse_chunk)
         # merge the cached-prefix and new-token results
         merge_attention_(context_o, context_lse, o, lse, out)
         return context_o if out is None else out  # (num_new_tokens, num_heads, v_head_dim)
 
     def _decode_latents(self, q: torch.Tensor, context: Context, out: torch.Tensor | None = None) -> torch.Tensor:
-        """Attention over the cached latents as they are, so nothing expands.
+        """Attend directly to cached latents without expanding their keys and values.
 
-        q^T (W_UK c) = (W_UK^T q)^T c moves the query into latent space; W_UV applies after, as attention is linear in values.
+        q^T (W_UK c) = (W_UK^T q)^T c projects the non-positional query into latent space.
+        Apply W_UV to the output afterward because attention is linear in the values.
         """
         W_UK_T, W_UV = self.latent_projections()
         # N = heads, P = qk_nope_head_dim, L = kv_lora_rank; W_UV is (N, L, V) with V = self.v_head_dim

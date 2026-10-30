@@ -62,10 +62,11 @@ never takes `flashinfer`, and `flashmla` never serves a plain layer. Layers of
 one model may end up on different backends; the runner logs the count per
 backend.
 
-`torch` serves every layer, so automatic selection never fails. Naming a backend
-that is unavailable, or that cannot serve a layer, raises an error listing the
-reasons rather than falling back, because a silent switch to a much slower
-backend in the middle of a benchmark is worse than a crash.
+`torch` is the last fallback, but it still checks dtype and head grouping, so
+automatic selection can fail; the error lists each backend's reasons. Naming a
+backend that is unavailable, or that cannot serve a layer, also raises an error
+listing the reasons rather than falling back, because a silent switch to a much
+slower backend in the middle of a benchmark is worse than a crash.
 
 ```bash
 LEAN_VLLM_ATTENTION_BACKEND=torch uv run python example.py

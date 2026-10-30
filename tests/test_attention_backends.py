@@ -501,6 +501,19 @@ def test_a_named_backend_that_cannot_serve_the_layer_says_why(all_available, mon
         get_attention_backend(spec)
 
 
+@pytest.mark.parametrize(
+    "spec, reason",
+    [
+        (LayerSpec(128, 6, 4, torch.bfloat16), "torch: 6 query heads do not group over 4 key heads"),
+        (LayerSpec(128, 32, 8, torch.float64), "torch: dtype torch.float64"),
+    ],
+    ids=["head_count", "dtype"],
+)
+def test_automatic_selection_says_why_when_no_backend_serves_the_layer(all_available, spec, reason):
+    with pytest.raises(RuntimeError, match=f"no attention backend can serve .*{reason}"):
+        get_attention_backend(spec)
+
+
 def test_layers_of_one_model_can_take_different_backends(all_available):
     """Chosen at init from each layer's own shape, under the dtype the runner sets while building the model."""
     default = torch.get_default_dtype()
