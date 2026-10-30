@@ -143,7 +143,7 @@ vLLM's MLA prefill does there, and so does `torch`, so values are never
 padded. vLLM's `_pad_v` zero-pads them to 192 only for FA2,
 which lean-vllm does not have.
 
-**Decode** skips the expansion. Since `q · (W_UK c) = (W_UKᵀ q) · c`, each head's
+**Decode** skips the expansion. Since `q^T (W_UK c) = (W_UK^T q)^T c`, each head's
 query is projected into latent space and attends the cached latents directly
 as one shared key head. The value projection is applied after attention. vLLM
 does the same with `W_UK_T` and `W_UV`. Both engines build them once the
@@ -210,9 +210,7 @@ defaults. File names and keys are vLLM's, so a file vLLM's tuner wrote works
 here too.
 
 No tuned file ships yet. vLLM ships none for V2-Lite on an H100 either
-(`E=64,N=1408` has only a B200 file), so the 20 September comparison ran both
-engines on defaults; lean-vLLM's own defaults then were a fixed 16 or 64-row
-tile, not vLLM's table.
+(`E=64,N=1408` has only a B200 file).
 
 `GROUP_SIZE_M` orders the launch as vLLM's kernel does: that many row blocks
 take each column tile in turn, so they read the same weight tile while it is
