@@ -24,8 +24,7 @@ checkpoints, not yet on the real weights.
 | DeepSeek-V3 architecture (`DeepseekV3ForCausalLM`) | `noaux_tc` routing (sigmoid scores, correction bias) and skipping the MTP layer's weights are tested on tiny checkpoints; FP8 checkpoints are not supported, and no real V3-architecture model has run |
 
 The runner picks the model class from `architectures` in `config.json`
-(`lean_vllm/models/__init__.py`). The config and tokenizer load with
-transformers ≥ 4.56 and need no `trust_remote_code`.
+(`lean_vllm/models/__init__.py`).
 
 ### Hardware and attention backends
 
@@ -35,7 +34,7 @@ Each MLA layer chooses its backend at init. The preference is `flashmla`, then
 
 | Backend | Runs on | How decode reads the cache | CUDA graphs |
 |---|---|---|---|
-| `flashmla` | H100/H200, with FlashMLA built from source | FlashMLA kernel over the latents | full + piecewise |
+| `flashmla` | H100/H200 | FlashMLA kernel over the latents | full + piecewise |
 | `flash_attn_3` | H100/H200 | expands latents into keys and values | piecewise only |
 | `torch` | anything: CPU or any CUDA GPU | over the latents, in plain torch | none (eager) |
 
@@ -70,18 +69,19 @@ uv run hf download deepseek-ai/DeepSeek-V2-Lite-Chat --local-dir ~/workspace/hug
 uv run lean-vllm serve ~/workspace/huggingface/DeepSeek-V2-Lite-Chat --served-model-name deepseek
 ```
 
-This runs on `flash_attn_3`. For the fast decode path, install FlashMLA. It has
-no wheel, and `flash-mla` on PyPI is an empty placeholder, so build it into the
-project's environment against the pinned torch:
+This runs on `flash_attn_3`. For the fast decode path, add the `flashmla` extra,
+on Linux x86_64 with `nvcc` 12.9 or newer:
 
 ```bash
-git clone --recursive https://github.com/deepseek-ai/FlashMLA.git && cd FlashMLA
-VIRTUAL_ENV=~/workspace/lean-vllm/.venv uv pip install --no-build-isolation -v .
+uv sync --extra cuda --extra flashmla
 ```
 
-A later `uv sync` removes it again unless you pass `--inexact`. The backend
-targets FlashMLA's current interface, where `get_mla_metadata()` takes no
-arguments and returns a `FlashMLASchedMeta`.
+FlashMLA has no wheel, and `flash-mla` on PyPI is an empty placeholder, so this
+builds it from source. `pyproject.toml` pins the commit of vLLM's fork that vLLM
+builds; do not swap in upstream `main`, which removed Hopper on 2026-09-30.
+
+The backend targets the interface where `get_mla_metadata()` takes no arguments
+and returns a `FlashMLASchedMeta`.
 
 ## What has been verified
 

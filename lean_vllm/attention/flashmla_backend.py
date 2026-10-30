@@ -7,7 +7,7 @@ from lean_vllm.utils.context import Context
 _IMPORT_ERROR: ImportError | None = None
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
-except ImportError as e:  # built from source, Hopper only
+except ImportError as e:  # the flashmla extra builds it on Linux x86_64
     _IMPORT_ERROR = e
 
 

@@ -32,7 +32,7 @@ AttentionBackend                  # the interface
 | `torch` | Anything: CPU or any CUDA GPU | Any layer; fp32, fp16 or bf16 | Any multiple of 16 | No, always eager | Yes |
 | `flashinfer` | sm80 and newer (A100, H100, ...), Linux | Plain layers; fp16/bf16; head size 64, 128 or 256 | Any multiple of 16 | Full + piecewise | Yes |
 | `flash_attn_3` | H100 / H200 (sm90), Linux x86_64 | Plain and MLA layers; fp16/bf16; head size a multiple of 8, up to 256 | Any multiple of 16 | Full + piecewise | No |
-| `flashmla` | H100 / H200, with FlashMLA built from source | MLA layers with 512 + 64 latents; as FA3 otherwise | 64 | Full + piecewise | MLA layers split themselves |
+| `flashmla` | H100 / H200, Linux x86_64 | MLA layers with 512 + 64 latents; as FA3 otherwise | 64 | Full + piecewise | MLA layers split themselves |
 
 `torch` is written to be obviously correct, not fast. It is the backend for
 development and tests, not for benchmarks. `torch` and `flashmla` decode MLA
@@ -97,8 +97,9 @@ any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
   `pyproject.toml`, for Linux on x86_64 against the pinned torch.
 - **FlashInfer**: also in the `cuda` extra, as `flashinfer-python` on Linux.
   That wheel compiles its kernels on first use, so the machine needs `nvcc`.
-- **FlashMLA**: build it from source; see
-  [deepseek-v2.md](deepseek-v2.md#running-it).
+- **FlashMLA**: `uv sync --extra cuda --extra flashmla`, for Linux on x86_64.
+  There is no wheel, so this builds it from a pinned commit and needs `nvcc`;
+  see [deepseek-v2.md](deepseek-v2.md#running-it).
 - **Triton**: in the `cuda` extra. Its kernels compile on first use.
 
 ## What has been verified

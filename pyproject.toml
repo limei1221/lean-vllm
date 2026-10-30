@@ -44,6 +44,9 @@ cuda = [
     # first use, so the machine needs nvcc.
     "flashinfer-python; sys_platform == 'linux'",
 ]
+# The flashmla backend, for Hopper. Pinned by git below and built on install, so
+# this extra needs nvcc 12.9 or newer, which is why it is not part of cuda.
+flashmla = ["flash-mla; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # NixlConnector's RDMA transport, at the version vLLM pins. The nixl package
 # picks the nixl-cu12 or nixl-cu13 module that matches torch's CUDA.
 nixl = ["nixl==1.3.1; sys_platform == 'linux'"]
@@ -109,6 +112,20 @@ required-version = ">=0.12"    # what wrote the committed lock
 # carries the file's hash. Anything built for another torch minor will not load.
 [tool.uv.sources]
 flash-attn-3 = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn_3-3.0.0%2Bcu130torch2.11gite2743ab-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl" }
+# The commit vLLM builds. FlashMLA has no wheel, and upstream main dropped Hopper,
+# so this is vLLM's fork, which keeps it.
+flash-mla = { git = "https://github.com/vllm-project/FlashMLA", rev = "a8f794d1251cbfd88a5011445dd5582289c727e4" }
+
+# FlashMLA's setup.py imports torch without declaring it.
+[tool.uv.extra-build-dependencies]
+flash-mla = ["torch==2.11.0"]
+
+# Stated here so `uv lock` need not run that setup.py, which also wants nvcc.
+# The version must stay: without one, uv builds the package to find it.
+[[tool.uv.dependency-metadata]]
+name = "flash-mla"
+version = "1.0.0"
+requires-dist = []
 
 [tool.setuptools.packages.find]
 where = ["."]
