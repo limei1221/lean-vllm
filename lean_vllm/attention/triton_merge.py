@@ -1,5 +1,7 @@
-"""vLLM's merge_attn_states in one Triton launch: attention over two disjoint key sets, from each one's output and
-log-sum-exp, written over the first in place or into an output of its own."""
+"""Combine attention outputs and log-sum-exp values in one Triton kernel launch, as in vLLM's merge_attn_states.
+
+The two inputs use the same queries and non-overlapping key sets.
+"""
 
 import torch
 
@@ -31,11 +33,12 @@ else:
         stride_out_h,
         BLOCK_D: tl.constexpr,
     ):
-        """One (token, head): each side weighted by its share of the summed exp(lse), in fp32."""
+        """Merge one token and head per program, using float32 for the weights and output blend."""
         token = tl.program_id(0).to(tl.int64)
         head = tl.program_id(1)
         lse_a = tl.load(lse_a_ptr + token * stride_lse_a_t + head * stride_lse_a_h).to(tl.float32)
         lse_b = tl.load(lse_b_ptr + token * stride_lse_b_t + head * stride_lse_b_h).to(tl.float32)
+        # Subtract the larger log-sum-exp to avoid overflow when computing the weights.
         lse_max = tl.maximum(lse_a, lse_b)
         weight_a = tl.exp(lse_a - lse_max)
         weight_b = tl.exp(lse_b - lse_max)
@@ -56,8 +59,11 @@ def merge_attn_states_(
     lse_b: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> None:
-    """o [tokens, heads, dim] and lse [tokens, heads], any strides but a unit-stride dim. Overwrites out, or else
-    o_a, and lse_a."""
+    """Write the merged output to out (or o_a if out is None) and the merged log-sum-exp to lse_a.
+
+    o_a, o_b, and out have shape [tokens, heads, dim]; lse_a and lse_b have shape [tokens, heads].
+    Token and head strides may vary, but dim must have stride 1 in o_a, o_b and out.
+    """
     num_tokens, num_heads, head_dim = o_a.shape
     out = o_a if out is None else out
     assert o_a.stride(-1) == 1 and o_b.stride(-1) == 1 and out.stride(-1) == 1, "the head dim must be contiguous"

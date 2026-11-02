@@ -17,18 +17,18 @@ try:
 except ImportError as e:  # the cuda extra installs it on Linux
     _IMPORT_ERROR = e
 
-# Scratch for split-KV partial results, shared by every wrapper.
+# Workspace size for split-KV partial results; all wrappers share one buffer.
 WORKSPACE_BYTES = 256 * 1024 * 1024
 
 
 class FlashInferBackend(AttentionBackend):
-    """FlashInfer's paged prefill and decode, planned once per step, with the Triton KV-cache scatter. sm80 and up."""
+    """Run FlashInfer prefill and decode with shared plans and Triton KV-cache writes on sm80 and newer GPUs."""
 
     supported_kinds = ("decoder",)
     _workspace: torch.Tensor | None = None
-    _wrappers: dict[tuple, Any] = {}  # by kernel, layer shape and graph size; each holds one plan at a time
-    _ragged: dict[tuple, list] = {}  # by layer shape: [wrapper, the lengths it is planned for]
-    _graph_pages: tuple[torch.Tensor, ...] | None = None  # the page table full graphs read, sized at the largest
+    _wrappers: dict[tuple, Any] = {}  # keyed by attention configuration and graph size; one current plan per wrapper
+    _ragged: dict[tuple, list] = {}  # keyed by layer configuration: [wrapper, cumulative lengths used by its plan]
+    _graph_pages: tuple[torch.Tensor, ...] | None = None  # shared page-table buffers, sized for the largest full graph
 
     @staticmethod
     def get_name() -> str:
@@ -45,7 +45,7 @@ class FlashInferBackend(AttentionBackend):
 
     @staticmethod
     def supports_cuda_graph() -> bool:
-        return True  # full graphs re-plan decode before each replay; piecewise runs attention eager
+        return True  # full graphs re-plan decode before each replay; piecewise graphs run attention eagerly
 
     @staticmethod
     def split_decodes() -> bool:
@@ -59,7 +59,7 @@ class FlashInferBackend(AttentionBackend):
         triton_cache.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
-        if context.block_tables is None:  # no pages (warmup): k and v hold every key, as FA3's
+        if context.block_tables is None:  # without pages, k and v contain all keys and values (e.g. during warmup)
             return self._planned_ragged(q, k, context).run(q, k, v, out=out)
         layout, pages = _paged_kv(k_cache, v_cache)
         return self._planned("paged", q, k_cache.dtype, context, k_cache.size(1), layout).run(q, pages, out=out)
@@ -70,8 +70,10 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def before_full_graph_replay(cls, context: Context, batch_size: int) -> None:
-        """Re-plan the decode wrappers the graph at batch_size captured, for this step's rows.
-        Their page tables are the graph's buffers, so the replay reads the new plan."""
+        """Re-plan the decode wrappers captured for batch_size using this step's sequence lengths and pages.
+
+        Planning updates the fixed page-table buffers that the graph reads during replay.
+        """
         pages = {}
         for key, wrapper in cls._wrappers.items():
             if key[0] == "decode" and key[-1] == batch_size:
@@ -81,7 +83,7 @@ class FlashInferBackend(AttentionBackend):
                 _plan_decode(wrapper, key, pages[page_size])
 
     def _planned_ragged(self, q: torch.Tensor, k: torch.Tensor, context: Context):
-        """A causal ragged wrapper per layer shape, re-planned only when this step's lengths differ from its plan's."""
+        """Return a cached causal ragged wrapper, re-planning when the cumulative query or key lengths change."""
         cu_q = _host_cumulative(context.cu_seqlens_q_host, context.cu_seqlens_q)
         cu_k = _host_cumulative(context.cu_seqlens_k_host, context.cu_seqlens_k)
         shape = (self.num_heads, self.num_kv_heads, self.head_dim, self.scale, q.dtype, k.dtype)
@@ -109,7 +111,7 @@ class FlashInferBackend(AttentionBackend):
     def _planned(
         self, kind: str, q: torch.Tensor, kv_dtype: torch.dtype, context: Context, page_size: int, layout: str
     ):
-        """This step's wrapper for kind, planned by the first layer to ask and reused by every layer alike."""
+        """Return the wrapper for kind, planning once per context and sharing it across layers with the same key."""
         graph_size = context.full_graph_size if kind == "decode" else None
         key = (
             kind,
@@ -148,16 +150,17 @@ class FlashInferBackend(AttentionBackend):
 
     def _make_wrapper(self, kind: str, device: torch.device, context: Context, layout: str, graph_size: int | None):
         workspace = self._workspace_for(device)
-        if kind == "paged":
+        if kind == "paged":  # prefill with paged KV
             return BatchPrefillWithPagedKVCacheWrapper(workspace, layout)
-        # Wide query groups decode on tensor cores; the CUDA-core kernel takes few group sizes.
+        # Use tensor cores for more than 4 query heads per KV head; the CUDA-core kernel supports few group sizes.
         use_tensor_cores = self.num_heads // self.num_kv_heads > 4
         if graph_size is None:
             return BatchDecodeWithPagedKVCacheWrapper(workspace, layout, use_tensor_cores=use_tensor_cores)
-        # One per captured batch size, over slices of one fixed page table.
+        # Each captured batch size gets a wrapper backed by the shared page-table buffers.
         if FlashInferBackend._graph_pages is None:
             assert context.block_tables is not None
-            rows, width = context.block_tables.shape  # graphs capture largest first, so this bounds the rest
+            # The largest graph is captured first, so these buffers fit all captured batch sizes.
+            rows, width = context.block_tables.shape
             FlashInferBackend._graph_pages = (
                 torch.zeros(rows + 1, dtype=torch.int32, device=device),
                 torch.zeros(rows * width, dtype=torch.int32, device=device),
@@ -177,8 +180,11 @@ class FlashInferBackend(AttentionBackend):
 
     @staticmethod
     def _pages(context: Context, page_size: int, num_rows: int | None = None) -> tuple[torch.Tensor, ...]:
-        """FlashInfer's page table: indptr and last-page lengths on the host, each row's used pages packed on the device.
-        num_rows pads it to a graph's batch size with rows of no pages."""
+        """Return page offsets (indptr), packed page indices, and the number of tokens in each row's last page.
+
+        Offsets and last-page lengths are on the host; indices are on the same device as context.block_tables.
+        When num_rows is given, pad to that many rows with empty page ranges for graph replay.
+        """
         cu_k = _host_cumulative(context.cu_seqlens_k_host, context.cu_seqlens_k, context.context_lens)
         kv_lens = cu_k[1:] - cu_k[:-1]
         num_pages = (kv_lens + page_size - 1) // page_size
@@ -191,7 +197,7 @@ class FlashInferBackend(AttentionBackend):
         flat = (rows * block_tables.size(1) + pages).to(block_tables.device, non_blocking=True)
         indices = block_tables.flatten()[flat]
         last_page_len = kv_lens - (num_pages - 1) * page_size
-        if num_rows is not None:  # a last length of 1, though an empty row reads none
+        if num_rows is not None:  # padded rows have no page indices and use 1 as a placeholder last-page length
             pad = num_rows - kv_lens.numel()
             indptr = torch.cat([indptr, indptr[-1:].expand(pad)])
             last_page_len = torch.cat([last_page_len, last_page_len.new_ones(pad)])
@@ -199,7 +205,7 @@ class FlashInferBackend(AttentionBackend):
 
 
 def _plan_decode(wrapper, key: tuple, pages: tuple[torch.Tensor, ...]) -> None:
-    """Plan a decode wrapper from its key alone, so a replay hook re-plans with no layer at hand."""
+    """Plan a decode wrapper using its cached configuration and page table, without needing a layer instance."""
     _, num_heads, num_kv_heads, head_dim, scale, q_dtype, kv_dtype, page_size, _, _ = key
     wrapper.plan(
         *pages, num_heads, num_kv_heads, head_dim, page_size, sm_scale=scale, q_data_type=q_dtype, kv_data_type=kv_dtype
@@ -207,16 +213,19 @@ def _plan_decode(wrapper, key: tuple, pages: tuple[torch.Tensor, ...]) -> None:
 
 
 def _paged_kv(k_cache: torch.Tensor, v_cache: torch.Tensor) -> tuple[str, tuple[torch.Tensor, torch.Tensor]]:
-    """The caches as FlashInfer takes them: an HND cache, bound as a transposed view, goes back to its own layout."""
-    if k_cache.stride(1) < k_cache.stride(2):  # tokens closer than heads: (block, head, token, dim) underneath
+    """Return the layout name and cache views FlashInfer expects, restoring HND axis order when needed."""
+    if k_cache.stride(1) < k_cache.stride(2):  # HND storage: tokens have a smaller stride than heads
         return "HND", (k_cache.transpose(1, 2), v_cache.transpose(1, 2))
     return "NHD", (k_cache, v_cache)
 
 
 def _host_cumulative(host: list[int] | None, device: torch.Tensor | None, lens: torch.Tensor | None = None):
-    """Cumulative lengths as a host int32 tensor. A hand-built context may lack the host copy, so read the device."""
+    """Return cumulative lengths as a CPU int32 tensor, using host values when available.
+
+    Otherwise, copy device values to the host, first computing cumulative lengths from lens if needed.
+    """
     if host is None:
-        if device is None:  # a decode context carries its lengths alone
+        if device is None:  # cumulative lengths are missing; use the per-sequence lengths
             assert lens is not None
             device = torch.nn.functional.pad(lens.cumsum(0), (1, 0))
         host = device.tolist()

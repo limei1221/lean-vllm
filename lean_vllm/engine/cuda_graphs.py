@@ -34,8 +34,8 @@ def full_graph_buffers(
 ) -> dict[str, torch.Tensor]:
     """A full decode graph's inputs and output, for up to max_bs rows of query_len tokens each.
 
-    Key lengths start at max_model_len, so FlashMLA sizes the tile schedule and split-KV workspace it captures for the
-    longest row."""
+    Key lengths start at max_model_len. Nothing captured is sized by them: FlashMLA rebuilds its schedule in the graph
+    from the lengths each replay copies in."""
     num_tokens = max_bs * query_len
     return dict(
         input_ids=torch.zeros(num_tokens, dtype=torch.int64, device=device),

@@ -29,7 +29,7 @@ else:
         offsets = tl.arange(0, D)
         key = tl.load(key_ptr + idx * key_stride + offsets)
         value = tl.load(value_ptr + idx * value_stride + offsets)
-        # The cache's own strides, so an NHD and an HND cache take the same kernel.
+        # Use the cache strides to support both NHD storage and a transposed view of HND storage.
         block, token = slot // block_size, slot % block_size
         head, dim = offsets // HEAD_DIM, offsets % HEAD_DIM
         cache_offsets = block * block_stride + token * token_stride + head * head_stride + dim
@@ -50,14 +50,17 @@ else:
         if slot == -1:
             return
         offsets = tl.arange(0, BLOCK)
-        mask = offsets < D  # a latent is 576 wide for V2-Lite, so the block overhangs it
+        mask = offsets < D  # skip padding when D is smaller than the power-of-two block
         latent = tl.load(latent_ptr + idx * latent_stride + offsets, mask=mask)
         tl.store(cache_ptr + slot * D + offsets, latent, mask=mask)
 
 
 def store_kvcache(key, value, k_cache, v_cache, slot_mapping) -> None:
-    """Scatter keys/values [num_tokens, heads, dim] into [num_blocks, block_size, heads, dim] caches, by their strides,
-    so an HND cache's transposed view takes it too. Slot -1 skips."""
+    """Write keys and values [num_tokens, heads, dim] into caches at the slots given by slot_mapping.
+
+    Caches have shape [num_blocks, block_size, heads, dim]. Use their strides to support both NHD storage
+    and HND storage viewed with the token and head axes transposed. Skip tokens whose slot_mapping entry is -1.
+    """
     num_tokens, num_heads, head_dim = key.shape
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
@@ -82,7 +85,10 @@ def store_kvcache(key, value, k_cache, v_cache, slot_mapping) -> None:
 
 
 def store_latents(latent, latent_cache, slot_mapping) -> None:
-    """Scatter latents [num_tokens, dim] into a [num_blocks, block_size, dim] cache. Slot -1 skips."""
+    """Write latents [num_tokens, dim] into a contiguous cache of shape [num_blocks, block_size, dim].
+
+    slot_mapping gives each token's slot across all blocks. Skip tokens whose slot_mapping entry is -1.
+    """
     num_tokens, dim = latent.shape
     assert latent.stride(-1) == 1 and latent_cache.stride(-2) == dim
     assert slot_mapping.numel() == num_tokens

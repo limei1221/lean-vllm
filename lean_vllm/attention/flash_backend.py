@@ -16,11 +16,11 @@ except ImportError as e:  # Hopper only, and built by the cuda extra
 class FlashAttention3Backend(AttentionBackend):
     """FlashAttention-3 kernels with a Triton KV-cache scatter. Hopper only.
 
-    Paged calls take a tile schedule made once per step (vLLM's AOT schedule).
+    Paged calls share a tile schedule across layers with the same configuration within a step.
     """
 
-    _graph_problems: dict[tuple, dict] = {}  # a full graph's decode schedule, by key: how to remake it before replay
-    _graph_schedules: dict[tuple, torch.Tensor] = {}  # what full graphs read their schedule from, per layer shape
+    _graph_problems: dict[tuple, dict] = {}  # arguments used to rebuild each full graph's decode schedule
+    _graph_schedules: dict[tuple, torch.Tensor] = {}  # schedule buffers shared across batch sizes, per layer config
 
     @staticmethod
     def get_name() -> str:
@@ -51,9 +51,9 @@ class FlashAttention3Backend(AttentionBackend):
         triton_cache.store_latents(latent, latent_cache, slot_mapping)
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
-        # FA3's entry points take no out, so one given is copied into.
+        # FA3 takes no out, so copy its result into out when one is given.
         if context.block_tables is None:
-            # No pages (warmup, or MLA's new tokens): k and v hold every key.
+            # Without a page table, k and v contain all keys and values needed for attention.
             o = flash_attn_varlen_func(
                 q,
                 k,
@@ -66,7 +66,8 @@ class FlashAttention3Backend(AttentionBackend):
                 causal=True,
             )
             return write_into(out, o)
-        # Keys come from the pages, cold rows too; FA3's varlen entry takes no page table.
+        # Read keys and values from the paged cache, including sequences with no cached prefix.
+        # FA3's varlen entry takes no page table, so this goes through flash_attn_with_kvcache.
         assert context.cu_seqlens_k is not None
         cache_seqlens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
         o = self._paged(
@@ -115,7 +116,10 @@ class FlashAttention3Backend(AttentionBackend):
         cu_seqlens_q=None,
         max_seqlen_q=None,
     ):
-        """FA3 over the pages, q batched or packed by cu_seqlens_q, on the step's schedule for this problem."""
+        """Run FA3 on the paged cache using the schedule shared by matching layers in this step.
+
+        q is batched when cu_seqlens_q is None; otherwise, it contains packed variable-length sequences.
+        """
         schedule = self._schedule(
             kind, q, k_cache, v_cache, context, cache_seqlens, page_table, cu_seqlens_q, max_seqlen_q
         )
@@ -144,16 +148,18 @@ class FlashAttention3Backend(AttentionBackend):
         cu_seqlens_q,
         max_seqlen_q,
     ) -> torch.Tensor:
-        """FA3's tile schedule for one problem, made by the step's first layer to pose it so the rest skip the
-        in-kernel pass. A full graph reads it from a buffer refilled before each replay."""
-        page_size = k_cache.size(1)
+        """Build a tile schedule on first use and reuse it for matching layers in this step.
+
+        Full CUDA graphs read the schedule from a shared buffer updated before each replay.
+        """
+        page_size = k_cache.size(1)  # k_cache/v_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         shape = (self.num_heads, self.num_kv_heads, self.head_dim, v_cache.size(-1), q.dtype, page_size)
         key = ("fa3", kind, *shape, context.full_graph_size)  # the step cache holds other backends' plans too
         cache = context.attn_metadata
         if key in cache:
             return cache[key]
         varlen = cu_seqlens_q is not None
-        # Every argument the kernel derives its split count from must match, or it reads a schedule for another.
+        # The kernel re-derives its split count from these; any mismatch makes it misread the schedule.
         problem = dict(
             batch_size=cu_seqlens_q.numel() - 1 if varlen else q.size(0),
             max_seqlen_q=max_seqlen_q if varlen else q.size(1),
@@ -168,7 +174,9 @@ class FlashAttention3Backend(AttentionBackend):
             causal=True,
         )
         schedule = get_scheduler_metadata(cache_seqlens=cache_seqlens, **problem)
-        if context.full_graph_size is not None:  # the capture's warmup; the capture finds it here
+        # Graph warmup or capture. The runner's capture reuses warmup's schedule from the shared context; the MTP
+        # drafter's fresh context recomputes it during capture.
+        if context.full_graph_size is not None:
             assert not varlen, "a full graph holds decode only"
             FlashAttention3Backend._graph_problems[key] = problem
             schedule = _into_graph_schedule(key, schedule)
@@ -177,21 +185,23 @@ class FlashAttention3Backend(AttentionBackend):
 
     @classmethod
     def before_full_graph_replay(cls, context: Context, batch_size: int) -> None:
-        """Remake the schedule each full graph at batch_size reads, for this step's lengths
-        before every replay."""
+        """Refresh schedules for graphs captured at batch_size using this step's sequence lengths."""
         lens = None
         for key, problem in FlashAttention3Backend._graph_problems.items():
             if key[-1] != batch_size:
                 continue
-            if lens is None:  # the graph's rows past the step's hold no keys
+            if lens is None:  # pad unused graph rows with zero key lengths
                 assert context.context_lens is not None
                 lens = F.pad(context.context_lens, (0, batch_size - context.context_lens.numel()))
             _into_graph_schedule(key, get_scheduler_metadata(cache_seqlens=lens, **problem))
 
 
 def _into_graph_schedule(key: tuple, schedule: torch.Tensor) -> torch.Tensor:
-    """schedule copied into the buffer full graphs read, its tail zeroed, since a stale tail misdirects
-    thread blocks. One buffer per layer shape, sized by the first capture, which is the largest batch."""
+    """Copy schedule into the shared graph buffer and return a view of the copied entries.
+
+    Zero the unused tail, since stale entries misdirect thread blocks. Graphs with the same layer configuration
+    share a buffer across batch sizes; capture the largest batch first to allocate enough space.
+    """
     buffers = FlashAttention3Backend._graph_schedules
     shape = key[:-1]
     if shape not in buffers:

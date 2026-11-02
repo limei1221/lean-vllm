@@ -12,7 +12,7 @@ except ImportError as e:  # the flashmla extra builds it on Linux x86_64
 
 
 class FlashMLABackend(FlashAttention3Backend):
-    """FlashMLA's dense decode over MLA latents, and FlashAttention-3 for everything else. Hopper only."""
+    """Use FlashMLA for decode over cached MLA latents and FlashAttention-3 for prefill. Hopper only."""
 
     supported_kinds = ("mla",)
 
@@ -22,12 +22,12 @@ class FlashMLABackend(FlashAttention3Backend):
 
     @staticmethod
     def is_available() -> bool:
-        # sm90 only, as FA3 is.
+        # FA3's availability check also enforces the Hopper (sm90) requirement.
         return _IMPORT_ERROR is None and FlashAttention3Backend.is_available()
 
     @classmethod
     def validate(cls, spec: LayerSpec) -> list[str]:
-        reasons = super().validate(spec)  # FA3's, which runs the expanded prefill
+        reasons = super().validate(spec)  # prefill uses FA3 with expanded keys and values
         if spec.latent_dim and spec.latent_dim != 576:
             reasons.append(f"latent width {spec.latent_dim} is not the 512 + 64 FlashMLA decodes")
         return reasons
@@ -38,11 +38,8 @@ class FlashMLABackend(FlashAttention3Backend):
 
     @staticmethod
     def supports_full_cudagraph_mla_decode() -> bool:
-        # flash_mla_with_kvcache builds a tile schedule and split-KV workspace from context_lens inside the
-        # kernel (this build fuses the old get_mla_metadata into dense_decode_fwd). The full graph is captured
-        # with worst-case context_lens (max_model_len), so the baked schedule and workspace are sized for the
-        # longest sequence; the kernel gates its KV loop on the context_lens each replay refreshes, so a replay
-        # with shorter, different lengths stays in bounds.
+        # The first call's schedule kernel reads context_lens on the GPU. Capture starts with a fresh holder, so
+        # each replay rebuilds the schedule from the lengths the runner copied in, and later layers reuse it.
         return True
 
     @staticmethod
@@ -51,13 +48,13 @@ class FlashMLABackend(FlashAttention3Backend):
 
     def mla_decode(self, q, latent_cache, v_dim, context: Context) -> torch.Tensor:
         if context.mla_decode_metadata is None:
-            # A holder the kernel fills with the schedule on the first layer's call; the rest reuse it.
+            # Create an empty metadata holder; the first decode call fills it, and later layers reuse it.
             context.mla_decode_metadata, _ = get_mla_metadata()
         assert context.context_lens is not None
         batch_size = context.context_lens.size(0)
         o, _ = flash_mla_with_kvcache(
-            q.view(batch_size, -1, *q.shape[1:]),  # [B, Lq, H, D]: Lq queries per row, causal
-            latent_cache.unsqueeze(-2),  # add a head dim of 1
+            q.view(batch_size, -1, *q.shape[1:]),  # [batch, queries per sequence, heads, latent_dim]
+            latent_cache.unsqueeze(-2),  # add a single KV head shared by all query heads
             context.block_tables,
             context.context_lens,
             v_dim,
