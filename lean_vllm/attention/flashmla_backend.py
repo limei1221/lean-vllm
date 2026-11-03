@@ -26,8 +26,8 @@ class FlashMLABackend(FlashAttention3Backend):
         return _IMPORT_ERROR is None and FlashAttention3Backend.is_available()
 
     @classmethod
-    def validate(cls, spec: LayerSpec) -> list[str]:
-        reasons = super().validate(spec)  # prefill uses FA3 with expanded keys and values
+    def validate_configuration(cls, spec: LayerSpec) -> list[str]:
+        reasons = super().validate_configuration(spec)  # prefill uses FA3 with expanded keys and values
         if spec.latent_dim and spec.latent_dim != 576:
             reasons.append(f"latent width {spec.latent_dim} is not the 512 + 64 FlashMLA decodes")
         return reasons

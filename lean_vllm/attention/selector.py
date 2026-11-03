@@ -47,4 +47,4 @@ def get_attention_backend(spec: LayerSpec, name: str | None = None) -> type[Atte
 def _unsupported(backend: type[AttentionBackend], spec: LayerSpec) -> list[str]:
     if not backend.is_available():
         return ["not available on this machine"]
-    return backend.validate(spec)
+    return backend.validate_configuration(spec)

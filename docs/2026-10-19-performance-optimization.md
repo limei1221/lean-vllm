@@ -30,7 +30,7 @@
 | Qwen3-8B steps above the 512-token graph range account for about 45% of recorded step time at load 48. | Investigate prefill budgets and graph coverage together. |
 | The current Qwen trace recorded no prefix-cache hits. | It cannot evaluate improvements to cache reuse. |
 
-Async scheduling, prefix caching, chunked prefill, compiled execution, and CUDA graphs already exist. Their presence alone is not a new optimization opportunity.
+Async scheduling, prefix caching, chunked prefill, compiled execution, and CUDA graphs already exist.
 
 ## 1. Establish a repeatable baseline
 

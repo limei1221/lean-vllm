@@ -44,7 +44,7 @@ def _cases():
     cases = []
     for backend_cls in BACKENDS:
         spec = LayerSpec(HEAD_DIM, NUM_HEADS, NUM_KV_HEADS, DTYPE[backend_cls.get_name()])
-        if not backend_cls.is_available() or backend_cls.validate(spec):
+        if not backend_cls.is_available() or backend_cls.validate_configuration(spec):
             continue
         if backend_cls.get_name() == "torch":
             devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])

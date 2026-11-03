@@ -51,10 +51,10 @@ a plain `decoder` layer, or `mla` when it caches latents. Then:
 1. the name passed to `get_attention_backend()`, if any;
 2. otherwise `LEAN_VLLM_ATTENTION_BACKEND`;
 3. otherwise the first backend, in the order `flashmla`, `flash_attn_3`,
-   `flashinfer`, `torch`, that is available and whose `validate(spec)` returns
-   no reason against the layer.
+   `flashinfer`, `torch`, that is available and whose
+   `validate_configuration(spec)` returns no reason against the layer.
 
-`validate` is vLLM's `validate_configuration`: it checks `supported_dtypes`,
+`validate_configuration`, named after vLLM's, checks `supported_dtypes`,
 `supports_head_size`, that query heads group evenly over key heads, and
 `supported_kinds`, and a backend can add its own checks (`flashmla` requires
 576-wide latents). So an fp32 layer takes `torch` even on an H100, an MLA layer
@@ -122,25 +122,9 @@ any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
 | FA3: one schedule per problem per step; full-graph schedules refilled before replay | CPU, with a fake kernel that does the arithmetic | Pass; never run on an H100 |
 
 The reference is `dense_attention` in `tests/test_attention_backends.py`: the
-textbook formula, looped over heads, with no SDPA and no paging, so agreeing with
-it means something. Tests are parametrized over the backends available on the
-machine, so the same file runs on a laptop and on a GPU box.
-
-The suite was mutation-tested: each backend was broken on purpose and the tests
-were run again.
-
-| Mutation | Outcome |
-|---|---|
-| Top-left causal alignment | Caught |
-| Ignore `-1` slots in `store_kvcache` | Caught |
-| Off-by-one in the page gather | Caught |
-| Swap the k and v caches in the gather | Caught |
-| Decode reads the wrong query row | Caught |
-| Drop the `scale` argument | Survived at first, since the tests used SDPA's default scale; fixed with a non-default scale |
-| `repeat` instead of `repeat_interleave` for GQA | Survived at first, since that path is dead on torch ≥ 2.5; fixed by forcing it in the test |
-| Offset the prefill side's key lengths by the query count | Caught |
-| Stop putting one-query rows first | Caught |
-| Run the prefill side over the whole step's context | Caught |
+textbook formula, looped over heads, with no SDPA and no paging. Tests are
+parametrized over the backends available on the machine, so the same file runs
+on a laptop and on a GPU box.
 
 ## How it works
 
@@ -152,7 +136,7 @@ were run again.
 | `prefill` | Yes | Attends packed variable-length rows, reading cached keys when a row resumes |
 | `decode` | Yes | One query per row against the paged cache; the path CUDA graphs capture |
 | `forward` | Has a default | One step: decode for a pure-decode step, else prefill, or both halves when the backend splits |
-| `validate` | Has a default | Why the backend cannot serve a `LayerSpec`; empty if it can |
+| `validate_configuration` | Has a default | Why the backend cannot serve a `LayerSpec`; empty if it can |
 | `get_kv_cache_shape` | Has a default | The cache layout, which is the backend's choice |
 | `varlen_with_lse` | For MLA layers | Attention over given keys, no cache, also returning the log-sum-exp |
 | `mla_decode`, `store_latents` | Optional | MLA decode over latents, and the latent cache's scatter |
@@ -189,23 +173,17 @@ shapes.
 | `mla_decode` returns | `[batch_size * queries, num_heads, v_dim]` |
 | `store_latents` latent | `[num_tokens, latent_dim]`, slot `-1` skips |
 
-A slot of `-1` marks a row that a CUDA graph padded, and both store methods skip
-it. FA3 returns its lse as `[num_heads, num_tokens]` and a singleton query axis
-in decode, so the flash backend transposes and squeezes to match.
-
 ### Causal masking is bottom-right aligned
 
 Under chunked prefill or prefix caching a row has fewer queries than keys, and
 its queries are the *last* `lq` of its `lk` keys. Query `j` (0-indexed) attends
-keys `0, …, lk - lq + j`.
+keys `0, ..., lk - lq + j`.
 
 `scaled_dot_product_attention(is_causal=True)` aligns top-left instead, and
 when `lq != lk` it silently returns a plausible but wrong answer. So
 `TorchAttention` builds the mask from absolute positions and never passes
 `is_causal`. FlashAttention has aligned bottom-right since 2.1, so the two
-agree. `test_top_left_causal_alignment_would_be_wrong` checks both that the
-backend matches the reference and that the top-left answer differs, so the test
-cannot quietly stop telling them apart.
+agree.
 
 ### Mixed batches, and the split into decode and prefill
 
@@ -250,9 +228,6 @@ As vLLM's V1, a prefill reads every key from the pages, cold rows included:
 `flash_attn_with_kvcache` with `page_table`. FA3's `flash_attn_varlen_func`
 takes no page table, so it serves only calls with no pages: warmup, before the
 cache exists, and MLA's new tokens.
-
-V0 skipped the pages when no row resumed from cached keys; V1 dropped that
-second path, and so does this backend.
 
 FA3 reads pages of any size, which is what made 16 tokens the default block
 size. FA2 required multiples of 256.
@@ -326,8 +301,7 @@ The padding and the gathered copy cost memory traffic that grows with batch
 size and context length, and a step that mixes long chunks with decode rows
 spends compute on padding. Each key head's query heads fold into its query axis
 rather than going through `enable_gqa`. The backend still reports no CUDA graph
-support. That is the right trade for a reference and for laptop development, and
-the wrong one for speed.
+support.
 
 ## Next steps
 

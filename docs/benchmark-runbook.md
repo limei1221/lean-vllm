@@ -19,8 +19,8 @@ graph modes) before trusting any timing. Section 0 gates on that. Use the same B
 
 ## 0. Validate correctness first
 
-A fast curve over wrong numbers is worthless. Before benchmarking, check that
-the GPU paths agree with their references on this machine:
+Before benchmarking, check that the GPU paths agree with their references on
+this machine:
 
 ```bash
 uv run pytest tests/test_attention_backends.py -k mla -v      # FlashMLA decode vs the fp32 oracle

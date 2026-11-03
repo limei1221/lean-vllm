@@ -29,7 +29,7 @@ def write_into(out: torch.Tensor | None, o: torch.Tensor) -> torch.Tensor:
 class AttentionBackend(ABC):
     """Execution strategy for one attention layer. See docs/attention-backends.md."""
 
-    # Supported dtypes and layer kinds, checked by validate.
+    # Supported dtypes and layer kinds, checked by validate_configuration.
     supported_dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
     supported_kinds: tuple[str, ...] = ("decoder", "mla")
 
@@ -73,7 +73,7 @@ class AttentionBackend(ABC):
         return True
 
     @classmethod
-    def validate(cls, spec: LayerSpec) -> list[str]:
+    def validate_configuration(cls, spec: LayerSpec) -> list[str]:
         """Return reasons the layer's configuration is unsupported, or an empty list if it is supported."""
         reasons = []
         if spec.dtype not in cls.supported_dtypes:
