@@ -37,19 +37,19 @@ def reset_peak_memory_stats(device: torch.device) -> None:
 
 
 def make_tensor(data, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    # pinned staging only pays off, and only exists, on cuda
+    # Stage through pinned memory for a nonblocking copy; pinning only exists on CUDA.
     if device.type == "cuda":
         return torch.tensor(data, dtype=dtype, pin_memory=True).cuda(non_blocking=True)
     return torch.tensor(data, dtype=dtype, device=device)
 
 
 def kvcache_bytes(device: torch.device, config) -> int:
-    """Bytes to spend on the KV cache, measured after warmup so its peak activations are set aside."""
+    """Return the KV cache budget in bytes. Call after warmup so its peak activations are set aside."""
     if device.type == "cuda":
         free, total = torch.cuda.mem_get_info()
         used = total - free
         stats = torch.cuda.memory_stats()
         peak, current = stats["allocated_bytes.all.peak"], stats["allocated_bytes.all.current"]
         return int(total * config.gpu_memory_utilization) - used - peak + current
-    # cpu shares memory with the OS, so take an explicit budget instead
+    # CPU memory is shared with the OS, so use an explicit budget instead.
     return int(config.kvcache_memory_gb * 2**30)

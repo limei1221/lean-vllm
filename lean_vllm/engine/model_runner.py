@@ -71,10 +71,7 @@ def decode_query_len(lens: np.ndarray, num_speculative_tokens: int) -> int:
 
 @dataclass(slots=True)
 class InFlightDrafts:
-    """Sampled tokens, drafts, and rejection counts left on the device for the next step, indexed by sampling row.
-
-    Related vLLM state: prev_sampled_token_ids, _draft_token_ids, and valid_sampled_token_count.
-    """
+    """Sampled tokens, drafts, and rejection counts left on the device for the next step, indexed by sampling row."""
 
     next_token_ids: torch.Tensor  # each row's next token, after any accepted drafts
     draft_token_ids: torch.Tensor  # [rows, num_speculative_tokens], for the next step to verify
@@ -84,7 +81,7 @@ class InFlightDrafts:
 class ModelRunner:
     proposer: MTPProposer | None = None  # set when speculative decoding is enabled
     num_speculative_tokens = 0
-    graph_query_len = 1  # queries per row in a full decode graph: 1, or 1 + drafts when verifying
+    graph_query_len = 1  # input tokens per row in a full decode graph: one current token plus any drafts
     in_flight_drafts: InFlightDrafts | None = None  # speculative outputs from the last launched step
     decodes_latents = True  # whether every MLA backend can run decode attention on cached latents
 
@@ -131,7 +128,8 @@ class ModelRunner:
         if rank == 0:
             counts = Counter(layer.backend.get_name() for layer in layers)
             logger.info("attention backends: %s", ", ".join(f"{name} ({n} layers)" for name, n in counts.items()))
-        self.attention_backends = list(dict.fromkeys(type(layer.backend) for layer in layers))  # replay hooks
+        # Keep each backend class once so its hook runs only once per full graph replay.
+        self.attention_backends = list(dict.fromkeys(type(layer.backend) for layer in layers))
         self.decodes_latents = all(
             layer.backend.supports_mla_decode() for layer in layers if isinstance(layer, MLAAttention)
         )
@@ -250,7 +248,7 @@ class ModelRunner:
         top_p = torch.full((num_rows,), 0.9, dtype=torch.float32)
         try:
             if self.proposer is None:
-                self.sampler(logits, temperatures)  # compiles the untruncated variant too
+                self.sampler(logits, temperatures)  # also compile sampling without top-k or top-p filtering
                 self.sampler(logits, temperatures, top_k, top_p)
             else:
                 num_draft_tokens = torch.full((num_rows,), self.num_speculative_tokens, dtype=torch.int64)
@@ -356,8 +354,8 @@ class ModelRunner:
         """Build input tensors and attention context for a batch of prompt chunks, decode rows, or both.
 
         As in vLLM's _prepare_inputs, collect sequence data on the host and use NumPy for per-token calculations.
-        On CUDA, copy host inputs through reusable pinned buffers to device buffers. Fill pending tokens
-        and drafts from the previous step's device tensors.
+        On CUDA, copy host inputs through reusable pinned buffers to device buffers. Replace pending token
+        and draft placeholders with values from the previous step's device tensors.
         """
         buffers = self.input_buffers
         buffers.begin()
@@ -380,8 +378,8 @@ class ModelRunner:
         lens, starts = lens[order], starts[order]  # in batch order
         # Sample only rows whose scheduled chunk reaches the end of their planned tokens.
         sampling = np.flatnonzero(starts[row_of] + lens[row_of] >= planned)  # in scheduler order
-        # Initially place pending rows as if the previous step accepted every draft.
-        # Correct their positions on the device unless attention planning needs exact host lengths.
+        # Initially compute positions for pending rows as if the previous step accepted every draft.
+        # Subtract rejected draft counts on the device unless attention planning needs exact lengths on the host.
         in_flight = self.in_flight_drafts
         moved = [i for i, seq in enumerate(batch) if seq.num_pending_tokens] if in_flight is not None else []
         moved_src = [self._prev_row(batch[i]) for i in moved]
@@ -462,7 +460,7 @@ class ModelRunner:
             slot_mapping=buffers.put("slot_mapping", [] if slot_mapping is None else slot_mapping, torch.int32),
             context_lens=buffers.put("context_lens", ends, torch.int32),
             block_tables=block_tables,
-            # A pure-decode batch uses every token row for sampling, so skip the logits gather.
+            # Pure decode needs logits for every input token, so skip selecting individual hidden-state rows.
             logits_indices=buffers.put("logits_indices", logits_indices, torch.int64) if is_prefill else None,
             decode_query_len=query_len,
         )
@@ -470,7 +468,8 @@ class ModelRunner:
         positions_t = buffers.put("positions", positions, torch.int64)
         all_greedy = all(temperature == 0 for temperature in row_temperatures)
         temperatures = None if all_greedy else buffers.put("temperatures", row_temperatures, torch.float32)
-        # Pass both top_k and top_p or neither. They share one sort and avoid top-k-only and top-p-only variants.
+        # Pass both top_k and top_p or neither. The filters share one sort; passing both avoids compiling
+        # separate top-k-only and top-p-only sampler variants.
         top_k = top_p = None
         if any(seq.top_k > 0 or seq.top_p < 1 for seq in sampling_rows):
             top_k = buffers.put("top_k", [seq.top_k for seq in sampling_rows], torch.int64)
@@ -542,8 +541,9 @@ class ModelRunner:
     ):
         """Adjust pending rows for drafts rejected by the previous step.
 
-        Update positions, cache slots, and key lengths on the device, as in vLLM's
-        update_num_computed_tokens_for_batch_change. Host lengths stay unchanged and remain upper bounds.
+        Subtract rejected draft counts from token positions and context lengths, then recompute cumulative
+        key lengths and cache slots on the device, as in vLLM's update_num_computed_tokens_for_batch_change.
+        Host lengths stay unchanged and remain upper bounds.
         """
         back = torch.zeros(len(context["context_lens"]), dtype=torch.int64, device=positions.device)
         rejected = in_flight.num_rejected.index_select(0, buffers.put("moved_src", moved_src, torch.int64))
@@ -606,7 +606,7 @@ class ModelRunner:
         )
 
     def _piecewise_bucket(self, num_tokens: int) -> int | None:
-        """Return the smallest fitting piecewise bucket, or None for sizes outside the captured range."""
+        """Return the smallest captured bucket that fits, or None below the smallest or above the largest."""
         bucket = smallest_fitting(self.piecewise_bs, num_tokens)
         return None if bucket is None or num_tokens < self.piecewise_bs[0] else bucket
 
@@ -687,7 +687,7 @@ class ModelRunner:
                 full_graph_size=bs,
             ) as context:
                 run = partial(self._full_graph_pass, context, bs * q)
-                run()  # warmup, which also plans FlashInfer
+                run()  # warm up the model and create FlashInfer plans if that backend is in use
                 # Clear the MLA schedule created during warmup so capture allocates it in the graph's pool.
                 # Otherwise the graph could keep pointers to freed memory.
                 context.mla_decode_metadata = None

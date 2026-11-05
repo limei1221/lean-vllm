@@ -1,6 +1,7 @@
 """Split the traced model at attention ops and compile the remaining pieces with Inductor.
 
-Each compiled piece captures one CUDA graph per token-count bucket. Attention runs eagerly between pieces.
+When piecewise_size is set, each compiled piece captures or replays a CUDA graph for that token-count bucket.
+Attention runs eagerly between pieces, outside the graphs.
 """
 
 from collections.abc import Callable
@@ -20,7 +21,7 @@ SPLITTING_OPS = ("lean_vllm.attention", "lean_vllm.mla_attention")
 
 
 def split_at_attention(gm: fx.GraphModule) -> tuple[fx.GraphModule, set[str]]:
-    """Put each attention op in its own submodule and group intervening nodes into separate pieces."""
+    """Put each attention op in its own submodule and group the nodes between attention ops into pieces."""
     part, attention, index = {}, set(), 0
     for node in gm.graph.nodes:
         if node.op in ("placeholder", "output"):
@@ -35,7 +36,7 @@ def split_at_attention(gm: fx.GraphModule) -> tuple[fx.GraphModule, set[str]]:
 
 
 def weak_ref(value: Any) -> Any:
-    """Return tensor views that share memory without keeping it alive; recurse through lists and tuples."""
+    """Return tensor views that share memory without owning it, recursing through lists and tuples."""
     if isinstance(value, (list, tuple)):
         return type(value)(weak_ref(item) for item in value)
     if not isinstance(value, torch.Tensor):
@@ -65,7 +66,7 @@ class Piece:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, self.pool):
             output = self.compiled(*args)
-        # Cache views without keeping output memory alive, so the pool can reuse it once later pieces read it.
+        # Cached views do not own the output memory, so they do not prevent the graph pool from reusing it.
         self.graphs[size] = graph, weak_ref(output)
         return output
 
@@ -88,7 +89,7 @@ class _CompilePieces(fx.Interpreter):
 
 
 class PiecewiseBackend:
-    """The torch.compile backend: split and compile the traced graph, keeping pieces to clear on exit."""
+    """Split and compile the traced graph for torch.compile. Keep pieces so callers can clear their CUDA graphs."""
 
     def __init__(self, pool=None):
         self.pool = pool
@@ -103,14 +104,14 @@ class PiecewiseBackend:
         compiler = _CompilePieces(split, attention, self.pool)
         with fake_mode, enable_python_dispatcher():
             compiler.run(*fake_inputs)
-        self.pieces += compiler.pieces  # only once compilation finishes, so a restarted trace leaves none behind
+        self.pieces += compiler.pieces  # only after compilation succeeds, so a restarted trace leaves none behind
         return split
 
 
 def compile_piecewise(model: nn.Module, pool=None) -> PiecewiseBackend:
     """Set up compilation on the model. Call mark_dynamic_tokens on inputs before the first model call."""
     backend = PiecewiseBackend(pool)
-    # Skip guards so later steps reuse the trace for any token count, including one.
+    # Skip guard checks so a change in token count, including to one, does not trigger retracing.
     model.compile(backend=backend, fullgraph=True, options={"guard_filter_fn": torch.compiler.skip_all_guards_unsafe})
     return backend
 
