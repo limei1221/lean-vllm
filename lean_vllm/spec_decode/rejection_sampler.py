@@ -6,12 +6,13 @@ from lean_vllm.spec_decode.config import PLACEHOLDER_TOKEN_ID
 
 
 class RejectionSampler(nn.Module):
-    """Verifies each row's drafts against the target's logits, as vLLM's RejectionSampler (Leviathan et al. 2023).
+    """Verify each row's draft tokens using rejection sampling (Leviathan et al. 2023).
 
-    MTP drafts greedily, so its draft distribution puts all probability on one token. Accept that token with its
-    target probability; replace the first rejected draft by sampling from the target with that token excluded.
-    A greedy row keeps a draft only if it is the target's argmax. A row that keeps every draft adds a bonus token
-    from its last position.
+    MTP chooses drafts greedily, so the draft distribution assigns probability 1 to the chosen token.
+    For a sampling row, accept each draft with its target probability. Replace the first rejected draft
+    by sampling from the target distribution with that draft token excluded, and discard later drafts.
+    For a greedy row, accept drafts that match the target's argmax and replace the first mismatch with
+    the target's argmax. A row that accepts every draft adds a token from its bonus position.
     """
 
     def forward(
@@ -26,16 +27,20 @@ class RejectionSampler(nn.Module):
     ) -> torch.Tensor:
         """Return tokens with shape [rows, max_num_drafts + 1], padded with PLACEHOLDER_TOKEN_ID.
 
-        logits holds each row's draft positions, then its bonus position, row after row: [sum(n + 1), vocab].
-        draft_token_ids is every row's drafts in the same order, and num_draft_tokens how many each row has.
-        temperatures, top_k and top_p are per row; the target's probabilities are taken after all three.
+        logits has shape [sum(num_draft_tokens + 1), vocab]. Each row's draft logits are followed by its
+        bonus logits. draft_token_ids contains the draft tokens flattened in the same row order;
+        num_draft_tokens gives the draft count for each row.
+        temperatures, top_k and top_p each have one value per row when provided. None for temperatures
+        makes all rows greedy; a zero temperature makes that row greedy. Sampling probabilities use
+        temperature scaling, then top-k and top-p filtering.
         """
         num_rows, num_drafts = num_draft_tokens.numel(), draft_token_ids.numel()
         device = logits.device
         rows = torch.arange(num_rows, device=device)
         num_logits = num_draft_tokens + 1
-        first = torch.cumsum(num_logits, 0) - num_logits  # each row's first logits row
-        # Each draft's row, its place in the row, and its logits row; no host sync, as the sizes are known.
+        first = torch.cumsum(num_logits, 0) - num_logits  # start of each row's logits in the flattened tensor
+        # Map each draft to its batch row, position within that row, and index in the flattened logits.
+        # Passing output_size avoids synchronizing with the host to determine the repeated tensor's size.
         draft_rows = torch.repeat_interleave(rows, num_draft_tokens, output_size=num_drafts)
         draft_cols = (
             torch.arange(num_drafts, device=device) - (torch.cumsum(num_draft_tokens, 0) - num_draft_tokens)[draft_rows]
@@ -59,12 +64,14 @@ class RejectionSampler(nn.Module):
             accepted = torch.where(
                 is_greedy, greedy[draft_index] == draft_token_ids, torch.rand_like(draft_probs) < draft_probs
             )
-            # Sample replacements from the target distribution with the rejected draft token excluded.
+            # Exclude the draft token at every draft position; leave bonus probabilities unchanged.
+            # Only the candidate at the first rejection or, if all drafts pass, the bonus position is used.
             probs[draft_index, draft_token_ids] = 0
             sampled = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
             candidates = torch.where(row_temperatures == 0, greedy, sampled)
 
-        # A row keeps its drafts up to the first rejection; the last column is never a draft, so the count stops there.
+        # Count consecutive accepted drafts from the start of each row. Unused columns stay zero,
+        # including the final column, so the count cannot exceed the row's draft count.
         keep = torch.zeros(num_rows, max_num_drafts + 1, dtype=torch.int32, device=device)
         keep[draft_rows, draft_cols] = accepted.int()
         num_accepted = keep.cumprod(dim=1).sum(dim=1)

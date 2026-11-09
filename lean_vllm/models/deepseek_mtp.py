@@ -8,13 +8,14 @@ from lean_vllm.layers.layernorm import RMSNorm
 from lean_vllm.layers.linear import ReplicatedLinear
 from lean_vllm.models.deepseek_v2 import DeepseekV2DecoderLayer, packed_modules_mapping
 
-# Copies of the target's weights. vLLM swaps in the target's embed_tokens but keeps each layer's own head.
+# Skip these checkpoint weights because the drafter uses the target's embedding and output layers.
 SHARED_WEIGHTS = ("embed_tokens.", "shared_head.head.")
 OWN_WEIGHTS = ("enorm.", "hnorm.", "eh_proj.", "shared_head.")
 
 
 class SharedHead(nn.Module):
-    """The checkpoint's shared_head: its norm. Its head is the target's lm_head, the same weights in V3."""
+    """Load only the norm from shared_head. The proposer uses the target's lm_head for logits; in V3 the
+    checkpoint's head is a copy of it."""
 
     def __init__(self, config: PretrainedConfig) -> None:
         super().__init__()
@@ -22,7 +23,7 @@ class SharedHead(nn.Module):
 
 
 class DeepSeekMultiTokenPredictorLayer(nn.Module):
-    """One MTP module: the next token's embedding and the hidden state before it, through one decoder layer."""
+    """Combine a token's embedding with the previous token's hidden state, then run one decoder layer."""
 
     def __init__(self, config: PretrainedConfig, layer_idx: int, enable_expert_parallel: bool = False) -> None:
         super().__init__()
@@ -38,20 +39,21 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         positions: torch.Tensor,
         previous_hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Nothing comes before position 0, so its embedding is masked.
+        # As vLLM: zero the embedding at position 0.
         inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
         hidden_states = self.eh_proj(torch.cat([self.enorm(inputs_embeds), self.hnorm(previous_hidden_states)], dim=-1))
         hidden_states, residual = self.mtp_block(positions, hidden_states, None)
-        # Normed once, both for the logits and for the next draft step.
+        # Add the residual and normalize the output for both logits and the next draft step.
         hidden_states, _ = self.shared_head.norm(hidden_states, residual)
         return hidden_states
 
 
 class DeepSeekMTP(nn.Module):
-    """DeepSeek-V3's multi-token prediction layers, which follow its last decoder layer in the checkpoint.
+    """DeepSeek-V3's multi-token prediction layers, stored after the target's decoder layers in the checkpoint.
 
-    The drafter of speculative decoding. It embeds and projects to logits with the target's own layers, so it
-    holds neither, and takes the target's final hidden states (after its norm) as its input.
+    Used as the drafter for speculative decoding. The proposer uses the target's embedding and output layers,
+    so this module holds neither. The first draft step takes the target's final normalized hidden states;
+    later steps take the previous draft step's output.
     """
 
     def __init__(self, config: PretrainedConfig, enable_expert_parallel: bool = False) -> None:
@@ -70,8 +72,11 @@ class DeepSeekMTP(nn.Module):
         self._weight_name = re.compile(rf"model\.layers\.({layer_ids})\.(.+)")
 
     def remap_weight_name(self, name: str) -> str | None:
-        """model.layers.{num_hidden_layers + i}.X as this module's layers.{i}.X, or layers.{i}.mtp_block.X for the
-        decoder layer's own weights. None for everything else, the target's and the copies it shares."""
+        """Map checkpoint names from model.layers.{num_hidden_layers + i}.X to layers.{i}.X.
+
+        Decoder weights go under layers.{i}.mtp_block.X. Return None for names outside the MTP layers
+        and for embedding and output weights supplied by the target.
+        """
         match = self._weight_name.fullmatch(name)
         if match is None or match[2].startswith(SHARED_WEIGHTS):
             return None

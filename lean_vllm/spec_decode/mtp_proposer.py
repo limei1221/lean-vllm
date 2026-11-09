@@ -21,21 +21,28 @@ from lean_vllm.utils.context import Context, set_context
 
 @dataclass(slots=True)
 class DraftInputs:
-    """What a step's batch preparation knows that the drafter needs, in the batch's row order."""
+    """Target inputs and batch metadata needed by the drafter.
 
-    input_ids: torch.Tensor  # the target's, on the device, where an async step fills what the host lacks
-    positions: torch.Tensor  # the target's, on the device, where an async step moves rows back past rejected drafts
-    max_position: int  # of a sampling row's last token, as if every draft was kept: vLLM's max_seq_len bound
-    last_index: np.ndarray  # each row's last token in input_ids
-    next_token_ids: np.ndarray  # the token after each row's chunk, for a row that does not sample; -1 for one that does
-    sampling_rows: np.ndarray  # the batch row of each sampling row, in sampling order
-    num_draft_tokens: np.ndarray  # drafts each sampling row verifies
+    last_index, next_token_ids, and block_table use batch order. sampling_rows maps sampling order to
+    batch indices, and num_draft_tokens uses sampling order.
+    """
+
+    input_ids: torch.Tensor  # target token ids on the device, including tokens not yet available on the host
+    positions: torch.Tensor  # target positions on the device, adjusted for previously rejected drafts
+    max_position: int  # host upper bound on the last token position across sampling rows, assuming all drafts kept
+    last_index: np.ndarray  # index of each batch row's last token in input_ids
+    next_token_ids: np.ndarray  # token after each non-sampling row's chunk; -1 for sampling rows
+    sampling_rows: np.ndarray  # batch indices of sampling rows, in sampling order
+    num_draft_tokens: np.ndarray  # number of drafts verified per sampling row, in sampling order
     block_table: np.ndarray | None  # None in warmup, which has no cache
 
 
 class FirstPass(nn.Module):
-    """The drafter's first pass, from token ids. A module of its own, so its compile holds step 0's layer alone,
-    and the later passes, which may run other MTP layers, stay eager or in their full graphs."""
+    """Run the first draft pass from token ids.
+
+    A separate module limits piecewise compilation to step 0's MTP layer. Later passes may use other
+    MTP layers and run eagerly or replay full CUDA graphs.
+    """
 
     def __init__(self, drafter: DeepSeekMTP, embed_tokens: Callable[[torch.Tensor], torch.Tensor]):
         super().__init__()
@@ -48,13 +55,15 @@ class FirstPass(nn.Module):
 class MTPProposer:
     """Drafts num_speculative_tokens tokens per sampling row with the checkpoint's MTP layers.
 
-    The first pass runs over the target's whole batch, each token beside the one after it, so the drafter's cache
-    follows the target's; its rows end at the last kept token, beside the token sampled after it. Every further pass
-    is one token per row: the draft before it, at the next position. The kept-draft
-    counts stay on the device: rejected drafts' rows run in the first pass as padding, and the later passes find
-    their positions there, so the host never waits on verification. Those single-token passes replay full CUDA
-    graphs when the target captures its own. The first pass is compiled piecewise when the target is, and replays
-    the target's buckets.
+    The first pass fills the drafter's cache over the target's whole batch, pairing each target hidden state
+    with the next token's embedding. For each sampling row, the last kept token's hidden state is paired with
+    the newly sampled token to produce the first draft. Later passes process one token per sampling row:
+    the previous pass's draft and output hidden state, one position further on.
+
+    Accepted-draft counts stay on the device. The first pass still processes rejected token positions, but
+    their outputs are not selected for drafting. Later passes read the selected positions on the device,
+    without waiting for the host to receive verification results. When enabled by the runner, later passes
+    replay full CUDA graphs, and the first pass uses piecewise compilation with the target's bucket sizes.
     """
 
     graph_bs: list[int] = []  # captured batch sizes; none until capture_cudagraphs
@@ -79,11 +88,11 @@ class MTPProposer:
         self.max_model_len = max_model_len
         self.device = device
         self.first_pass = FirstPass(drafter, embed_tokens)
-        self.buffers = InputBuffers(device)  # its own, so a draft pass never rewrites the target's inputs
+        self.buffers = InputBuffers(device)  # separate buffers keep draft passes from overwriting target inputs
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}  # by MTP layer and batch size
 
     def compile(self, pool) -> None:
-        """Compile the first pass piecewise, into the target's graph pool; its next call traces."""
+        """Set up piecewise compilation with the supplied graph pool. The next first-pass call traces the model."""
         self.compile_backend = compile_piecewise(self.first_pass, pool)
 
     @torch.inference_mode()
@@ -95,8 +104,11 @@ class MTPProposer:
         num_accepted: torch.Tensor,
         next_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Drafts [sampling rows, num_speculative_tokens] after the target's step, whose context this is. Each
-        sampling row kept num_accepted of its drafts, then next_token_ids; both on the device."""
+        """Return draft token ids with shape [sampling rows, num_speculative_tokens] after the target step.
+
+        context is the target step's attention context. For each sampling row, num_accepted counts the
+        accepted drafts and next_token_ids supplies the token sampled after them. Both tensors stay on the device.
+        """
         num_rows = num_accepted.size(0)
         not_sampling = inputs.next_token_ids >= 0
         buffers = self.buffers
@@ -111,9 +123,9 @@ class MTPProposer:
             table = buffers.put("block_table", inputs.block_table[inputs.sampling_rows], torch.int32)
         buffers.end()
 
-        # Each token beside the one after it, as vLLM's set_inputs_first_pass. Each sampling row's first draft comes
-        # from its last kept token, beside the token sampled after it, as vLLM's eagle_prepare_inputs_padded_kernel;
-        # the rows after it are padding.
+        # Shift token ids to pair each target hidden state with the next token, then fix sequence boundaries.
+        # At each sampling row's last kept position, use the newly sampled token. Only that position's output
+        # produces the first draft; outputs at later, rejected positions are ignored.
         input_ids = inputs.input_ids.roll(-1)
         input_ids[fixed_index] = fixed_token_ids
         sample_index += num_accepted
@@ -142,15 +154,21 @@ class MTPProposer:
         return torch.stack(drafts, dim=1)
 
     def _draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Greedy drafts; rejection sampling then needs no draft probabilities. Every rank
-        gathers the logits and takes the argmax itself, so no rank waits on another's tokens."""
+        """Choose greedy drafts, so rejection sampling needs no draft probabilities.
+
+        The target's compute_logits gathers logits on every rank. Each rank takes its own argmax,
+        so draft token ids do not need to be broadcast.
+        """
         return self.compute_logits(hidden_states).argmax(dim=-1)
 
     def _run_first_pass(
         self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor, context: Context
     ) -> torch.Tensor:
-        """The first pass, padded to the smallest captured bucket that holds it, as the target's _replay_piecewise.
-        The target's hidden states are copied in before any replay, which may reuse the pool they sit in."""
+        """Run the first pass, padding to the smallest captured bucket that fits, if one exists.
+
+        When a bucket fits, copy the target's hidden states into the first-pass buffers before replay can
+        overwrite their storage in the shared graph pool. Return only the actual tokens' outputs.
+        """
         n = input_ids.size(0)
         bucket = smallest_fitting(self.piecewise_bs, n)
         if bucket is not None:
@@ -179,10 +197,13 @@ class MTPProposer:
         max_position: int,
         step: int,
     ) -> tuple[torch.Tensor, dict]:
-        """One token per sampling row, step positions past its last kept one; as a decode step's context, built on
-        the device, as vLLM's eagle_step_update_slot_mapping_and_metadata. Key lengths have only a bound on the host."""
+        """Build positions and decode context for one token per sampling row.
+
+        Advance each row's last kept position by step. Exact positions and key lengths stay on the device;
+        max_position supplies the host-side upper bound used for max_seqlen_k.
+        """
         cu_q = list(range(cu_seqlens_q.numel()))
-        # Past max_model_len only for drafts no step would schedule; clamped so the rope cache covers them.
+        # Only drafts no step would schedule pass max_model_len; clamp them so they stay within the RoPE cache.
         positions = (sample_positions + step).clamp_(max=self.max_model_len - 1)
         context: dict = dict(is_prefill=False, max_seqlen_q=1, cu_seqlens_q=cu_seqlens_q, cu_seqlens_q_host=cu_q)
         if table is None:  # warmup: no cache, so each token attends itself alone
@@ -208,7 +229,7 @@ class MTPProposer:
         hidden_states: torch.Tensor,
         context: Context,
     ) -> torch.Tensor:
-        """The pass for these rows from the graph of bs rows, as the target's _replay_full."""
+        """Replay the graph for layer and bs rows, returning a view of the actual rows' output buffer."""
         return replay_full_graph(
             self.graphs[(layer, bs)],
             self.graph_vars,
@@ -222,8 +243,10 @@ class MTPProposer:
 
     @torch.inference_mode()
     def capture_piecewise(self, size: int) -> None:
-        """Run the compiled first pass over size rows of its buffers, in the runner's capture context for that
-        bucket, so each piece captures its graph. The largest size comes first and sizes the buffers."""
+        """Capture each compiled first-pass piece for size tokens using the runner's current capture context.
+
+        The runner calls with the largest bucket first to allocate buffers large enough for every bucket.
+        """
         if not self.piecewise_bs:
             weight = next(self.drafter.parameters())
             self.piecewise_vars = dict(
@@ -239,9 +262,11 @@ class MTPProposer:
 
     @torch.inference_mode()
     def capture_cudagraphs(self, sizes: list[int], max_num_blocks: int, pool, backends: list) -> None:
-        """A full graph of one single-token pass per batch size and MTP layer, where vLLM's drafter takes
-        piecewise graphs only; the logits stay eager. backends are the attention backends whose replay hooks run
-        before each replay."""
+        """Capture a single-token pass for each batch size and MTP layer used after the first draft.
+
+        Logit computation stays outside the graphs. backends supplies the attention backends whose hooks
+        run before each replay.
+        """
         layers = sorted({step % self.drafter.num_mtp_layers for step in range(1, self.num_speculative_tokens)})
         if not layers:
             return  # one draft per row, which the first pass makes
@@ -257,7 +282,7 @@ class MTPProposer:
         self.graph_bs = sizes
 
     def _graph_pass(self, layer: int, bs: int) -> None:
-        """One single-token pass over the graph's buffers, in a context of them alone."""
+        """Run one token per row using inputs and attention context backed by the graph's buffers."""
         graph_vars = self.graph_vars
         with set_context(
             False,
@@ -272,5 +297,5 @@ class MTPProposer:
 
     @staticmethod
     def _capture(run: Callable[[], None], pool) -> torch.cuda.CUDAGraph:
-        run()  # outside the graph first, where first launches may compile or allocate
-        return capture_graph(run, pool)  # a fresh context, so FlashMLA's schedule holder lands in the graph's pool
+        run()  # warm up outside capture so initial compilation and allocation can finish
+        return capture_graph(run, pool)  # run() creates a fresh context so FlashMLA allocates its schedule in this pool
