@@ -1,8 +1,8 @@
-"""Transport between AsyncLLM and the engine core, as vLLM's AsyncMPClient, without streams or detokenizers.
+"""Move requests and outputs between AsyncLLM and the engine core, like vLLM's AsyncMPClient.
 
-The core runs in a process of its own, so the event loop only sends requests and reads outputs while the step loop
-holds its own GIL. If the core dies, pending admission and metrics calls fail and the output reader receives
-EngineDeadError.
+AsyncLLM owns the streams and detokenizers. The core runs in a separate process, so its step loop does not compete
+with the client's event loop for the GIL. If the core dies, pending admission and metrics calls fail with
+EngineDeadError, and get_output_async() raises that error after any queued outputs have been read.
 """
 
 import asyncio
@@ -36,7 +36,7 @@ def _dead_error(prefix: str, error: BaseException) -> EngineDeadError:
 
 
 class AsyncMPClient:
-    """The engine core in another process, over two ZMQ sockets."""
+    """Communicate with the engine core in a separate process over two ZMQ sockets."""
 
     def __init__(
         self,
@@ -45,23 +45,23 @@ class AsyncMPClient:
         kwargs: dict | None = None,
         shutdown_timeout: float = 30.0,
     ):
-        """Starts the core and blocks until its engine is built."""
+        """Start the core and wait for its engine to be built and its input socket to connect."""
         self.error: BaseException | None = None
         self.shutdown_timeout = shutdown_timeout
         self._outputs: asyncio.Queue = asyncio.Queue()
-        self._adding: dict[str, asyncio.Future] = {}  # sent, not yet acknowledged
+        self._adding: dict[str, asyncio.Future] = {}  # requests awaiting admission replies
         self._calls: dict[int, asyncio.Future] = {}
         self._call_ids = count()
         self._stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._reader: asyncio.Task | None = None
 
-        # IPC sockets in a private directory, bound here so the core can connect as soon as it starts.
+        # Bind the IPC sockets in a private directory before starting the core so it can connect immediately.
         self._ipc_dir = tempfile.mkdtemp(prefix="lean-vllm-")
         input_address, output_address = f"ipc://{self._ipc_dir}/in", f"ipc://{self._ipc_dir}/out"
         self._context = zmq.Context()
         self._input = self._context.socket(zmq.PUSH)
-        self._input.setsockopt(zmq.SNDHWM, 0)  # a send never blocks the event loop
+        self._input.setsockopt(zmq.SNDHWM, 0)  # no send queue limit, so zmq.Again from _send means the core is gone
         self._input.bind(input_address)
         self._async_context = zmq.asyncio.Context()
         self._output = self._async_context.socket(zmq.PULL)
@@ -69,7 +69,8 @@ class AsyncMPClient:
 
         ctx = mp.get_context("spawn")
         ready, child_ready = ctx.Pipe(duplex=False)
-        # Not a daemon: the core spawns the TP workers, and a daemon may have no children.
+        # In multiprocessing, a daemon is terminated when its parent exits and cannot spawn child processes.
+        # The core must not be a daemon because it spawns tensor-parallel workers.
         self._process = ctx.Process(
             target=run_engine_core,
             name="EngineCore",
@@ -77,29 +78,29 @@ class AsyncMPClient:
         )
         self._process.start()
         child_ready.close()
-        atexit.register(self._shutdown_process)  # also when the server never got as far as its lifespan
+        atexit.register(self._shutdown_process)  # clean up even if the server's lifespan handler never starts
         wait([ready, self._process.sentinel])
         try:
             status, error = ready.recv()
-        except EOFError:  # it died before it could say why
+        except EOFError:  # the core exited without reporting its startup status
             status, error = "exited", None
         ready.close()
         if status != "ready":
             self._shutdown_process()
             raise RuntimeError(f"the engine core failed to start (exit code {self._process.exitcode})") from error
-        # The core's connect() is asynchronous: wait for its pipe, or the first non-blocking send finds no peer.
+        # connect() returns before the connection is ready; wait so the first non-blocking send has a peer.
         if not self._input.poll(CONNECT_TIMEOUT_MS, zmq.POLLOUT):
             self._shutdown_process()
             raise RuntimeError("the engine core started but never connected")
 
     def start(self):
-        """Called from the event loop that will read the outputs."""
+        """Start reading outputs and watching for core exit on the current event loop."""
         self._loop = asyncio.get_running_loop()
         self._reader = self._loop.create_task(self._read_outputs())
         self._loop.add_reader(self._process.sentinel, self._on_process_exit)
 
     def shutdown(self, timeout: float | None = None):
-        """From the event loop's thread: asks the core to finish its step and exit, killing it after timeout."""
+        """From the event loop's thread: stop the core (terminating it after timeout), the reader and pending calls."""
         if self._stopped:
             return
         self._stopped = True
@@ -128,7 +129,7 @@ class AsyncMPClient:
             raise error
 
     def abort_request(self, request_id: str, reason: str = "abort"):
-        """Non-blocking and never raising."""
+        """Send an abort without waiting; a no-op once the core is dead or shutting down."""
         if self.error is not None or self._stopped:
             return  # the blocks went with the engine
         self._send(("abort", request_id, reason))
@@ -154,8 +155,9 @@ class AsyncMPClient:
     async def _read_outputs(self):
         try:
             while True:
-                # Wait on poll, then take what is there: a non-blocking recv is done when made, so a cancel never
-                # lands mid-message. recv_pyobj would chain its unpickling through the loop, which it could.
+                # Wait for input, then receive and unpickle each available message without yielding to the loop.
+                # recv(NOBLOCK) returns a completed future. recv_pyobj schedules an unpickling callback,
+                # which allows cancellation after receiving a message but before delivering it.
                 await self._output.poll()
                 while True:
                     try:
@@ -167,7 +169,7 @@ class AsyncMPClient:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            if not self._stopped:  # else the socket closed under a shutdown
+            if not self._stopped:  # ignore read errors during shutdown, which closes the socket
                 self._die(error)
 
     def _handle(self, message: tuple) -> bool:
@@ -178,7 +180,7 @@ class AsyncMPClient:
         elif kind == "added":
             _, request_id, error = message
             added = self._adding.pop(request_id, None)
-            if added is not None and not added.done():  # else its caller gave up, and sent an abort
+            if added is not None and not added.done():  # ignore replies whose caller is no longer waiting
                 added.set_result(error)
         elif kind == "metrics":
             _, call_id, value = message
@@ -191,7 +193,7 @@ class AsyncMPClient:
         return True
 
     def _send(self, message: tuple):
-        """Never blocks the loop. With no peer to queue for, the core is gone: fail everything waiting on it."""
+        """Send without waiting for socket readiness. Treat zmq.Again as a lost core connection."""
         try:
             self._input.send_pyobj(message, zmq.NOBLOCK)
         except zmq.Again:
@@ -219,14 +221,14 @@ class AsyncMPClient:
         self._outputs.put_nowait(dead)
 
     def _shutdown_process(self, timeout: float | None = None):
-        """Idempotent; runs from shutdown() or at exit."""
+        """Stop the core and release sockets and IPC files. Safe to call again after cleanup."""
         atexit.unregister(self._shutdown_process)
         process = self._process
         if process.is_alive():
             try:
                 self._input.send_pyobj(("shutdown",), zmq.NOBLOCK)
             except zmq.ZMQError:
-                pass  # never connected, or gone
+                pass  # still wait for the process and stop it if the shutdown message could not be sent
             process.join(self.shutdown_timeout if timeout is None else timeout)
         if process.is_alive():
             logger.warning("the engine core did not stop in time, so it is terminated")

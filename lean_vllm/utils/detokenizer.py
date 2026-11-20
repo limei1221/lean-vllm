@@ -9,7 +9,7 @@ INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
 
 
 class FastIncrementalDetokenizer:
-    """Decodes one token at a time with DecodeStream, which holds back a split character rather than emit U+FFFD."""
+    """Decodes one token at a time with DecodeStream, holding back incomplete UTF-8 characters."""
 
     def __init__(
         self, tokenizer: PreTrainedTokenizerFast, prompt_token_ids: list[int], skip_special_tokens: bool = True
@@ -28,7 +28,7 @@ class FastIncrementalDetokenizer:
         except Exception as e:
             if not str(e).startswith(INVALID_PREFIX_ERR_MSG):
                 raise
-            # non-monotonic UTF-8 output breaks the stream; start a fresh one
+            # decoding was non-monotonic (new text no longer extends the old); restart without prior context
             logger.warning("invalid prefix while detokenizing, resetting the decode stream")
             self.stream = DecodeStream(skip_special_tokens=self.skip_special_tokens)
             return self.stream.step(self.tokenizer, token_id) or ""

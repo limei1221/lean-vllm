@@ -1,4 +1,4 @@
-"""OpenAI-compatible HTTP server over `AsyncLLM`, whichever core client it runs."""
+"""OpenAI-compatible HTTP server using AsyncLLM."""
 
 import asyncio
 import json
@@ -30,12 +30,12 @@ from lean_vllm.sampling_params import SamplingParams
 
 DONE = "data: [DONE]\n\n"
 
-# The engine's own reasons; a drop, such as "capacity", is not a completion and never appears here.
+# Map engine finish reasons to API finish reasons. Other reasons, such as "capacity", become errors.
 FINISH_REASONS = {"stop": "stop", "length": "length", "abort": "stop"}
 
 
 class _RequestStreamingResponse(StreamingResponse):
-    """Own admission cleanup even if sending headers or the first chunk fails."""
+    """Abort the request and close the stream even if sending headers or the first chunk fails."""
 
     def __init__(self, stream, engine: AsyncLLM, request_id: str):
         super().__init__(stream, media_type="text/event-stream")
@@ -70,7 +70,7 @@ def build_app(engine: AsyncLLM, model: str) -> FastAPI:
         kind = "server_error" if exc.status_code >= 500 else "invalid_request_error"
         return JSONResponse(status_code=exc.status_code, content=_error(kind, exc.detail))
 
-    # What admission and a dead engine raise, answered once here rather than in every route.
+    # Handle rejected requests and engine failures in one place for all routes.
     @app.exception_handler(InvalidRequest)
     async def _invalid_request(request: Request, exc: InvalidRequest):
         return JSONResponse(status_code=400, content=_error("invalid_request_error", str(exc)))
@@ -101,7 +101,7 @@ def build_app(engine: AsyncLLM, model: str) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatCompletionRequest, request: Request):
         messages = [message.model_dump() for message in body.messages]
-        # return_dict=False, or newer tokenizers hand back a BatchEncoding rather than ids.
+        # Request token ids instead of a BatchEncoding.
         prompt_token_ids = engine.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=True, return_dict=False
         )
@@ -119,13 +119,12 @@ async def _serve(
     request: Request | None = None,
 ):
     if body.model != model:
-        # An unserved model name returns 404.
         raise HTTPException(404, f"the model {body.model!r} does not exist")
     if engine.is_dead:
         raise HTTPException(503, f"the engine died: {engine.error!r}")
     kv_transfer_params = body.kv_transfer_params
     if body.stream and kv_transfer_params and kv_transfer_params.get("do_remote_decode"):
-        # A stream has nowhere to return the params, so the blocks would sit held until they expire.
+        # A stream can't carry KV transfer params, so no decode instance reads the blocks; they're held until timeout.
         raise HTTPException(400, "do_remote_decode needs a non-streaming request")
     request_id = f"{'chatcmpl' if chat else 'cmpl'}-{uuid4().hex}"
     sampling_params = SamplingParams(
@@ -145,13 +144,13 @@ async def _serve(
         return _RequestStreamingResponse(stream, engine, request_id)
     reply = await _unless_disconnected(request, _collect(deltas, request_id, model, len(prompt_token_ids), chat))
     if reply is None:
-        engine.abort(request_id)  # the generators may never have started, so no finally ran
-        return Response(status_code=499)  # nobody is left to read it
+        engine.abort(request_id)  # unstarted generators cannot run their finally blocks
+        return Response(status_code=499)  # the client has disconnected
     return reply
 
 
 async def _unless_disconnected(request: Request | None, work: Coroutine):
-    """Starlette only watches for a disconnect while streaming. None if the client left first."""
+    """Watch for a disconnect, which Starlette only does while streaming. None if the client left first."""
     if request is None:
         return await work
     task = asyncio.create_task(work)
@@ -176,14 +175,17 @@ async def _deltas(
     engine: AsyncLLM,
     request_id: str,
 ):
-    """Yields (text, finish_reason, num_completion_tokens, kv_transfer_params); the last has a reason."""
+    """Yield (text, finish_reason, num_completion_tokens, kv_transfer_params).
+
+    Token counts are cumulative; only the last item has a finish reason, from a stop-string match or the engine.
+    """
     num_tokens = 0
     try:
         async for output in outputs:
             num_tokens += len(output.token_ids)
             text = checker.push(output.text)
             if checker.matched:
-                engine.abort(request_id, "stop")  # frees the blocks, counted as a finish rather than a cancel
+                engine.abort(request_id, "stop")  # ask the core to record a normal finish and release the blocks
                 yield text, "stop", num_tokens, None
                 return
             if output.finished:
@@ -233,7 +235,7 @@ async def _stream(deltas, request_id: str, model: str, body: BaseRequest, num_pr
         response, kind = protocol.CompletionStreamResponse, "text_completion"
 
     def chunk(choices: list, **extra) -> str:
-        # kind is the literal its response class asks for, a pairing mypy cannot follow
+        # Each response class requires its matching kind literal, but mypy cannot infer that pairing.
         return _event(response(id=request_id, object=kind, created=created, model=model, choices=choices, **extra))  # type: ignore[arg-type]
 
     def choice(text: str, reason: str | None, role: Literal["assistant"] | None = None):
@@ -250,7 +252,7 @@ async def _stream(deltas, request_id: str, model: str, body: BaseRequest, num_pr
             async for delta, reason, num_tokens, _ in deltas:  # noqa: B007 - the last count is kept
                 yield chunk([choice(delta, reason)])
         except (EngineDeadError, HTTPException) as error:
-            # The 200 is already sent, so the error rides in the stream.
+            # The HTTP 200 status has already been sent, so send the error as a stream event.
             yield _event(_error("server_error", str(getattr(error, "detail", error))))
             yield DONE
             return

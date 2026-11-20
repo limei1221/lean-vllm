@@ -1,11 +1,12 @@
-"""`lean-vllm serve <model>`, with engine flags generated from `Config`."""
+"""CLI for `lean-vllm serve` and `lean-vllm proxy`, with serve's engine flags generated from `Config`."""
 
 import argparse
 from dataclasses import MISSING, fields
 
 from lean_vllm.config import Config
 
-# Not flags: the positional, and what the engine reads from the checkpoint.
+# These fields have no generated flags: model is positional; the others are loaded
+# from the checkpoint or parsed from JSON settings.
 INTERNAL = {"model", "hf_config", "eos", "kv_transfer", "speculative"}
 
 
@@ -14,7 +15,7 @@ def add_engine_args(parser: argparse.ArgumentParser):
     for field in fields(Config):
         default = field.default
         if field.name in INTERNAL or default is MISSING or default is None:
-            continue  # no default to take a type from
+            continue  # excluded field, or no default value to infer its type from
         flag = "--" + field.name.replace("_", "-")
         if isinstance(default, bool):
             group.add_argument(flag, action=argparse.BooleanOptionalAction, default=default)
@@ -50,7 +51,7 @@ def main(argv: list[str] | None = None):
         )
         return
 
-    from lean_vllm.entrypoints.server import run  # imports fastapi, which is the `serve` extra
+    from lean_vllm.entrypoints.server import run  # load the `serve` extra's dependencies after parsing arguments
 
     engine_kwargs = {
         field.name: getattr(args, field.name)

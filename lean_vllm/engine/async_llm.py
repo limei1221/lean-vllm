@@ -1,7 +1,6 @@
-"""The server's engine, as vLLM's AsyncLLM: the front end of an engine core in another process.
+"""The server's interface to an engine core in another process, like vLLM's AsyncLLM.
 
-It owns every request's state (its stream and detokenizer, in an OutputProcessor), so the client below it only
-moves requests in and outputs out.
+OutputProcessor holds each request's stream and detokenizer. AsyncMPClient handles communication with the core.
 """
 
 import asyncio
@@ -24,7 +23,7 @@ class AsyncLLM:
         self.output_processor = OutputProcessor(tokenizer)
         self.error: BaseException | None = None
         self.on_death: Callable[[], None] | None = None
-        self._death = ""  # the message every later EngineDeadError carries
+        self._death = ""  # the message used by _dead_error after an engine failure
         self._stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._output_handler: asyncio.Task | None = None
@@ -41,13 +40,16 @@ class AsyncLLM:
         return self.error is not None
 
     def start(self):
-        """Called from the event loop that will read the streams."""
+        """Start handling outputs on the event loop that will read the streams."""
         self._loop = asyncio.get_running_loop()
         self.engine_core.start()
         self._output_handler = self._loop.create_task(self._handle_outputs())
 
     def stop(self, timeout: float | None = None):
-        """Callable from any thread. Waits up to timeout for the step in flight."""
+        """Call from the event loop's thread: stops the core, then fails the streams.
+
+        The core is terminated if it does not exit within timeout, or the client's default timeout if None.
+        """
         if self._stopped:
             return
         self._stopped = True
@@ -60,28 +62,29 @@ class AsyncLLM:
         sampling_params: SamplingParams,
         request_id: str | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
-        """Wait for admission before returning an output generator, so the server can choose an HTTP status.
+        """Wait for the core to accept the request before returning an output generator.
 
+        This lets the server choose an HTTP status before it starts streaming.
         Closing the generator after iteration starts aborts an unfinished request.
         """
         token_ids: list[int] = self.tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
         request_id = request_id or f"req-{uuid4().hex}"
         if request_id in self.output_processor.request_states:
-            # The scheduler would refuse it too, but only after this stream replaced the live one.
+            # Reject duplicate ids here: registering a new stream would overwrite the live request's state.
             raise DuplicateRequestId(f"{request_id} is already in flight")
         if self._stopped:
             raise EngineDeadError("the server is shutting down")
         if self.is_dead:
             raise self._dead_error()
-        # Ready before the add is sent: the first token may arrive before this coroutine resumes.
+        # Register the stream before sending the request: outputs may arrive before this coroutine resumes.
         stream = AsyncStream()
         self.output_processor.add_request(request_id, token_ids, sampling_params.skip_special_tokens, stream)
         try:
             await self.engine_core.add_request_async(request_id, token_ids, sampling_params)
         except asyncio.CancelledError:
-            self.abort(request_id)  # the core may have taken it before the cancel
+            self.abort(request_id)  # the core may have accepted the request before cancellation
             raise
-        except BaseException:  # refused, or the engine is gone
+        except BaseException:  # remove local state if submitting the request fails
             self.output_processor.abort_request(request_id)
             raise
         return self._generate(request_id, stream)
@@ -94,20 +97,21 @@ class AsyncLLM:
             # A finished request's id may already belong to a newer stream.
             state = self.output_processor.request_states.get(request_id)
             if state is not None and state.stream is stream:
-                self.abort(request_id)  # this is what makes a disconnect free KV blocks
+                self.abort(request_id)  # ask the core to release the unfinished request's KV blocks
 
     def abort(self, request_id: str, reason: str = "abort"):
-        """Non-blocking and never raising, so it is safe in a generator's finally.
+        """Close the local stream and send an abort without waiting for the core.
 
-        reason is "stop" when the server ends it on a stop string, which counts as a finish.
+        Never raises, so it is safe in a finally block.
+        The server passes reason="stop" when it matches a stop string, so the core records a normal finish.
         """
         self.output_processor.abort_request(request_id)
         if self.is_dead or self._stopped:
-            return  # the blocks went with the engine
+            return  # no abort is sent after engine failure or shutdown begins
         self.engine_core.abort_request(request_id, reason)
 
     async def render_metrics(self) -> str:
-        """The counters live with the engine, maybe in another process."""
+        """Fetch the metrics text from the engine core."""
         if self.is_dead:
             raise self._dead_error()
         return await self.engine_core.render_metrics_async()
@@ -120,7 +124,7 @@ class AsyncLLM:
             self._die(dead)
 
     def _die(self, dead: EngineDeadError):
-        """A status code cannot be retracted, so live streams get the error instead."""
+        """Record the engine failure and queue an error for each live stream to raise when read."""
         if self.is_dead or self._stopped:
             return
         self.error = dead.__cause__ if dead.__cause__ is not None else dead
@@ -135,9 +139,9 @@ class AsyncLLM:
         self.output_processor.fail_all(EngineDeadError("the server is shutting down"))
 
     def _on_loop(self, callback: Callable, *args):
-        """Run callback now on the engine's event loop, or schedule it thread-safely from another thread."""
+        """Run callback now if on the saved event loop, or schedule it thread-safely from another thread."""
         if self._loop is None or self._loop.is_closed():
-            return  # never started, or the loop is closed and its streams with it
+            return  # no event loop is available to run the callback
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:

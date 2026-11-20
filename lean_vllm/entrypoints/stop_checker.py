@@ -1,5 +1,5 @@
 class StopChecker:
-    """Applies `stop` strings to streamed text, holding back a tail a match could still start in."""
+    """Checks streamed text for stop strings, holding back a tail where a match could still begin."""
 
     def __init__(self, stop: list[str]):
         self.stop = [s for s in stop if s]
@@ -8,7 +8,7 @@ class StopChecker:
         self.matched = False
 
     def push(self, text: str) -> str:
-        """The text safe to emit now. Sets `matched` when a stop string hits."""
+        """Returns text safe to emit, cut before the earliest stop string. Sets `matched` if one is found."""
         if not self.stop:
             return text
         self.buffer += text
@@ -24,6 +24,6 @@ class StopChecker:
         return emit
 
     def flush(self) -> str:
-        """Generation ended with no match, so the held tail was real output."""
+        """Returns and clears the held text. Call when generation ends without a stop string match."""
         emit, self.buffer = self.buffer, ""
         return emit

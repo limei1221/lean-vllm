@@ -1,18 +1,18 @@
-"""Server-side metrics, as Prometheus text.
+"""Server-side metrics in Prometheus text format.
 
-Names mirror vLLM's under a `lean_vllm:` prefix, so one dashboard reads both. The prefix-cache counters
-count blocks where vLLM's count tokens, so only their ratio compares.
+Names mirror vLLM's under a `lean_vllm:` prefix, so one dashboard reads both. Prefix-cache counters count
+blocks, not tokens as vLLM's do, so compare only the hit rate.
 """
 
 import threading
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, disable_created_metrics, generate_latest
 
-disable_created_metrics()  # no _created series beside each counter and histogram
+disable_created_metrics()  # omit the _created timestamp series for counters and histograms
 
 INF = float("inf")
 
-# Step kinds that replayed a graph; the rest ran without one, as "prefill", "decode" or "enforced".
+# Step kinds that replay CUDA graphs; steps without graphs are labelled "prefill", "decode", or "enforced".
 GRAPH_KINDS = ("graph", "piecewise")
 
 LATENCY_BUCKETS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0, INF)
@@ -27,8 +27,8 @@ BYTE_BUCKETS = tuple(2 ** (10 + i) for i in range(1, 25, 2)) + (INF,)
 
 class Metrics:
     def __init__(self):
-        self.lock = threading.Lock()  # so a render never catches a step half recorded
-        self.registry = CollectorRegistry()  # one per engine, so several in one process do not clash
+        self.lock = threading.Lock()  # prevent render() from reading a partially recorded update
+        self.registry = CollectorRegistry()  # separate registries let engines reuse metric names in one process
         registry = self.registry
 
         def counter(name: str, documentation: str, label: str | None = None) -> Counter:
@@ -66,7 +66,7 @@ class Metrics:
         self.eager_steps = counter(
             "lean_vllm:num_eager_steps_total", "Forward passes no CUDA graph covered.", label="reason"
         )
-        # Share of the clock, not the count: eager steps take longer each.
+        # Track elapsed step time by kind, since step counts alone do not show where time is spent.
         self.step_seconds = counter("lean_vllm:step_seconds_total", "Time in forward passes.", label="kind")
         self.model_busy = counter("lean_vllm:model_busy_seconds_total", "Wall seconds spent inside a step.")
 
@@ -87,7 +87,7 @@ class Metrics:
             "lean_vllm:iteration_tokens_total", "Tokens in one step's batch.", BATCH_BUCKETS
         )
 
-        # Disaggregated prefill: the decode instance's loads, and the prefill instance's blocks nobody read.
+        # Disaggregated prefill: the decode instance's KV loads, and prefill's held blocks freed unread on a timeout.
         self.kv_transfers = counter("lean_vllm:kv_transfers_total", "KV loads finished.")
         self.kv_transfer_failures = counter(
             "lean_vllm:kv_transfer_failures_total", "KV loads that failed, so the prompt prefilled here."
@@ -100,7 +100,7 @@ class Metrics:
         )
         self.kv_transfer_bytes = histogram("lean_vllm:kv_transfer_bytes", "Bytes per load, all ranks.", BYTE_BUCKETS)
 
-        # Speculative decoding: a draft is one row's drafts in one step.
+        # Speculative decoding: spec_drafts counts each row's drafts once per step; spec_draft_tokens counts the tokens.
         self.spec_drafts = counter("lean_vllm:spec_decode_num_drafts_total", "Rows that verified drafts.")
         self.spec_draft_tokens = counter("lean_vllm:spec_decode_num_draft_tokens_total", "Draft tokens verified.")
         self.spec_accepted_tokens = counter("lean_vllm:spec_decode_num_accepted_tokens_total", "Draft tokens kept.")
@@ -116,12 +116,12 @@ class Metrics:
         with self.lock:
             if request_output.finish_reason == "abort":
                 self.requests_aborted.inc()
-            else:  # ended by the server on a stop string: a completion, not a cancel
+            else:  # a server stop-string match counts as a completed request
                 self._record_finished(request_output)
 
     def record_step(self, scheduler, output, outputs, duration: float, step_kind: str):
         with self.lock:
-            if output:  # a step that scheduled nothing ran no model
+            if output:  # count a model step only when sequences were scheduled
                 self.steps.inc()
                 if step_kind in GRAPH_KINDS:
                     self.graph_steps.inc()
@@ -153,8 +153,8 @@ class Metrics:
             self.kv_transfer_expired.inc(len(kv_output.expired_sending))
 
     def record_spec_decoding(self, rows, token_ids: list[list[int]]):
-        """A speculative step's rows, each with its drafts' count, and the tokens each produced: its kept drafts and
-        one more."""
+        """Count each row's drafts and accepted drafts; each token list is the accepted drafts plus one sampled
+        token."""
         with self.lock:
             for row, tokens in zip(rows, token_ids):
                 if not row.num_draft_tokens:
@@ -185,6 +185,6 @@ class Metrics:
                 histogram.observe(value)
 
     def render(self) -> str:
-        """Prometheus text exposition format."""
+        """Return the registry's metrics in Prometheus text format."""
         with self.lock:
             return generate_latest(self.registry).decode()

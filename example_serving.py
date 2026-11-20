@@ -1,4 +1,4 @@
-"""example.py's two prompts, over HTTP with the official OpenAI SDK.
+"""Send the two prompts from example.py over HTTP using the official OpenAI SDK.
 
 uv run lean-vllm serve ~/workspace/huggingface/Qwen3-0.6B --served-model-name qwen
 uv run python example_serving.py
@@ -14,7 +14,7 @@ BASE_URL = os.getenv("LEAN_VLLM_URL", "http://127.0.0.1:8000/v1")
 
 
 async def ask(client, model: str, prompt: str):
-    # Only what the engine implements: top_p, seed, n > 1 and penalties are a 400.
+    # The server rejects per-request seeds, n > 1, and non-default penalties with HTTP 400.
     stream = await client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
@@ -36,8 +36,8 @@ async def main():
         "introduce yourself",
         "list all prime numbers within 100",
     ]
-    async with AsyncOpenAI(api_key="unused", base_url=BASE_URL) as client:  # no auth is checked
-        model = (await client.models.list()).data[0].id  # whatever --served-model-name says
+    async with AsyncOpenAI(api_key="unused", base_url=BASE_URL) as client:
+        model = (await client.models.list()).data[0].id  # use the model ID reported by the server
         outputs = await asyncio.gather(*(ask(client, model, prompt) for prompt in prompts))
 
     for prompt, (text, ttft, total) in zip(prompts, outputs):
