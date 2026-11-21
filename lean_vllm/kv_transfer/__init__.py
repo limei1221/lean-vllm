@@ -26,7 +26,7 @@ __all__ = [
     "parse_kv_transfer_config",
 ]
 
-# As vLLM's KVConnectorFactory: a name in kv_transfer_config, and the class for each half.
+# Like vLLM's KVConnectorFactory, map each connector name to its scheduler and worker classes.
 CONNECTORS = {"NixlConnector": (NixlConnectorScheduler, NixlConnectorWorker)}
 
 

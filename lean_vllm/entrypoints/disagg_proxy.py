@@ -1,7 +1,9 @@
-"""A proxy in front of prefill and decode servers, as vLLM's toy_proxy_server.py.
+"""Proxy requests through separate prefill and decode servers.
 
-Each request prefills on a prefill server with max_tokens=1, which hands back kv_transfer_params, then runs whole on
-a decode server that pulls the prompt's KV with them and generates. Servers are taken round-robin.
+For each completions or chat completions request, first call a prefill server with max_tokens=1, streaming disabled and
+do_remote_decode set. Forward the original request to a decode server, adding any kv_transfer_params returned by
+prefill so decode can load the prompt's KV. Return the decode response to the client. Select prefill and decode servers
+independently in round-robin order.
 """
 
 import itertools
@@ -18,7 +20,7 @@ def build_proxy_app(
     prefill_urls = [url.rstrip("/") for url in prefill_urls]
     decode_urls = [url.rstrip("/") for url in decode_urls]
     prefills, decodes = itertools.cycle(prefill_urls), itertools.cycle(decode_urls)
-    # No timeout: a long generation is not a hung one.
+    # Disable timeouts for the default client so long generations can finish.
     client = client or httpx.AsyncClient(timeout=None)
 
     @asynccontextmanager
@@ -59,9 +61,9 @@ async def _disaggregate(client: httpx.AsyncClient, prefill_url: str, decode_url:
     prefill_body.pop("stream_options", None)
     prefill = await client.post(prefill_url + path, json=prefill_body)
     if prefill.status_code != 200:
-        return _relay(prefill)  # a 400 there is the client's answer
+        return _relay(prefill)  # return the prefill error without calling decode
     kv_transfer_params = prefill.json().get("kv_transfer_params")
-    # None when the prefill was aborted; the decode server then prefills itself.
+    # If prefill returns no transfer params (for example, after an abort), forward the original request body.
     decode_body = dict(body, kv_transfer_params=kv_transfer_params) if kv_transfer_params else body
     upstream = await client.send(client.build_request("POST", decode_url + path, json=decode_body), stream=True)
     if upstream.status_code != 200 or not body.get("stream"):
@@ -72,7 +74,10 @@ async def _disaggregate(client: httpx.AsyncClient, prefill_url: str, decode_url:
 
 
 class _UpstreamStreamingResponse(StreamingResponse):
-    """Closes the upstream however the stream ends; on a client disconnect, that aborts the decode."""
+    """Close the decode response when streaming ends, including on a client disconnect.
+
+    Closing an unfinished response lets the decode server detect the disconnect and abort generation.
+    """
 
     def __init__(self, upstream: httpx.Response):
         super().__init__(upstream.aiter_raw(), media_type=upstream.headers.get("content-type"))

@@ -1,14 +1,16 @@
-"""NixlConnector: the decode instance reads a finished prefill's blocks GPU to GPU over RDMA, as vLLM's does.
+"""NixlConnector lets a decode instance load a producer's prompt KV blocks through NIXL's UCX backend.
 
-A producer holds a request's prompt blocks once it has sampled its one token, and hands back kv_transfer_params that
-say where they are. Each rank registers its KV cache with a NIXL agent. A producer rank serves the agent's metadata and its cache's addresses from a ROUTER socket on kv_port + rank. A consumer
-rank handshakes once with each producer rank it reads, then posts one-sided READs from those blocks straight into its
-own. Each read carries a notification, and a producer rank frees a request's blocks once every consumer rank that reads
-it has sent one; blocks nobody reads are freed after LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT.
+A producer holds the prompt blocks of a request configured for remote decode when it finishes with length or stop,
+and returns their location in kv_transfer_params. Each rank registers its KV cache with a NIXL agent. A producer rank
+serves its agent metadata and cache addresses from a ROUTER socket on kv_port + rank. A consumer rank caches a handshake
+with each producer rank it uses, then issues one-sided READs directly into its own blocks. Reads include completion
+notifications. A producer rank reports a request's blocks ready for release after all expected notifications arrive
+or LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT expires. The engine frees the blocks once all producer ranks have reported them.
 
-The two sides may run different tensor-parallel sizes. Caches are HND, so within a block each head's tokens are
-contiguous, and a consumer rank reads from each producer rank whose heads overlap its own just the overlap. MLA latents
-are the same on every rank, so a consumer rank reads whole blocks from one producer rank and only notifies the rest.
+The two sides may use different tensor-parallel sizes. HND caches store each head's tokens contiguously within a block.
+A consumer rank reads only the heads it needs from each producer rank. MLA latents are replicated across ranks, so a
+consumer reads whole latent blocks from the first producer rank in its shares and omits latents from the other reads.
+If a share has no data to read, the consumer sends its notification directly.
 """
 
 import json
@@ -38,9 +40,9 @@ from lean_vllm.kv_transfer.base import (
 
 logger = logging.getLogger(__name__)
 
-HANDSHAKE_TIMEOUT = 5.0  # ZMQ never refuses a connect, so an absent producer is one that does not answer
-IDLE_WAIT = 0.01  # how often the transfer thread answers handshakes and takes notifications
-BUSY_WAIT = 0.001  # and how often it polls reads in flight
+HANDSHAKE_TIMEOUT = 5.0  # bound the handshake wait when a producer does not respond
+IDLE_WAIT = 0.01  # queue wait in seconds when no reads are pending
+BUSY_WAIT = 0.001  # shorter queue wait while polling reads in flight
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -48,8 +50,9 @@ def _cdiv(a: int, b: int) -> int:
 
 
 def make_agent(name: str):
-    """A NIXL agent over UCX."""
-    os.environ.setdefault("UCX_RCACHE_MAX_UNRELEASED", "1024")  # as vLLM, against a UCX leak; read at import
+    """Create a NIXL agent using the UCX backend."""
+    # Apply vLLM's UCX memory-leak workaround before importing NIXL, unless the user set a limit.
+    os.environ.setdefault("UCX_RCACHE_MAX_UNRELEASED", "1024")
     try:
         from nixl._api import nixl_agent, nixl_agent_config
     except ImportError as error:
@@ -61,13 +64,16 @@ class Share(NamedTuple):
     """The heads one consumer rank reads from one producer rank."""
 
     remote_rank: int
-    remote_head: int  # the first, among the producer rank's
-    local_head: int  # where it lands, among the consumer rank's
+    remote_head: int  # first head index within the producer rank's cache
+    local_head: int  # first destination head index within the consumer rank's cache
     num_heads: int
 
 
 def head_shares(rank: int, tp_size: int, remote_tp_size: int, num_heads: int) -> list[Share]:
-    """Each remote rank holding some of this rank's heads, of num_heads split evenly over each side's ranks."""
+    """Return the head ranges this consumer rank reads from each producer rank.
+
+    num_heads is the total head count, split evenly across the ranks on each side.
+    """
     local, remote = num_heads // tp_size, num_heads // remote_tp_size
     start, end = rank * local, (rank + 1) * local
     shares = []
@@ -79,18 +85,21 @@ def head_shares(rank: int, tp_size: int, remote_tp_size: int, num_heads: int) ->
 
 @dataclass(slots=True)
 class Region:
-    """One registered K, V or latent tensor, as a read addresses it."""
+    """Address and byte strides for one registered key, value or latent tensor."""
 
-    addr: int  # of block 0
-    block_bytes: int  # between blocks
+    addr: int  # address of block 0
+    block_bytes: int  # byte stride between blocks
     head_bytes: int  # one head's tokens within a block; 0 for latents, which are read whole
 
 
 def block_descs(
     regions: list[Region], block_ids: list[int], first_head: int, num_heads: int, latents: bool, device_id: int
 ) -> np.ndarray:
-    """NIXL's (address, length, device) rows, region by region: num_heads from first_head of each block, and whole
-    blocks of latent regions if latents."""
+    """Build NIXL (address, length, device) rows in region order, then block_ids order.
+
+    Key and value regions include num_heads starting at first_head in each block. Latent regions include whole blocks
+    when latents is True and are skipped otherwise. Addresses and lengths are in bytes.
+    """
     blocks = np.asarray(block_ids, dtype=np.uint64)
     parts = []
     for region in regions:
@@ -126,13 +135,13 @@ class NixlConnectorScheduler(KVConnectorScheduler):
             logger.warning("prefilling %s here instead: %s", seq.request_id, problem)
             params["do_remote_prefill"] = False
             return 0, False
-        # Any tp_size: each rank reads its heads from whichever producer ranks hold them.
+        # Different tensor-parallel sizes are supported: each consumer rank reads the producer ranks it needs.
         return seq.num_prompt_tokens - num_computed_tokens, True
 
     def update_state_after_alloc(self, seq, num_external_tokens: int):
         params = seq.kv_transfer_params
-        params["do_remote_prefill"] = False  # one load per request, so a preempted one recomputes
-        num_local_blocks = seq.num_cached_tokens // self.block_size  # prefix-cache hits here are not read
+        params["do_remote_prefill"] = False  # load only once; recompute locally if the request is preempted
+        num_local_blocks = seq.num_cached_tokens // self.block_size  # skip blocks already in the local prefix cache
         self._reqs_to_recv[seq.request_id] = ReqToRecv(
             local_block_ids=seq.block_table[num_local_blocks:],
             remote_block_ids=params["remote_block_ids"][num_local_blocks:],
@@ -150,7 +159,7 @@ class NixlConnectorScheduler(KVConnectorScheduler):
 
     def request_finished(self, seq) -> tuple[bool, dict | None]:
         params = seq.kv_transfer_params
-        # A prefill that hit its max_tokens or a stop token hands over; an abort ends there.
+        # Share prompt blocks only for remote decode requests that finished with length or stop, not an abort.
         if not params or not params.get("do_remote_decode") or seq.finish_reason not in ("length", "stop"):
             return False, None
         block_ids = seq.block_table[: _cdiv(seq.num_prompt_tokens, self.block_size)]
@@ -170,7 +179,7 @@ class NixlConnectorScheduler(KVConnectorScheduler):
 
 @dataclass(slots=True)
 class _Remote:
-    """A producer rank, as its handshake described it."""
+    """Cached agent and cache information from a producer rank's handshake."""
 
     engine_id: str
     agent_name: str
@@ -182,11 +191,11 @@ class _Remote:
 
 @dataclass(slots=True)
 class _Load:
-    """One request's reads, one per producer rank holding heads it needs."""
+    """Track one request's reads and the producer ranks still needing notifications."""
 
     req: ReqToRecv
-    handles: list = field(default_factory=list)  # in flight
-    unnotified: set[int] = field(default_factory=set)  # producer ranks no read or notification has reached
+    handles: list = field(default_factory=list)  # read handles awaiting completion checks
+    unnotified: set[int] = field(default_factory=set)  # ranks needing a fallback notification if setup fails
     started: float = field(default_factory=monotonic)
     num_bytes: int = 0
     failed: bool = False
@@ -201,26 +210,27 @@ class NixlConnectorWorker(KVConnectorWorker):
         self.block_size = config.kvcache_block_size
         self.kv_caches: list[torch.Tensor] = []
         self.regions: list[Region] = []
-        self.num_heads = 0  # every rank's key heads together; 0 for a model of latents only
+        self.num_heads = 0  # total key heads across ranks; 0 when all layers use latents
         self.layout: dict = {}
         self.agent: Any = None  # a nixl_agent, once the caches are registered
         self._reg_descs = None
-        self._lock = threading.Lock()  # guards the three below, shared with the transfer thread
-        self._reqs_to_send: dict[str, float] = {}  # request -> when to stop waiting for its readers
-        self._notified: dict[str, list] = {}  # request -> [notifications, readers, first seen]; may precede the above
+        self._lock = threading.Lock()  # protects _reqs_to_send, _notified and _finished across threads
+        self._reqs_to_send: dict[str, float] = {}  # request ID -> deadline for consumer notifications
+        # Notifications may arrive before the request is added to _reqs_to_send.
+        self._notified: dict[str, list] = {}  # request ID -> [notification count, expected readers, first arrival time]
         self._finished = KVConnectorOutput()
         self._queue: queue.Queue = queue.Queue()
         self._context = zmq.Context()
         self._context.setsockopt(zmq.LINGER, 0)
         self._server: zmq.Socket | None = None
-        self._remotes: dict[tuple[str, int], _Remote] = {}  # by producer address; transfer thread only
+        self._remotes: dict[tuple[str, int], _Remote] = {}  # keyed by producer (host, port); transfer thread only
         self._loads: dict[str, _Load] = {}  # transfer thread only
         self._thread: threading.Thread | None = None
 
     def register_kv_caches(self, kv_caches: list[torch.Tensor]):
         self.kv_caches = kv_caches
         self.mem_type = "VRAM" if kv_caches[0].is_cuda else "DRAM"
-        self.device_id = max(kv_caches[0].get_device(), 0)  # NIXL wants no -1 for the host
+        self.device_id = max(kv_caches[0].get_device(), 0)  # use device ID 0 for host memory instead of -1
         layers = []
         for cache in kv_caches:
             itemsize = cache.element_size()
@@ -233,7 +243,7 @@ class NixlConnectorWorker(KVConnectorWorker):
             for part in cache:
                 head_bytes = part.stride(1) * itemsize if cache.dim() == 5 else 0
                 self.regions.append(Region(part.data_ptr(), part.stride(0) * itemsize, head_bytes))
-        # What a peer must match: every rank's heads together, so the two sides may split them differently.
+        # Compare total head counts so peers can match layouts even with different tensor-parallel sizes.
         self.layout = dict(block_size=self.block_size, layers=layers)
 
         kv = self.kv_transfer
@@ -262,7 +272,7 @@ class NixlConnectorWorker(KVConnectorWorker):
                     self._reqs_to_send[request_id] = deadline
                     self._release_if_read(request_id)
         if metadata.reqs_to_recv:
-            # Freshly allocated blocks may still be written by a step in flight; the reads wait for it.
+            # A step in flight may still write these blocks. Record an event for the transfer thread to wait on.
             ready = torch.cuda.current_stream().record_event() if self.mem_type == "VRAM" else None
             for request_id, req in metadata.reqs_to_recv.items():
                 self._queue.put((request_id, req, ready))
@@ -272,7 +282,7 @@ class NixlConnectorWorker(KVConnectorWorker):
         timeout = envs.LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT
         with self._lock:
             for request_id, deadline in list(self._reqs_to_send.items()):
-                # A read is one-sided, so the producer cannot tell one in flight; the timeout is long for that.
+                # The producer tracks notifications, not reads in flight; the timeout must allow reads to finish.
                 if deadline < now:
                     logger.warning(
                         "freeing the KV blocks of %s, which no decode instance read in %.0f s", request_id, timeout
@@ -281,7 +291,7 @@ class NixlConnectorWorker(KVConnectorWorker):
                     self._finished.expired_sending.add(request_id)
             for request_id, (_, _, seen) in list(self._notified.items()):
                 if request_id not in self._reqs_to_send and seen + timeout < now:
-                    del self._notified[request_id]  # read here, but never handed over: not this engine's
+                    del self._notified[request_id]  # discard stale notifications with no pending send
             finished, self._finished = self._finished, KVConnectorOutput()
         return finished
 
@@ -294,18 +304,21 @@ class NixlConnectorWorker(KVConnectorWorker):
         self._context.term()
 
     def _release(self, request_id: str):
-        """Lock held. The engine frees the blocks once every rank has reported them."""
+        """Mark a pending send finished on this rank. Caller must hold _lock.
+
+        The engine frees the blocks after all ranks report completion.
+        """
         if self._reqs_to_send.pop(request_id, None) is not None:
             self._notified.pop(request_id, None)
             self._finished.finished_sending.add(request_id)
 
     def _release_if_read(self, request_id: str):
-        """Lock held."""
+        """Report the send as finished once all expected notifications arrive. Caller must hold _lock."""
         entry = self._notified.get(request_id)
         if entry is not None and entry[0] >= entry[1]:
             self._release(request_id)
 
-    # The transfer thread: every NIXL call, so the agent is never shared between threads.
+    # After cache registration, the transfer thread handles NIXL operations and cleanup.
 
     def _run(self):
         try:
@@ -339,7 +352,7 @@ class NixlConnectorWorker(KVConnectorWorker):
         if self._server is not None:
             self._server.close()
 
-    # Producer: answer handshakes, and count the notifications that end each request's reads.
+    # Producer: answer handshakes and count consumer notifications before releasing requests.
 
     def _serve(self):
         while True:
@@ -397,10 +410,10 @@ class NixlConnectorWorker(KVConnectorWorker):
                 remote = self._handshake(req, share.remote_rank)
                 if max(req.remote_block_ids, default=-1) >= remote.num_blocks:
                     raise RuntimeError(f"a block id past the producer's {remote.num_blocks} blocks")
-                # How many consumer ranks read this producer rank: its shares, seen from its side.
+                # Swap producer and consumer roles to count the consumers assigned to this producer rank.
                 readers = len(head_shares(share.remote_rank, req.remote_tp_size, self.tp_size, heads))
                 notification = f"{req.remote_request_id}:{readers}".encode()
-                args = (share.num_heads, i == 0)  # latents come whole from the first producer rank
+                args = (share.num_heads, i == 0)  # read whole latent blocks only from the first share
                 local = block_descs(self.regions, req.local_block_ids, share.local_head, *args, self.device_id)
                 if not len(local):
                     self.agent.send_notif(remote.agent_name, notification)
@@ -439,7 +452,7 @@ class NixlConnectorWorker(KVConnectorWorker):
                     self._fail(load, RuntimeError(f"a NIXL read ended {state}"))
             load.handles = pending
             if pending:
-                continue  # even a failed load waits for its reads, which write into blocks the engine would reuse
+                continue  # wait even after failure: pending reads may still write blocks the engine could reuse
             del self._loads[request_id]
             with self._lock:
                 if load.failed:
@@ -459,30 +472,32 @@ class NixlConnectorWorker(KVConnectorWorker):
                 error,
             )
         load.failed = True
-        # Ranks no read reached free their blocks now rather than at the timeout, where their agent is known.
+        # Attempt missing notifications for known producer ranks so block release need not wait for a timeout.
         for remote_rank in list(load.unnotified):
             remote = self._remotes.get((req.remote_host, req.remote_port + remote_rank))
             if remote is not None and remote.engine_id == req.remote_engine_id:
                 readers = len(head_shares(remote_rank, req.remote_tp_size, self.tp_size, self._heads(req)))
                 try:
                     self.agent.send_notif(remote.agent_name, f"{req.remote_request_id}:{readers}".encode())
-                except Exception as notify_error:  # the timeout frees them instead
+                except Exception as notify_error:  # the producer's timeout allows the blocks to be released later
                     logger.debug("notifying producer rank %d failed: %s", remote_rank, notify_error)
             load.unnotified.discard(remote_rank)
 
     def _heads(self, req: ReqToRecv) -> int:
-        """Key heads to split over both sides' ranks; for latents, which are whole on every rank, just enough to
-        say which producer ranks each consumer rank stands for."""
+        """Return the head count used to assign producer ranks to consumers.
+
+        For models with only replicated latents, use a virtual head count divisible by both tensor-parallel sizes.
+        """
         return self.num_heads or math.lcm(self.tp_size, req.remote_tp_size)
 
     def _handshake(self, req: ReqToRecv, remote_rank: int) -> _Remote:
-        """The producer rank's agent and regions, asked for once per producer, checked to match this engine."""
+        """Return cached producer information, or fetch and validate its engine ID, tensor-parallel size and layout."""
         key = (req.remote_host, req.remote_port + remote_rank)
         remote = self._remotes.get(key)
         if remote is not None:
             if remote.engine_id == req.remote_engine_id:
                 return remote
-            del self._remotes[key]  # restarted since, so ask afresh
+            del self._remotes[key]  # the requested engine ID changed; refresh the cached producer
             self.agent.remove_remote_agent(remote.agent_name)
         sock = self._context.socket(zmq.DEALER)
         try:

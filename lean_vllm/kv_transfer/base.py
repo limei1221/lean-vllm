@@ -1,7 +1,7 @@
-"""The KV connector interface, as vLLM's KVConnectorBase_V1: a scheduler half in the engine and a worker half per rank.
+"""The KV connector interface follows vLLM's KVConnectorBase_V1, with a scheduler in the engine and a worker per rank.
 
-The scheduler half decides which requests load or hand over KV and holds their blocks meanwhile; each step it sends
-the worker halves a KVConnectorMetadata, and they answer with the transfers that finished since.
+The scheduler decides which requests load or share KV and keeps their blocks allocated during transfers. Each step,
+it sends KVConnectorMetadata to the workers, which report transfers completed since their previous report.
 """
 
 import uuid
@@ -16,11 +16,11 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 @pydantic_dataclass(config=ConfigDict(extra="forbid"), slots=True)
 class KVTransferConfig:
-    """vLLM's --kv-transfer-config, as JSON. A producer serves prefilled KV, a consumer loads it, both does either."""
+    """Settings for --kv-transfer-config. Producers serve prefilled KV, consumers load it, and kv_both allows both."""
 
     kv_connector: str = "NixlConnector"
     kv_role: Literal["kv_producer", "kv_consumer", "kv_both"] = "kv_both"
-    kv_ip: str = "127.0.0.1"  # where a producer listens, and what it tells consumers to dial
+    kv_ip: str = "127.0.0.1"  # address the producer listens on and gives consumers to connect to
     kv_port: int = 14579  # rank r listens on kv_port + r
     engine_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
@@ -41,9 +41,9 @@ class KVTransferConfig:
 
 
 class _RemotePrefill(BaseModel):
-    """What a decode instance needs to pull a remote prefill's blocks, as the producer's request_finished returns it."""
+    """Fields a decode instance needs to load remote KV blocks, returned by the producer's request_finished."""
 
-    model_config = ConfigDict(strict=True)  # wire input: "1" is not a port
+    model_config = ConfigDict(strict=True)  # reject incorrect field types, such as a string for remote_port
 
     remote_block_ids: list[int]
     remote_request_id: str
@@ -54,7 +54,7 @@ class _RemotePrefill(BaseModel):
 
 
 def check_kv_transfer_params(params, kv_transfer: KVTransferConfig | None) -> str | None:
-    """Why this engine cannot honour a request's kv_transfer_params, or None if it can."""
+    """Return a validation error for the request's kv_transfer_params, or None if these checks pass."""
     if not isinstance(params, dict):
         return "kv_transfer_params must be an object"
     if kv_transfer is None:
@@ -74,7 +74,7 @@ def check_kv_transfer_params(params, kv_transfer: KVTransferConfig | None) -> st
 
 @dataclass(slots=True)
 class ReqToRecv:
-    """A remote prefill's blocks to read into local ones, the two lists aligned."""
+    """Remote KV blocks to load into local blocks. Block IDs at the same index refer to the same prompt tokens."""
 
     local_block_ids: list[int]
     remote_block_ids: list[int]
@@ -87,10 +87,10 @@ class ReqToRecv:
 
 @dataclass(slots=True)
 class KVConnectorMetadata:
-    """One step's instructions to every worker half."""
+    """Transfer instructions sent to every worker for one step."""
 
     reqs_to_recv: dict[str, ReqToRecv] = field(default_factory=dict)
-    reqs_to_send: dict[str, list[int]] = field(default_factory=dict)  # held blocks a remote decode may now read
+    reqs_to_send: dict[str, list[int]] = field(default_factory=dict)  # blocks held for remote decode requests to read
 
     def __bool__(self):
         return bool(self.reqs_to_recv or self.reqs_to_send)
@@ -98,32 +98,35 @@ class KVConnectorMetadata:
 
 @dataclass(slots=True)
 class KVTransferStats:
-    """One load: from the read to the blocks landing."""
+    """Elapsed time and bytes read for a completed KV load, including setup time."""
 
     seconds: float
     num_bytes: int
 
     def merge(self, other: "KVTransferStats") -> "KVTransferStats":
-        """Ranks load in parallel: the slowest sets the time, and the bytes add up."""
+        """Combine parallel loads across ranks using the longest elapsed time and the total bytes read."""
         return KVTransferStats(max(self.seconds, other.seconds), self.num_bytes + other.num_bytes)
 
 
 @dataclass(slots=True)
 class KVConnectorOutput:
-    """Transfers a worker half finished since its last report. A failed load leaves its blocks to recompute."""
+    """Transfer results since the last report, from one worker or aggregated across ranks.
+
+    Failed loads require local recomputation. Finished sends include blocks released after a timeout.
+    """
 
     finished_sending: set[str] = field(default_factory=set)
     finished_recving: set[str] = field(default_factory=set)
     failed_recving: set[str] = field(default_factory=set)
-    expired_sending: set[str] = field(default_factory=set)  # of finished_sending, freed with no consumer read
-    recv_stats: dict[str, KVTransferStats] = field(default_factory=dict)  # of finished_recving
+    expired_sending: set[str] = field(default_factory=set)  # finished_sending requests that timed out on any rank
+    recv_stats: dict[str, KVTransferStats] = field(default_factory=dict)  # stats for requests in finished_recving
 
     def __bool__(self):
         return bool(self.finished_sending or self.finished_recving or self.failed_recving)
 
 
 class KVOutputAggregator:
-    """A transfer is over once every rank has reported it; a load failed if any rank's did."""
+    """Report a transfer's result once every rank has reported it. A load fails if any rank reports failure."""
 
     def __init__(self, world_size: int):
         self.world_size = world_size
@@ -166,39 +169,39 @@ class KVOutputAggregator:
 
 
 class KVConnectorScheduler(ABC):
-    """The engine's half. Every method runs on the engine thread, between steps."""
+    """The scheduler side of the connector. Every method runs on the engine thread, between steps."""
 
     @abstractmethod
     def get_num_new_matched_tokens(self, seq, num_computed_tokens: int) -> tuple[int, bool]:
-        """Prompt tokens past num_computed_tokens whose KV can come from elsewhere, and whether it loads async."""
+        """Return how many prompt tokens beyond num_computed_tokens have remote KV, and whether loading is async."""
 
     @abstractmethod
     def update_state_after_alloc(self, seq, num_external_tokens: int):
-        """seq now holds blocks for its prompt; queue the load into the ones not already cached here."""
+        """Queue a load into seq's allocated prompt blocks, skipping blocks already cached locally."""
 
     @abstractmethod
     def build_connector_meta(self) -> KVConnectorMetadata:
-        """This step's metadata for the workers. Resets what it hands over."""
+        """Return this step's transfer instructions for the workers and clear the scheduler's pending instructions."""
 
     @abstractmethod
     def request_finished(self, seq) -> tuple[bool, dict | None]:
-        """Whether to hold seq's blocks until a worker reports them sent, and the kv_transfer_params to return."""
+        """Return whether to hold seq's blocks until all workers report finished_sending, and any kv_transfer_params."""
 
 
 class KVConnectorWorker(ABC):
-    """One rank's half: moves blocks between this rank's KV cache and another instance's."""
+    """The worker side of the connector: transfers blocks between this rank's KV cache and another instance's."""
 
     @abstractmethod
     def register_kv_caches(self, kv_caches: list):
-        """Each layer's cache, block index on dim 1, in model order. Called once, before any step."""
+        """Register each layer's cache in model order, with blocks along dimension 1. Called once, before any step."""
 
     @abstractmethod
     def start_load_kv(self, metadata: KVConnectorMetadata):
-        """Start this step's loads and expose this step's sends. Must not block on the network."""
+        """Start this step's loads and track blocks held for remote reads. Must not block on the network."""
 
     @abstractmethod
     def get_finished(self) -> KVConnectorOutput:
-        """Transfers finished on this rank since the last call."""
+        """Return transfer results on this rank since the last call."""
 
     def shutdown(self):
         pass
