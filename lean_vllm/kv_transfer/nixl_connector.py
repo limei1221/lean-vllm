@@ -74,10 +74,11 @@ def head_shares(rank: int, tp_size: int, remote_tp_size: int, num_heads: int) ->
 
     num_heads is the total head count, split evenly across the ranks on each side.
     """
+    # heads per consumer rank (local) and per producer rank (remote)
     local, remote = num_heads // tp_size, num_heads // remote_tp_size
     start, end = rank * local, (rank + 1) * local
     shares = []
-    for remote_rank in range(start // remote, -(-end // remote)):
+    for remote_rank in range(start // remote, _cdiv(end, remote)):
         first, last = max(start, remote_rank * remote), min(end, (remote_rank + 1) * remote)
         shares.append(Share(remote_rank, first - remote_rank * remote, first - start, last - first))
     return shares
@@ -299,7 +300,7 @@ class NixlConnectorWorker(KVConnectorWorker):
         if self._context.closed:
             return
         if self._thread is not None:
-            self._queue.put(None)
+            self._queue.put(None)  # tell the transfer thread to stop
             self._thread.join(timeout=10)
         self._context.term()
 
